@@ -1,0 +1,118 @@
+"""Durable queue; interruptions must be reconciled before retrying external work."""
+from __future__ import annotations
+import sqlite3
+from contextlib import contextmanager
+import time
+from pathlib import Path
+
+class JobStore:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as db:
+            db.executescript('''
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS jobs (
+              id INTEGER PRIMARY KEY, vod_id TEXT UNIQUE NOT NULL, streamer TEXT NOT NULL,
+              title TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued',
+              stage TEXT NOT NULL DEFAULT 'Ожидает обработки', detail TEXT NOT NULL DEFAULT '',
+              output_dir TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+              available_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS job_events (
+              id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+              timestamp REAL NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+            CREATE INDEX IF NOT EXISTS ix_jobs_ready ON jobs(state,available_at,id);
+            ''')
+
+    @contextmanager
+    def _connect(self):
+        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA foreign_keys=ON')
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def add(self, vod_id, streamer, title=''):
+        vod_id, streamer = str(vod_id).strip(), str(streamer).strip()
+        if not vod_id.isdecimal() or not streamer:
+            raise ValueError('Требуются числовой ID записи и имя стримера')
+        now = time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cur = db.execute('INSERT OR IGNORE INTO jobs(vod_id,streamer,title,created_at,updated_at) VALUES (?,?,?,?,?)',
+                             (vod_id, streamer, str(title), now, now))
+            row = db.execute('SELECT * FROM jobs WHERE vod_id=?', (vod_id,)).fetchone()
+            if cur.rowcount: self._event(db, row['id'], now, 'Ожидает обработки')
+            db.commit()
+            return dict(row), bool(cur.rowcount)
+
+    @staticmethod
+    def _event(db, job_id, now, stage, detail=''):
+        db.execute('INSERT INTO job_events(job_id,timestamp,stage,detail) VALUES (?,?,?,?)', (job_id, now, stage, detail))
+
+    def claim(self, now=None):
+        now = time.time() if now is None else float(now)
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT id FROM jobs WHERE state IN ('queued','retry') AND available_at<=? ORDER BY id LIMIT 1", (now,)).fetchone()
+            if not row:
+                db.commit()
+                return None
+            job_id = row['id']
+            db.execute("UPDATE jobs SET state='running',stage='Запуск',detail='',attempts=attempts+1,updated_at=? WHERE id=?", (now,job_id))
+            self._event(db,job_id,now,'Запуск')
+            result = dict(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+            db.commit()
+            return result
+
+    def update_stage(self, job_id, stage, detail='', output_dir=None):
+        if not str(stage).strip(): raise ValueError('Название этапа не может быть пустым')
+        now = time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cur = db.execute("UPDATE jobs SET stage=?,detail=?,output_dir=COALESCE(?,output_dir),updated_at=? WHERE id=? AND state='running'", (str(stage),str(detail),output_dir,now,job_id))
+            if cur.rowcount != 1:
+                db.rollback(); raise ValueError('Задание не выполняется')
+            self._event(db,job_id,now,str(stage),str(detail)); db.commit()
+
+    def finish(self, job_id, state, detail='', retry_after=0):
+        if state not in ('done','failed','retry') or retry_after < 0: raise ValueError('Недопустимое состояние или задержка')
+        now = time.time()
+        label = {'done':'Готово','failed':'Ошибка','retry':'Ожидает повтора'}[state]
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cur = db.execute("UPDATE jobs SET state=?,stage=?,detail=?,available_at=?,updated_at=? WHERE id=? AND state='running'", (state,label,str(detail),now+retry_after if state == 'retry' else 0,now,job_id))
+            if cur.rowcount != 1:
+                db.rollback(); raise ValueError('Задание не выполняется')
+            self._event(db,job_id,now,label,str(detail)); db.commit()
+
+    def recover_interrupted(self):
+        # Only call when no worker is running; explicit retry prevents duplicate requests.
+        now = time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE state='running'")]
+            for job_id in ids:
+                detail = 'Работа прервалась; проверьте результаты перед повтором'
+                db.execute("UPDATE jobs SET state='failed',stage='Прервано',detail=?,updated_at=? WHERE id=?", (detail,now,job_id))
+                self._event(db,job_id,now,'Прервано',detail)
+            db.commit(); return len(ids)
+
+    def retry(self, job_id):
+        now = time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cur = db.execute("UPDATE jobs SET state='queued',stage='Ожидает обработки',detail='',available_at=0,updated_at=? WHERE id=? AND state='failed'", (now,job_id))
+            if cur.rowcount != 1:
+                db.rollback(); raise ValueError('Повторить можно только задание с ошибкой')
+            self._event(db,job_id,now,'Ожидает обработки'); db.commit()
+
+    def list_jobs(self, limit=100):
+        with self._connect() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+
+    def events(self, job_id):
+        with self._connect() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM job_events WHERE job_id=? ORDER BY id', (job_id,))]
