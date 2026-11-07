@@ -66,9 +66,9 @@ try {
 
     $venv = Join-Path $PSScriptRoot '.venv'
     $venvPython = Join-Path $venv 'Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $venvPython)) { Run-Checked $python @('-m','venv',$venv) }
-    Run-Checked $venvPython @('-m','pip','install','--upgrade','pip')
-    Run-Checked $venvPython @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
+    if (-not (Test-Path -LiteralPath $venvPython)) { Run-Checked -file $python -arguments @('-m','venv',$venv) }
+    Run-Checked -file $venvPython -arguments @('-m','pip','install','--upgrade','pip')
+    Run-Checked -file $venvPython -arguments @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
 
     # The pinned original GitHub release is verified before unpacking. Never replace an existing tool.
     $tools = Join-Path $root 'desktop\tools\TwitchDownloaderCLI'
@@ -99,9 +99,9 @@ try {
     }
     if (-not (Api-Ready)) { throw 'Не удалось запустить локальный сервер Ollama на 127.0.0.1:11434.' }
     Write-Host 'Загрузка локальной модели Qwen3-8B (~5,2 ГБ)...'
-    Run-Checked $ollama @('pull','qwen3:8b')
+    Run-Checked -file $ollama -arguments @('pull','qwen3:8b')
     Write-Host 'Загрузка модели Whisper large-v3-turbo...'
-    Run-Checked $venvPython @('-c','from faster_whisper.utils import download_model; download_model("large-v3-turbo")')
+    Run-Checked -file $venvPython -arguments @('-c','from faster_whisper.utils import download_model; download_model("large-v3-turbo")')
     Write-Host 'Зависимости и модели подготовлены. Приложение и автоматический конвейер ещё не готовы.' -ForegroundColor Yellow
     exit 0
 } catch {

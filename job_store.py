@@ -88,17 +88,23 @@ class JobStore:
                 db.rollback(); raise ValueError('Задание не выполняется')
             self._event(db,job_id,now,label,str(detail)); db.commit()
 
-    def recover_interrupted(self):
-        # Only call when no worker is running; explicit retry prevents duplicate requests.
+    def recover_interrupted(self, safe_stages=()):
+        # Only call when no worker is running. Never replay an uncertain model request.
         now = time.time()
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            ids = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE state='running'")]
-            for job_id in ids:
-                detail = 'Работа прервалась; проверьте результаты перед повтором'
-                db.execute("UPDATE jobs SET state='failed',stage='Прервано',detail=?,updated_at=? WHERE id=?", (detail,now,job_id))
-                self._event(db,job_id,now,'Прервано',detail)
-            db.commit(); return len(ids)
+            rows = list(db.execute("SELECT id,stage FROM jobs WHERE state='running'"))
+            for row in rows:
+                job_id=row['id']
+                if row['stage'] in safe_stages:
+                    detail = 'Восстановлено после прерывания; ожидает повтора'
+                    db.execute("UPDATE jobs SET state='retry',stage='Ожидает повтора',detail=?,available_at=0,updated_at=? WHERE id=?", (detail,now,job_id))
+                    self._event(db,job_id,now,'Ожидает повтора',detail)
+                else:
+                    detail = 'Работа прервалась; проверьте результаты перед повтором'
+                    db.execute("UPDATE jobs SET state='failed',stage='Прервано',detail=?,updated_at=? WHERE id=?", (detail,now,job_id))
+                    self._event(db,job_id,now,'Прервано',detail)
+            db.commit(); return len(rows)
 
     def retry(self, job_id):
         now = time.time()
