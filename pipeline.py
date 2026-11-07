@@ -17,6 +17,7 @@ from pathlib import Path
 import full_cycle
 import stream_cutter
 import transcribe
+import whisper_cpp
 
 class PipelineError(RuntimeError): pass
 
@@ -89,7 +90,7 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
     duration=media_duration(video) if duration is None else float(duration)
     chunk_seconds=600
     source=file_stamp(video)
-    settings={'source':source,'model':cfg.get('model','large-v3-turbo'),'language':cfg.get('language','ru'),
+    settings={'engine':'whisper.cpp-b5454','source':source,'model':cfg.get('model','large-v3-turbo'),'language':cfg.get('language','ru'),
               'device':cfg.get('device','auto'),'compute':cfg.get('compute','auto'),'beam':int(cfg.get('beam',1)), 'chunk_seconds':chunk_seconds}
     key=hashlib.sha256(json.dumps(settings,sort_keys=True).encode()).hexdigest()
     folder=Path(cache_dir)/key; folder.mkdir(parents=True,exist_ok=True)
@@ -101,7 +102,7 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
         if isinstance(cached,dict) and cached.get('key')==key and isinstance(cached.get('segments'),list):
             segments=cached['segments']
         else:
-            fn=transcriber or transcribe.transcribe_file
+            fn=transcriber or whisper_cpp.transcribe_file
             segments=fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=start,end=end,quiet=True)
             if not isinstance(segments,list): raise PipelineError('Распознаватель не вернул список сегментов')
             atomic_json(filename,{'key':key,'segments':segments})
