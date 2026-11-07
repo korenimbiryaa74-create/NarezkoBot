@@ -22,28 +22,85 @@ function Run-Checked([string]$file, [string[]]$arguments) {
     & $file @arguments
     if ($LASTEXITCODE -ne 0) { throw "Ошибка команды $file (код $LASTEXITCODE)." }
 }
-function Python-315 {
-    # A missing launcher target must not terminate PowerShell before fallback paths are tried.
+function Test-Python315([string]$exe, [string[]]$prefix = @()) {
+    if (-not $exe) { return $null }
     $oldPreference = $ErrorActionPreference
+    $oldAutoInstall = $env:PYTHON_MANAGER_AUTOMATIC_INSTALL
+    $oldEncoding = $env:PYTHONIOENCODING
     try {
+        # Never let Python install manager download a runtime while searching.
+        $env:PYTHON_MANAGER_AUTOMATIC_INSTALL = '0'
+        $env:PYTHONIOENCODING = 'utf-8'
         $ErrorActionPreference = 'Continue'
-        $py = Get-Command py.exe -ErrorAction SilentlyContinue
-        if ($py) {
-            $candidate = & $py.Source -3.15 -c 'import sys,struct; print(sys.executable if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else "")' 2>$null
-            if ($LASTEXITCODE -eq 0 -and $candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+        $probe = Join-Path $PSScriptRoot 'python_probe.py'
+        $params = @($prefix) + @($probe)
+        $candidate = & $exe @params 2>$null
+        if ($LASTEXITCODE -eq 0 -and $candidate -is [string] -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
         }
-        $python = Get-Command python.exe -ErrorAction SilentlyContinue
-        if ($python) {
-            $candidate = & $python.Source -c 'import sys,struct; print(sys.executable if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else "")' 2>$null
-            if ($LASTEXITCODE -eq 0 -and $candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    } catch {
+        # Missing/stub executable or an unusable runtime: try the next candidate.
+    } finally {
+        $ErrorActionPreference = $oldPreference
+        $env:PYTHON_MANAGER_AUTOMATIC_INSTALL = $oldAutoInstall
+        $env:PYTHONIOENCODING = $oldEncoding
+    }
+    return $null
+}
+function Python-315 {
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($py) {
+        $candidate = Test-Python315 -exe $py.Source -prefix @('-3.15')
+        if ($candidate) { return $candidate }
+    }
+    foreach ($name in @('python3.15.exe','python.exe')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) {
+            $candidate = Test-Python315 -exe $command.Source
+            if ($candidate) { return $candidate }
         }
-        $candidate = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python315\python.exe'
-        if (Test-Path -LiteralPath $candidate) {
-            & $candidate -c 'import sys,struct; sys.exit(0 if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else 1)' 2>$null
-            if ($LASTEXITCODE -eq 0) { return $candidate }
+    }
+    # PEP 514 installations may live outside the standard user folder.
+    $registryRoots = @('HKCU:\Software\Python','HKLM:\Software\Python','HKLM:\Software\WOW6432Node\Python')
+    foreach ($registryRoot in $registryRoots) {
+        if (-not (Test-Path $registryRoot)) { continue }
+        $vendors = Get-ChildItem -Path $registryRoot -ErrorAction SilentlyContinue
+        foreach ($vendor in $vendors) {
+            foreach ($version in (Get-ChildItem -Path $vendor.PSPath -ErrorAction SilentlyContinue)) {
+                $installKey = Join-Path $version.PSPath 'InstallPath'
+                if (-not (Test-Path $installKey)) { continue }
+                $key = Get-Item -Path $installKey -ErrorAction SilentlyContinue
+                $path = $key.GetValue('ExecutablePath')
+                if (-not $path) {
+                    $dir = $key.GetValue('')
+                    if ($dir) { $path = Join-Path $dir 'python.exe' }
+                }
+                if ($path) {
+                    $candidate = Test-Python315 -exe $path
+                    if ($candidate) { return $candidate }
+                }
+            }
         }
-        return $null
-    } finally { $ErrorActionPreference = $oldPreference }
+    }
+    $paths = @()
+    if ($env:LOCALAPPDATA) { $paths += Join-Path $env:LOCALAPPDATA 'Programs\Python\Python315\python.exe' }
+    if ($env:ProgramFiles) { $paths += Join-Path $env:ProgramFiles 'Python315\python.exe' }
+    $paths += 'C:\Python315\python.exe'
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $candidate = Test-Python315 -exe $path
+            if ($candidate) { return $candidate }
+        }
+    }
+    Write-Host 'Автоматически найти Python 3.15 x64 не удалось.' -ForegroundColor Yellow
+    Write-Host 'Введите полный путь к python.exe или перетащите этот файл в окно. Enter отменяет установку.'
+    $entered = (Read-Host 'Путь к python.exe').Trim().Trim('"')
+    if ($entered -and (Test-Path -LiteralPath $entered -PathType Leaf)) {
+        $candidate = Test-Python315 -exe $entered
+        if ($candidate) { return $candidate }
+        Write-Host 'Файл не запустился или это не 64-битный Python 3.15.' -ForegroundColor Yellow
+    }
+    return $null
 }
 function Download-Verified([string]$url, [string]$path, [string]$sha256) {
     if (Test-Path -LiteralPath $path) {
@@ -77,7 +134,7 @@ try {
     Write-Host 'Экспериментальная сборка: интерфейс есть, но приложение ещё не проверено на Windows.' -ForegroundColor Yellow
     Refresh-Path
     $python = Python-315
-    if (-not $python) { throw 'Не найден 64-битный Python 3.15. Проверьте команду py -3.15 и PATH; текущий Python не изменялся.' }
+    if (-not $python) { throw 'Python 3.15 x64 не найден. Ничего не устанавливалось и текущий Python не изменялся.' }
     Write-Host "Python: $python"
 
     if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe.exe -ErrorAction SilentlyContinue)) {
@@ -94,7 +151,7 @@ try {
     $venv = Join-Path $PSScriptRoot '.venv'
     $venvPython = Join-Path $venv 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $venvPython)) { Run-Checked -file $python -arguments @('-m','venv',$venv) }
-    Run-Checked -file $venvPython -arguments @('-c','import sys,struct; assert sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8, "Existing desktop/.venv must use 64-bit Python 3.15; it was not modified"')
+    if (-not (Test-Python315 -exe $venvPython)) { throw 'Существующее desktop/.venv не использует рабочий 64-битный Python 3.15; оно не изменено.' }
     Run-Checked -file $venvPython -arguments @('-m','pip','install','--upgrade','pip')
     Run-Checked -file $venvPython -arguments @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
 
