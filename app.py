@@ -1,0 +1,172 @@
+"""Windows desktop control panel. All background work is owned by this process."""
+from __future__ import annotations
+import copy
+import os
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox
+from settings import Settings
+from service import Service
+from chatgpt_finder import ChatGPTFinder
+
+ROOT=Path(__file__).resolve().parent
+
+class App:
+    def __init__(self,window):
+        self.window=window; self.window.title('Нарезкобот — разработка'); self.window.geometry('1100x760'); self.window.minsize(850,600)
+        self.settings=Settings(ROOT/'config.json')
+        try:self.config=self.settings.load()
+        except Exception as exc:
+            messagebox.showerror('Настройки',str(exc)); raise
+        self.finder=ChatGPTFinder(ROOT); self.service=Service(ROOT,self.settings,self.finder)
+        self.variables={}; self._last_job=None
+        self._build()
+        self._load_controls()
+        self.window.protocol('WM_DELETE_WINDOW',self.close)
+        if self.config['monitor']['enabled']:
+            self.service.start()
+        self.refresh()
+
+    def var(self,key,default='',kind='str'):
+        v=tk.BooleanVar(value=default) if kind=='bool' else tk.StringVar(value=str(default))
+        self.variables[key]=v; return v
+    def _row(self,parent,row,label,key,secret=False,width=36):
+        ttk.Label(parent,text=label).grid(row=row,column=0,sticky='w',padx=8,pady=5)
+        box=ttk.Entry(parent,textvariable=self.var(key),show='•' if secret else '',width=width)
+        box.grid(row=row,column=1,sticky='ew',padx=8,pady=5); return box
+    def _toggle(self,parent,row,label,key):
+        ttk.Checkbutton(parent,text=label,variable=self.var(key,False,'bool')).grid(row=row,column=0,columnspan=2,sticky='w',padx=8,pady=5)
+    def _build(self):
+        outer=ttk.Frame(self.window,padding=12); outer.pack(fill='both',expand=True)
+        header=ttk.Frame(outer); header.pack(fill='x')
+        ttk.Label(header,text='Нарезкобот',font=('Segoe UI',18,'bold')).pack(side='left')
+        ttk.Label(header,text='Экспериментальная сборка — не для работы без контроля').pack(side='left',padx=16)
+        tabs=ttk.Notebook(outer); tabs.pack(fill='both',expand=True,pady=10)
+        dashboard=ttk.Frame(tabs,padding=10); settings=ttk.Frame(tabs,padding=10)
+        tabs.add(dashboard,text='Состояние'); tabs.add(settings,text='Настройки')
+        bar=ttk.Frame(dashboard);bar.pack(fill='x')
+        ttk.Button(bar,text='Сохранить и запустить',command=self.start).pack(side='left')
+        ttk.Button(bar,text='Остановить после текущей операции',command=self.stop).pack(side='left',padx=5)
+        ttk.Button(bar,text='Войти в ChatGPT',command=self.login).pack(side='left',padx=5)
+        ttk.Button(bar,text='Открыть папку результатов',command=self.open_outputs).pack(side='left',padx=5)
+        self.status=tk.StringVar(value='Остановлено')
+        ttk.Label(dashboard,textvariable=self.status).pack(anchor='w',pady=(9,4))
+        ttk.Label(dashboard,text='Эфиры и ожидание записи').pack(anchor='w')
+        self.streams=ttk.Treeview(dashboard,columns=('login','id','state','details'),show='headings',height=5)
+        for name,width,text in [('login',140,'Стример'),('id',130,'ID эфира'),('state',150,'Состояние'),('details',350,'Ошибка / VOD')]:
+            self.streams.heading(name,text=text); self.streams.column(name,width=width,stretch=True)
+        self.streams.pack(fill='x',pady=4)
+        ttk.Label(dashboard,text='Очередь и история обработки').pack(anchor='w',pady=(7,0))
+        self.jobs=ttk.Treeview(dashboard,columns=('id','streamer','vod','state','stage','detail'),show='headings',height=9)
+        for name,width,text in [('id',50,'№'),('streamer',100,'Стример'),('vod',100,'VOD'),('state',90,'Статус'),('stage',130,'Этап'),('detail',400,'Подробности')]:
+            self.jobs.heading(name,text=text); self.jobs.column(name,width=width,stretch=True)
+        self.jobs.pack(fill='both',expand=True,pady=4)
+        ttk.Button(dashboard,text='Повторить выбранное задание с ошибкой',command=self.retry).pack(anchor='w')
+        ttk.Label(dashboard,text='Последние события').pack(anchor='w',pady=(8,0))
+        self.events=tk.Text(dashboard,height=5,state='disabled',wrap='word'); self.events.pack(fill='x')
+        # Settings are organised into independently scrollable tabs rather than an oversized form.
+        sub=ttk.Notebook(settings);sub.pack(fill='both',expand=True)
+        common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8)
+        sub.add(common,text='Twitch и прокси');sub.add(processing,text='Обработка')
+        for f in (common,processing):f.columnconfigure(1,weight=1)
+        self._row(common,0,'Twitch Client ID','client_id')
+        self._row(common,1,'Twitch Client Secret','client_secret',secret=True)
+        self._row(common,2,'Стримеры через запятую','streamers')
+        self._row(common,3,'Интервал проверки, секунды','interval')
+        self._toggle(common,4,'Мониторинг включён','monitor_enabled')
+        self._toggle(common,5,'Использовать прокси','proxy_enabled')
+        self._row(common,6,'Адрес прокси (http:// или socks5://)','proxy_url',secret=True)
+        self._toggle(common,7,'Прокси для Twitch API','proxy_twitch')
+        self._toggle(common,8,'Прокси для ChatGPT','proxy_chatgpt')
+        ttk.Label(common,text='Загрузка видео работает напрямую. После смены прокси перезапустите приложение.').grid(row=9,column=0,columnspan=2,sticky='w',padx=8,pady=7)
+        self._row(processing,0,'Качество Twitch','quality')
+        self._row(processing,1,'Потоки скачивания','threads')
+        self._row(processing,2,'Минимальная длина реакции, мин','min_reaction')
+        self._row(processing,3,'Допустимое отвлечение, мин','bridge')
+        self._toggle(processing,4,'Удалять тишину','silence')
+        self._row(processing,5,'Минимальная тишина, сек','min_cut')
+        self._row(processing,6,'Допустимая пауза, сек','max_gap')
+        self._row(processing,7,'Порог над шумом, дБ','onset')
+        self._row(processing,8,'Максимальная высота видео','height')
+        self._toggle(processing,9,'Сохранять исходные фрагменты','keep_original')
+        ttk.Label(processing,text='Речь: локальный Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.').grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
+        ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
+    def _load_controls(self):
+        c=self.config; p=c['pipeline']; s=p['silence']; v=self.variables
+        values={'client_id':c['twitch']['client_id'],'client_secret':c['twitch']['client_secret'],
+          'streamers':', '.join(c['streamers']),'interval':c['monitor']['interval'],'monitor_enabled':c['monitor']['enabled'],
+          'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],
+          'quality':p['quality'],'threads':p['download_threads'],'min_reaction':p['min_reaction_minutes'],'bridge':p['bridge_minutes'],
+          'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original']}
+        for key,value in values.items(): v[key].set(value)
+    def save(self):
+        try:
+            v=self.variables; c=copy.deepcopy(self.config)
+            c['twitch']={'client_id':v['client_id'].get().strip(),'client_secret':v['client_secret'].get().strip()}
+            c['streamers']=[x.strip() for x in v['streamers'].get().split(',') if x.strip()]
+            c['monitor']={'enabled':v['monitor_enabled'].get(),'interval':v['interval'].get()}
+            c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get()}
+            p=c['pipeline'];p.update(quality=v['quality'].get().strip(),download_threads=v['threads'].get(),min_reaction_minutes=v['min_reaction'].get(),bridge_minutes=v['bridge'].get(),keep_original=v['keep_original'].get())
+            p['silence'].update(enabled=v['silence'].get(),min_cut=v['min_cut'].get(),max_gap=v['max_gap'].get(),onset_db=v['onset'].get(),max_height=v['height'].get())
+            self.config=self.settings.save(c);self.service.settings_changed();self.status.set('Настройки сохранены')
+            return True
+        except Exception as exc:
+            messagebox.showerror('Ошибка настроек',str(exc));return False
+    def start(self):
+        self.variables['monitor_enabled'].set(True)
+        if not self.save():return
+        if not self.config['twitch']['client_id'] or not self.config['twitch']['client_secret'] or not self.config['streamers']:
+            messagebox.showwarning('Нужны данные','Укажите Twitch Client ID, Client Secret и хотя бы одного стримера.');return
+        if self.service.start(): self.status.set('Мониторинг запущен')
+        else: messagebox.showwarning('Остановка', 'Дождитесь завершения текущей операции перед повторным запуском.')
+    def stop(self):
+        self.variables['monitor_enabled'].set(False)
+        if self.save(): self.service.request_stop();self.status.set('Остановка запрошена')
+    def login(self):
+        if not self.save():return
+        self.status.set('Откройте окно браузера и войдите в ChatGPT')
+        def action():
+            try:
+                ok=self.finder.login()
+                self.service.log('ChatGPT: вход выполнен' if ok else 'ChatGPT: время входа истекло')
+            except Exception as exc:self.service.log('ChatGPT: не удалось открыть браузер ('+type(exc).__name__+')')
+        threading.Thread(target=action,daemon=True).start()
+    def retry(self):
+        rows=self.jobs.selection()
+        if not rows:return
+        if not messagebox.askyesno('Повтор','Проверьте, что предыдущий запрос ChatGPT не выполняется. Повторить задание?'):return
+        try:self.service.store.retry(int(rows[0]))
+        except ValueError as exc:messagebox.showerror('Повтор',str(exc))
+    def open_outputs(self):
+        folder=ROOT/'recordings';folder.mkdir(exist_ok=True)
+        if hasattr(os,'startfile'):os.startfile(str(folder))
+    def refresh(self):
+        try:
+            streams=[]
+            if self.service._monitor: streams=self.service._monitor.status()
+            self.streams.delete(*self.streams.get_children())
+            labels={'live':'В эфире','waiting_vod':'Ожидает запись','queued':'В очереди'}
+            for s in streams:self.streams.insert('', 'end',values=(s['login'],s['stream_id'],labels.get(s['state'],s['state']),s['last_error'] or s['queued_vod_id'] or ''))
+            selected=self.jobs.selection()
+            self.jobs.delete(*self.jobs.get_children())
+            for j in self.service.store.list_jobs(200):
+                labels={'queued':'В очереди','running':'В работе','done':'Готово','failed':'Ошибка','retry':'Повтор'}
+                self.jobs.insert('','end',iid=str(j['id']),values=(j['id'],j['streamer'],j['vod_id'],labels.get(j['state'],j['state']),j['stage'],j['detail']))
+            for item in selected:
+                if self.jobs.exists(item):self.jobs.selection_add(item)
+            text='\n'.join(__import__('datetime').datetime.fromtimestamp(t).strftime('%H:%M:%S')+'  '+m for t,m in self.service.logs()[-30:])
+            self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
+        except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
+        self.window.after(3000,self.refresh)
+    def close(self):
+        active=any(j['state']=='running' for j in self.service.store.list_jobs(1000))
+        if active and not messagebox.askyesno('Выход','Обработка ещё идёт. Выход прервёт её. Выйти?'):return
+        self.service.request_stop()
+        if not active:
+            threading.Thread(target=self.finder.close,daemon=True).start()
+        self.window.destroy()
+
+if __name__=='__main__':
+    root=tk.Tk(); App(root); root.mainloop()

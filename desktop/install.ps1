@@ -22,15 +22,42 @@ function Run-Checked([string]$file, [string[]]$arguments) {
     & $file @arguments
     if ($LASTEXITCODE -ne 0) { throw "Ошибка команды $file (код $LASTEXITCODE)." }
 }
-function Python-312 {
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($py) {
-        $candidate = & $py.Source -3.12 -c 'import sys;print(sys.executable)' 2>$null
-        if ($LASTEXITCODE -eq 0 -and $candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+function Python-315 {
+    # A missing launcher target must not terminate PowerShell before fallback paths are tried.
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $py = Get-Command py.exe -ErrorAction SilentlyContinue
+        if ($py) {
+            $candidate = & $py.Source -3.15 -c 'import sys,struct; print(sys.executable if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else "")' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+        }
+        $python = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($python) {
+            $candidate = & $python.Source -c 'import sys,struct; print(sys.executable if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else "")' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+        }
+        $candidate = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python315\python.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            & $candidate -c 'import sys,struct; sys.exit(0 if sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8 else 1)' 2>$null
+            if ($LASTEXITCODE -eq 0) { return $candidate }
+        }
+        return $null
+    } finally { $ErrorActionPreference = $oldPreference }
+}
+function Download-Verified([string]$url, [string]$path, [string]$sha256) {
+    if (Test-Path -LiteralPath $path) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -ne $sha256) {
+            throw "Существующий файл $path повреждён или изменён; он не будет перезаписан."
+        }
+        return
     }
-    $candidate = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
-    return $null
+    $tmp = "$path.download-" + [Guid]::NewGuid().ToString('N')
+    try {
+        Run-Checked -file 'curl.exe' -arguments @('--fail','--location','--retry','3','--output',$tmp,$url)
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToLowerInvariant() -ne $sha256) { throw "Контрольная сумма $url не совпадает." }
+        Move-Item -LiteralPath $tmp -Destination $path
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
 function Ollama-Exe {
     $local = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
@@ -47,11 +74,11 @@ function Api-Ready {
 }
 try {
     Write-Host 'Установка зависимостей Windows. Существующий config.json и личные данные не изменяются.'
-    Write-Host 'Это подготовка, а не готовое приложение; интерфейс ещё не подключён.' -ForegroundColor Yellow
+    Write-Host 'Экспериментальная сборка: интерфейс есть, но приложение ещё не проверено на Windows.' -ForegroundColor Yellow
     Refresh-Path
-    $python = Python-312
-    if (-not $python) { Install-Winget 'Python.Python.3.12'; $python = Python-312 }
-    if (-not $python) { throw 'Python 3.12 установлен, но не найден. Перезапустите установщик.' }
+    $python = Python-315
+    if (-not $python) { throw 'Не найден 64-битный Python 3.15. Проверьте команду py -3.15 и PATH; текущий Python не изменялся.' }
+    Write-Host "Python: $python"
 
     if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe.exe -ErrorAction SilentlyContinue)) {
         Install-Winget 'Gyan.FFmpeg'
@@ -66,9 +93,12 @@ try {
 
     $venv = Join-Path $PSScriptRoot '.venv'
     $venvPython = Join-Path $venv 'Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $venvPython)) { Run-Checked $python @('-m','venv',$venv) }
-    Run-Checked $venvPython @('-m','pip','install','--upgrade','pip')
-    Run-Checked $venvPython @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
+    if (-not (Test-Path -LiteralPath $venvPython)) { Run-Checked -file $python -arguments @('-m','venv',$venv) }
+    Run-Checked -file $venvPython -arguments @('-c','import sys,struct; assert sys.version_info[:2] == (3,15) and struct.calcsize("P") == 8, "Existing desktop/.venv must use 64-bit Python 3.15; it was not modified"')
+    Run-Checked -file $venvPython -arguments @('-m','pip','install','--upgrade','pip')
+    Run-Checked -file $venvPython -arguments @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
+
+    Run-Checked -file $venvPython -arguments @('-c','import tkinter,requests,numpy,websocket')
 
     # The pinned original GitHub release is verified before unpacking. Never replace an existing tool.
     $tools = Join-Path $root 'desktop\tools\TwitchDownloaderCLI'
@@ -99,10 +129,34 @@ try {
     }
     if (-not (Api-Ready)) { throw 'Не удалось запустить локальный сервер Ollama на 127.0.0.1:11434.' }
     Write-Host 'Загрузка локальной модели Qwen3-8B (~5,2 ГБ)...'
-    Run-Checked $ollama @('pull','qwen3:8b')
-    Write-Host 'Загрузка модели Whisper large-v3-turbo...'
-    Run-Checked $venvPython @('-c','from faster_whisper.utils import download_model; download_model("large-v3-turbo")')
-    Write-Host 'Зависимости и модели подготовлены. Приложение и автоматический конвейер ещё не готовы.' -ForegroundColor Yellow
+    Run-Checked -file $ollama -arguments @('pull','qwen3:8b')
+    # Official pre-release build pinned to its release digest. RTX 5060 compatibility
+    # and actual GPU execution still need a real Windows test.
+    $whisper = Join-Path $root 'desktop\tools\whisper'
+    $whisperCli = Join-Path $whisper 'whisper-cli.exe'
+    if (-not (Test-Path -LiteralPath $whisperCli)) {
+        if (Test-Path -LiteralPath $whisper) { throw "Папка $whisper уже существует, но whisper-cli.exe не найден; она не будет перезаписана." }
+        $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('narezka-whisper-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $temp | Out-Null
+        try {
+            $zip = Join-Path $temp 'whisper.zip'
+            Write-Host 'Скачивание whisper.cpp CUDA (~653 МиБ)...'
+            Download-Verified 'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cuda-12.4.0-x64.zip' $zip 'afef0b881c500958921c3f5523b50e59ee2ec9b6f5cbd25b324c51ed308a957a'
+            $extract = Join-Path $temp 'extracted'
+            Expand-Archive -LiteralPath $zip -DestinationPath $extract
+            $exe = Get-ChildItem -LiteralPath $extract -Filter 'whisper-cli.exe' -File -Recurse | Select-Object -First 1
+            if (-not $exe) { throw 'whisper-cli.exe отсутствует в архиве.' }
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $whisper) | Out-Null
+            Move-Item -LiteralPath $exe.Directory.FullName -Destination $whisper
+        } finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    $modelDir = Join-Path $root 'desktop\tools\whisper-model'
+    New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+    $model = Join-Path $modelDir 'ggml-large-v3-turbo.bin'
+    Write-Host 'Скачивание модели Whisper large-v3-turbo (~1,62 ГБ)...'
+    Download-Verified 'https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo.bin' $model '1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69'
+    Run-Checked -file $whisperCli -arguments @('--version')
+    Write-Host 'Зависимости подготовлены. Сборка экспериментальная; Windows и GPU пока не проверены.' -ForegroundColor Yellow
     exit 0
 } catch {
     Write-Host ("ОШИБКА: " + $_.Exception.Message) -ForegroundColor Red

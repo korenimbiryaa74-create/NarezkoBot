@@ -1,0 +1,195 @@
+"""Independent VOD processing pipeline, with bounded speech chunks and safe output.
+
+The caller provides the reaction finder and progress callback. Real service
+integration remains separate so that failure can never masquerade as success.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import full_cycle
+import stream_cutter
+import transcribe
+import whisper_cpp
+
+class PipelineError(RuntimeError): pass
+
+def safe_name(value):
+    value=re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(value)).strip(' .')
+    if not value or value.upper() in {'CON','PRN','AUX','NUL','COM1','LPT1'}: value='stream'
+    return value[:100]
+
+def timestamp(s):
+    s=max(0,int(s)); return f'{s//3600:02}:{s%3600//60:02}:{s%60:02}'
+
+def atomic_json(path, value):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix='.tmp-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf8') as f:
+            json.dump(value,f,ensure_ascii=False,allow_nan=False,indent=2); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def load_json(path):
+    try:
+        with open(path,encoding='utf8') as f: return json.load(f)
+    except (OSError,ValueError): return None
+
+def file_stamp(path):
+    st=Path(path).stat(); return {'size':st.st_size,'mtime_ns':st.st_mtime_ns}
+
+def validate_intervals(rows,duration,min_seconds=0):
+    if not isinstance(rows,list): raise PipelineError('Ответ модели не содержит список реакций')
+    clean=[]
+    for item in rows:
+        if not isinstance(item,dict): raise PipelineError('Некорректная реакция')
+        a,b=item.get('start'),item.get('end')
+        if isinstance(a,bool) or isinstance(b,bool): raise PipelineError('Некорректные границы реакции')
+        try: a,b=float(a),float(b)
+        except (ValueError,TypeError): raise PipelineError('Некорректные границы реакции')
+        if not math.isfinite(a+b) or a<0 or b<=a or b>duration+.5:
+            raise PipelineError('Модель вернула границы за пределами записи')
+        if b-a<min_seconds: continue
+        clean.append({'start':a,'end':min(b,duration),'title':str(item.get('title') or 'Реакция')[:100]})
+    clean.sort(key=lambda x:x['start'])
+    if any(b['start']<a['end'] for a,b in zip(clean,clean[1:])):
+        raise PipelineError('Модель вернула пересекающиеся интервалы')
+    return clean
+
+def media_duration(path):
+    if not Path(path).is_file() or Path(path).stat().st_size<1000: raise PipelineError('Видеофайл не создан или пуст')
+    ffprobe=shutil.which('ffprobe')
+    if not ffprobe: raise PipelineError('ffprobe не найден')
+    data=stream_cutter.probe(str(path),ffprobe)
+    duration=float(stream_cutter.duration_of(data))
+    if not math.isfinite(duration) or duration<=0: raise PipelineError('Некорректная длительность видео')
+    return duration
+
+def default_download(vod_id, quality, output, begin=None, end=None, cli=None, threads=4):
+    if not cli or not Path(cli).is_file(): raise PipelineError('Не найден TwitchDownloaderCLI')
+    output=Path(output)
+    if output.exists(): raise PipelineError('Временный файл уже существует; не перезаписываю')
+    command=[str(cli),'videodownload','--id',str(vod_id),'-q',quality,'-t',str(threads),'--collision','Rename','-o',str(output)]
+    if begin is not None: command.extend(['-b',timestamp(begin),'-e',timestamp(end)])
+    # Download does not implicitly inherit proxies; service-specific proxy support must be explicit.
+    env={k:v for k,v in os.environ.items() if not k.lower().endswith('_proxy')}
+    env['NO_PROXY']='*'; env['no_proxy']='*'
+    result=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace')
+    if result.returncode or not output.is_file(): raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')')
+
+def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration=None):
+    duration=media_duration(video) if duration is None else float(duration)
+    chunk_seconds=600
+    source=file_stamp(video)
+    settings={'engine':'whisper.cpp-b5454','source':source,'model':cfg.get('model','large-v3-turbo'),'language':cfg.get('language','ru'),
+              'device':cfg.get('device','auto'),'compute':cfg.get('compute','auto'),'beam':int(cfg.get('beam',1)), 'chunk_seconds':chunk_seconds}
+    key=hashlib.sha256(json.dumps(settings,sort_keys=True).encode()).hexdigest()
+    folder=Path(cache_dir)/key; folder.mkdir(parents=True,exist_ok=True)
+    total=math.ceil(duration/chunk_seconds); result=[]
+    for i in range(total):
+        start=i*chunk_seconds; end=min(duration,start+chunk_seconds)
+        filename=folder/f'{i:04}.json'; cached=load_json(filename)
+        progress('Транскрибация',f'Часть {i+1}/{total}, {timestamp(start)}–{timestamp(end)}')
+        if isinstance(cached,dict) and cached.get('key')==key and isinstance(cached.get('segments'),list):
+            segments=cached['segments']
+        else:
+            fn=transcriber or whisper_cpp.transcribe_file
+            segments=fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=start,end=end,quiet=True)
+            if not isinstance(segments,list): raise PipelineError('Распознаватель не вернул список сегментов')
+            atomic_json(filename,{'key':key,'segments':segments})
+        for seg in segments:
+            if not isinstance(seg,dict) or not isinstance(seg.get('text'),str): raise PipelineError('Повреждённый сегмент транскрипта')
+            try: a,b=float(seg['start']),float(seg['end'])
+            except (ValueError,TypeError,KeyError): raise PipelineError('Повреждённые времена транскрипта')
+            if not math.isfinite(a+b) or a<start-.5 or b>end+1 or b<a: raise PipelineError('Времена транскрипта вне части')
+            result.append(dict(seg,start=a,end=b))
+    if not result: raise PipelineError('В записи не обнаружена речь')
+    return result,duration
+
+def render_clip(src, output, row, source_offset, silence_cfg):
+    ffmpeg,ffprobe=stream_cutter.require_tools()
+    args=stream_cutter.parse_args([])
+    args.out=str(output)
+    args.min_cut=float(silence_cfg.get('min_cut',1.5)); args.max_gap=float(silence_cfg.get('max_gap',2.0))
+    args.onset_db=float(silence_cfg.get('onset_db',12.0))
+    args.blur_regions=[]; args.precise=True; args.fast=False
+    args.scale_height=int(silence_cfg.get('max_height',1080) or 0)
+    args.maxrate=silence_cfg.get('maxrate','12M') or None
+    stream_cutter.apply_speed(args,silence_cfg.get('speed','turbo'))
+    args.vcodec=stream_cutter.pick_encoder(ffmpeg,args.vcodec)
+    res=stream_cutter.analyse(str(src),args,ffmpeg,ffprobe)
+    start=float(row['start'])-source_offset; end=float(row['end'])-source_offset
+    if float(res['total'])+.3<end: raise PipelineError('Скачанный фрагмент короче найденного интервала')
+    keeps=full_cycle.trim_keeps(res['keep'] if silence_cfg.get('enabled',True) else [(0.,float(res['total']))],start,end)
+    if sum(b-a for a,b in keeps)<.5: raise PipelineError('После удаления тишины не осталось видео')
+    res['keep']=keeps
+    stream_cutter.render_file(res,args,ffmpeg,ffprobe)
+    duration=media_duration(output)
+    return keeps,duration
+
+class Pipeline:
+    def __init__(self, root, finder, download=default_download, renderer=render_clip, speech=speech_chunks):
+        self.root=Path(root).resolve(); self.finder=finder; self.download=download; self.renderer=renderer; self.speech=speech
+
+    def run(self, job, cfg, progress=lambda stage,detail='':None):
+        vod_id=str(job['vod_id']); login=str(job['streamer'])
+        if not vod_id.isdecimal(): raise PipelineError('Некорректный ID VOD')
+        folder=self.root/'recordings'/f'{safe_name(login)} VOD {vod_id}'
+        folder.mkdir(parents=True,exist_ok=True)
+        work=folder/'_work'; work.mkdir(exist_ok=True)
+        cli=cfg.get('cli_path') or str(self.root/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe')
+        threads=int(cfg.get('download_threads',4)); quality=cfg.get('quality','1080p60')
+        src=work/'full-160p.mp4'
+        progress('Скачивание','Загружается запись для транскрибации')
+        if not src.exists():
+            temp=work/'full-160p.downloading.mp4'
+            if temp.exists(): temp.unlink() # only our own explicitly named temporary file
+            self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
+            media_duration(temp); os.replace(temp,src)
+        duration=media_duration(src)
+        expected=job.get('duration_seconds')
+        if expected and duration < float(expected)-max(5.,float(expected)*.005):
+            raise PipelineError('Запись короче заявленной Twitch; не обрабатываю неполный VOD')
+        segs,duration=self.speech(src,work/'transcripts',cfg.get('speech',{}),progress,duration=duration)
+        progress('Поиск реакций','Анализируется полный транскрипт')
+        rows=validate_intervals(self.finder(str(src),segs,duration,login,cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
+        atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
+        outputs=[]
+        for i,row in enumerate(rows,1):
+            progress('Нарезка',f'{i}/{len(rows)} · {timestamp(row["start"])}–{timestamp(row["end"])}')
+            stem=f'{i:02d} {safe_name(row["title"])}'; output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
+            config_hash=hashlib.sha256(json.dumps({'row':row,'quality':quality,'silence':cfg.get('silence',{})},sort_keys=True).encode()).hexdigest()
+            previous=load_json(meta)
+            if output.exists() and txt.exists() and isinstance(previous,dict) and previous.get('key')==config_hash:
+                media_duration(output); outputs.append(str(output)); continue
+            if output.exists() or meta.exists() or txt.exists(): raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
+            begin,end=full_cycle.download_bounds(row['start'],row['end'])
+            raw=work/(f'clip-{i:04}.mp4'); temp=work/(f'clip-{i:04}.download.mp4'); rendered=folder/(stem+'.rendering.mp4')
+            if temp.exists():temp.unlink()
+            if rendered.exists():rendered.unlink()
+            if raw.exists():raw.unlink()
+            self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
+            media_duration(temp); os.replace(temp,raw)
+            progress('Рендер',f'Нарезка {i}/{len(rows)}')
+            keeps,actual=self.renderer(raw,rendered,row,begin,cfg.get('silence',{}))
+            mapped,planned=full_cycle.remap_segments(segs,begin,keeps)
+            if abs(actual-planned)>.5:
+                raise PipelineError('Длительность видео не совпала с монтажной картой; таймкоды не сохранены')
+            mapped=full_cycle.clip_segments(mapped,actual)
+            # A partial render is never presented as completed.
+            os.replace(rendered,output)
+            txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+transcribe.to_txt(mapped),encoding='utf-8-sig')
+            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'duration':actual,'transcript':txt.name})
+            if not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
+            outputs.append(str(output))
+        progress('Готово',f'Найдено реакций: {len(rows)}; сохранено видео: {len(outputs)}')
+        return {'folder':str(folder),'outputs':outputs,'reactions':len(rows)}
