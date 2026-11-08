@@ -18,6 +18,9 @@ class JobStore:
               stage TEXT NOT NULL DEFAULT 'Ожидает обработки', detail TEXT NOT NULL DEFAULT '',
               output_dir TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
               available_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS notifications (
+              id INTEGER PRIMARY KEY, timestamp REAL NOT NULL, message TEXT NOT NULL,
+              event_key TEXT UNIQUE);
             CREATE TABLE IF NOT EXISTS job_events (
               id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
               timestamp REAL NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
@@ -115,7 +118,7 @@ class JobStore:
                 db.rollback(); raise ValueError('Задание не выполняется')
             self._event(db,job_id,now,str(stage),str(detail)); db.commit()
 
-    def finish(self, job_id, state, detail='', retry_after=0):
+    def finish(self, job_id, state, detail='', retry_after=0, notification=None):
         if state not in ('done','failed','retry') or retry_after < 0: raise ValueError('Недопустимое состояние или задержка')
         now = time.time()
         label = {'done':'Готово','failed':'Ошибка','retry':'Ожидает повтора'}[state]
@@ -124,7 +127,10 @@ class JobStore:
             cur = db.execute("UPDATE jobs SET state=?,stage=?,detail=?,available_at=?,updated_at=? WHERE id=? AND state='running'", (state,label,str(detail),now+retry_after if state == 'retry' else 0,now,job_id))
             if cur.rowcount != 1:
                 db.rollback(); raise ValueError('Задание не выполняется')
-            self._event(db,job_id,now,label,str(detail)); db.commit()
+            self._event(db,job_id,now,label,str(detail))
+            if notification:
+                self._notification(db,now,notification, f'job:{job_id}:done' if state == 'done' else None)
+            db.commit()
 
     def recover_interrupted(self, safe_stages=()):
         # Only call when no worker is running. Never replay an uncertain model request.
@@ -189,6 +195,27 @@ class JobStore:
                 db.execute("UPDATE jobs SET state='cancelled',stage='Отменено',detail='Очищено пользователем',hidden=1,updated_at=? WHERE id=?",(now,row['id']))
                 self._event(db,row['id'],now,'Отменено','Очищено пользователем')
             db.commit(); return len(rows)
+
+    @staticmethod
+    def _notification(db, now, message, key=None):
+        db.execute('INSERT OR IGNORE INTO notifications(timestamp,message,event_key) VALUES (?,?,?)',
+                   (now,str(message),key))
+
+    def notify(self, message, key=None):
+        with self._connect() as db:
+            self._notification(db,time.time(),message,key)
+
+    def notifications(self, limit=200):
+        with self._connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM notifications WHERE message <> '' ORDER BY id DESC LIMIT ?",
+                                                (max(1,min(int(limit),1000)),))]
+
+    def clear_notifications(self):
+        # Remove visible text but retain deduplication keys, so old stream events
+        # cannot reappear after restart or while awaiting a VOD.
+        with self._connect() as db:
+            db.execute("DELETE FROM notifications WHERE event_key IS NULL")
+            db.execute("UPDATE notifications SET message='' WHERE event_key IS NOT NULL")
 
     def events(self, job_id):
         with self._connect() as db:

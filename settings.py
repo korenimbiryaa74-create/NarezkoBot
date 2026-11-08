@@ -9,7 +9,7 @@ from proxy_setup import parse_proxy
 
 DEFAULTS={
  'twitch':{'client_id':'','client_secret':''},
- 'streamers':[], 'monitor':{'enabled':False,'interval':60},
+ 'streamers':[], 'monitor':{'enabled':False,'interval':60,'profiles_imported':False},
  'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True,'groq':False},
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},

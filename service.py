@@ -19,7 +19,7 @@ class Service:
         self.store=JobStore(root/'state'/'jobs.sqlite3')
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
-        self._monitor=None; self._monitor_key=None
+        self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
 
     def log(self,text):
         with self._lock: self._logs.append((time.time(),str(text)))
@@ -28,7 +28,9 @@ class Service:
     def recover_interrupted(self):
         if any(t.is_alive() for t in self._threads): return 0
         interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов','Готово'))
-        if interrupted:self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
+        if interrupted:
+            self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
+            self.store.notify(f'После перезапуска восстановлено заданий: {interrupted}. Проверьте очередь: некоторые запросы могут требовать ручного повтора.')
         return interrupted
     def start(self):
         if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
@@ -110,17 +112,42 @@ class Service:
         self.log(f"VOD {job['vod_id']}: готовые файлы собраны: {ready}")
         return ready,len(outputs)
 
+    def _monitor_problem(self, name, failed):
+        if failed and name not in self._monitor_failures:
+            self._monitor_failures.add(name)
+            self.store.notify((f'{name}: мониторинг Twitch недоступен. Проверьте подключение и настройки Twitch.' if name else
+                               'Мониторинг Twitch недоступен. Проверьте Client ID, Client Secret и подключение.'))
+        elif not failed and name in self._monitor_failures:
+            self._monitor_failures.discard(name)
+            self.store.notify(f'{name}: мониторинг Twitch восстановлен.' if name else 'Мониторинг Twitch восстановлен.')
+
     def monitor_once(self):
         cfg=self.settings.load()
         if not cfg['monitor']['enabled']: return
-        if not cfg['streamers']: return
-        monitor=self._get_monitor(cfg)
-        for name in cfg['streamers']:
+        if not cfg['streamers'] and not self._monitor and not (cfg['twitch']['client_id'] and cfg['twitch']['client_secret']): return
+        try:
+            monitor=self._get_monitor(cfg)
+            self._monitor_problem('',False)
+        except Exception:
+            self._monitor_problem('',True)
+            raise
+        names=cfg['streamers']
+        for name in names:
             if self.stop_event.is_set():break
-            try: monitor.tick(name)
+            try:
+                monitor.tick(name)
+                self._monitor_problem(name,False)
             except Exception as exc:
-                # Never include error message: URLs may carry credentials.
+                self._monitor_problem(name,True)
                 self.log(f'{name}: ошибка мониторинга ({type(exc).__name__})')
+        # Continue waiting for an already-ended stream even after removal.
+        for name in monitor.pending_logins():
+            if self.stop_event.is_set(): break
+            if name in names: continue
+            try: monitor.poll_pending(name); self._monitor_problem(name,False)
+            except Exception as exc:
+                self._monitor_problem(name,True)
+                self.log(f'{name}: ошибка ожидания записи ({type(exc).__name__})')
     def _monitor_loop(self):
         while not self.stop_event.is_set():
             try:
@@ -133,6 +160,8 @@ class Service:
         if not job:return False
         cfg=None
         try:
+            name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
+            self.store.notify(f'{name}: началась обработка записи.',f"job:{job['id']}:started")
             cfg=copy.deepcopy(self.settings.load())
             engine=self.pipeline_factory(self.root,self.finder)
             speech=cfg['pipeline']['speech']
@@ -148,7 +177,10 @@ class Service:
                 self.store.update_stage(job['id'],stage,detail)
                 if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
-            self.store.finish(job['id'],'done',f"Видео: {len(outcome['outputs'])}; {outcome['folder']}")
+            count=len(outcome['outputs'])
+            name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
+            notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих реакций не найдено.'
+            self.store.finish(job['id'],'done',f"Видео: {count}; {outcome['folder']}",notification=notice)
             self.log(f"VOD {job['vod_id']}: готово")
         except Exception as exc:
             # No replay without reconciliation: a web request may have been delivered.
@@ -166,7 +198,8 @@ class Service:
                 self.store.finish(job['id'],'retry',detail,retry_after=delay)
                 self.log(f"VOD {job['vod_id']}: повтор через {delay} с — {detail}")
             else:
-                self.store.finish(job['id'],'failed',detail)
+                name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
+                self.store.finish(job['id'],'failed',detail,notification=f'{name}: обработка остановлена из-за ошибки ({type(exc).__name__}). Проверьте задание в очереди.')
                 self.log(f"VOD {job['vod_id']}: ошибка — {detail}")
         return True
     def _worker_loop(self):

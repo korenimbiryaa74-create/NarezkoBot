@@ -14,6 +14,18 @@ def profile_path(root, login):
     return Path(root) / 'state' / 'blur_profiles' / (normalize_login(login) + '.json')
 
 
+def profile_logins(root):
+    """List validly named saved profiles without altering their contents."""
+    directory=Path(root)/'state'/'blur_profiles'
+    if not directory.exists(): return []
+    names=set()
+    for path in directory.glob('*.json'):
+        if not path.is_file() or path.is_symlink(): continue
+        try: names.add(normalize_login(path.stem))
+        except ValueError: continue
+    return sorted(names)
+
+
 def validate_profile(value):
     if not isinstance(value, dict) or value.get('version') != 1 or value.get('mode') not in ('regions','none'):
         raise BannerSetupError('Повреждён профиль блюра; настройте области заново')
