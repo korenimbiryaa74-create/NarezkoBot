@@ -49,7 +49,11 @@ def transcribe_file(path, *, model=None, lang='ru', device='auto', compute='auto
         wav = str(Path(tmp) / 'audio.wav')
         out = Path(tmp) / 'transcript'
         transcribe.extract_audio(path, transcribe.pick_track(info, 'auto'), ffmpeg, begin, finish, wav)
-        cmd = [str(CLI), '-m', str(MODEL), '-f', wav, '-l', lang or 'auto', '-bs', str(int(beam)), '-mc', '0', '-oj', '-of', str(out)]
+        # Passing an absolute model path containing non-ASCII characters can crash
+        # Windows builds while converting argv. Use the relative path between the
+        # bundled ASCII-named directories, while retaining the CLI working directory.
+        model_arg = os.path.relpath(MODEL, CLI.parent)
+        cmd = [str(CLI), '-m', model_arg, '-f', wav, '-l', lang or 'auto', '-bs', str(int(beam)), '-mc', '0', '-oj', '-of', str(out)]
         if device == 'cpu': cmd.append('-ng')
         try:
             run = subprocess.run(cmd, cwd=str(CLI.parent), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,

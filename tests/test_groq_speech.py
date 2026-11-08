@@ -71,6 +71,17 @@ class GroqTests(unittest.TestCase):
         with patch.object(groq_speech.requests,'Session',return_value=session):
             with self.assertRaises(groq_speech.GroqError) as exc: groq_speech.transcribe_chunk(str(media),start=0,end=2,api_key='fake-secret')
         self.assertNotIn('fake-secret',str(exc.exception));session.post.assert_called_once()
+    def test_403_code_allowlist_only(self):
+        media=self.root/'sample.wav'; subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','sine=duration=2','-y',str(media)],check=True)
+        session=MagicMock();session.proxies={}; response=MagicMock(status_code=403);session.post.return_value=response
+        response.json.return_value={'error':{'code':'model_permission_blocked_project','message':'fake-secret'}}
+        with patch.object(groq_speech.requests,'Session',return_value=session):
+            with self.assertRaises(groq_speech.GroqError) as exc: groq_speech.transcribe_chunk(str(media),start=0,end=2,api_key='fake-secret')
+        self.assertIn('модель запрещена проектом',str(exc.exception)); self.assertNotIn('fake-secret',str(exc.exception))
+        response.json.return_value={'error':{'code':'fake-secret','message':'fake-secret'}}
+        with patch.object(groq_speech.requests,'Session',return_value=session):
+            with self.assertRaises(groq_speech.GroqError) as exc: groq_speech.transcribe_chunk(str(media),start=0,end=2,api_key='fake-secret')
+        self.assertNotIn('fake-secret',str(exc.exception)); self.assertIn('HTTP 403',str(exc.exception))
     def test_service_masks_groq_secret_and_passes_proxy(self):
         settings=Settings(self.root/'config.json'); cfg=settings.load(); cfg['pipeline']['speech']['groq_api_key']='fake-secret'
         cfg['proxy'].update(enabled=True,url='http://example.com:8080',groq=True); settings.save(cfg)

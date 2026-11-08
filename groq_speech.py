@@ -59,7 +59,19 @@ def transcribe_chunk(path, *, start, end, api_key, language='ru', proxy_url=''):
                 response = session.post(URL, headers={'Authorization': 'Bearer ' + api_key}, data=data,
                                         files={'file': ('audio.mp3', f, 'audio/mpeg')}, timeout=(15, 300))
             if not 200 <= response.status_code < 300:
-                raise GroqError('Groq вернул HTTP ' + str(response.status_code))
+                reason = 'Groq вернул HTTP ' + str(response.status_code)
+                if response.status_code == 403:
+                    # Allowlist known codes only. Never print an arbitrary body, key or proxy URL.
+                    try:
+                        body = response.json()
+                        error = body.get('error', {}) if isinstance(body, dict) else {}
+                        code = error.get('code') if isinstance(error, dict) else None
+                    except ValueError:
+                        code = None
+                    if code == 'model_permission_blocked_org': reason += ': модель запрещена организацией в Groq'
+                    elif code == 'model_permission_blocked_project': reason += ': модель запрещена проектом в Groq'
+                    else: reason += ': доступ запрещён; проверьте права модели и доступ сети'
+                raise GroqError(reason)
             try: payload = response.json()
             except ValueError: raise GroqError('Некорректный JSON от Groq') from None
             return parse_segments(payload, start, end-start)

@@ -17,10 +17,12 @@ class WhisperCppTests(unittest.TestCase):
             with self.assertRaises(transcribe.TranscribeError): whisper_cpp.transcribe_file('any')
     def test_cli_result_and_time_offset(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); cli=root/'whisper-cli.exe'; model=root/'model.bin'
-            cli.touch(); model.touch()
+            root=Path(tmp)/'проект'; cli=root/'whisper'/'whisper-cli.exe'; model=root/'whisper-model'/'model.bin'
+            cli.parent.mkdir(parents=True); model.parent.mkdir(); cli.touch(); model.touch()
             def run(cmd, **kw):
                 import json
+                self.assertEqual(cmd[cmd.index('-m')+1], str(Path('..')/'whisper-model'/'model.bin'))
+                self.assertEqual(kw['cwd'],str(cli.parent))
                 out=Path(cmd[cmd.index('-of')+1]).with_suffix('.json')
                 out.write_text(json.dumps({'transcription':[{'text':'ok','offsets':{'from':1000,'to':2000}}]}))
                 class Result: returncode=0; stderr=''
