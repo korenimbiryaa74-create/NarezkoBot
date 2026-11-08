@@ -22,3 +22,7 @@ recordings/
 *.wav
 *.transcript.json
 *cookie*.json
+
+# Never commit user test videos or inputs.
+test_input/*
+!test_input/README.md
