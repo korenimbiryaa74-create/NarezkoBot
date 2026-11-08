@@ -34,7 +34,7 @@ class BannerTests(unittest.TestCase):
             opener.return_value.open.return_value=Response()
             with self.assertRaisesRegex(banner_blur.BannerResponseError,'обрезан'):banner_blur.request_boxes(b'jpeg')
 
-    def test_truncation_retries_once_with_larger_limits(self):
+    def test_truncation_retries_once_in_json_mode(self):
         class Response:
             def __init__(self, obj):self.obj=obj
             def __enter__(self):return self
@@ -48,9 +48,11 @@ class BannerTests(unittest.TestCase):
             self.assertEqual(banner_blur.request_boxes(b'jpeg',events.append),[])
             calls=opener.return_value.open.call_args_list
             self.assertEqual(len(calls),2)
-            a,b=[json.loads(call.args[0].data)['options'] for call in calls]
-            self.assertEqual((a['num_ctx'],a['num_predict']),(4096,512))
-            self.assertEqual((b['num_ctx'],b['num_predict']),(8192,1024))
+            first,second=[json.loads(call.args[0].data) for call in calls]
+            self.assertEqual(first['format'],banner_blur.SCHEMA)
+            self.assertEqual(second['format'],'json')
+            self.assertEqual(second['messages'],first['messages'])
+            self.assertEqual(second['options']['num_predict'],512)
             self.assertTrue(any('повторяю' in e for e in events))
 
     def test_second_truncation_reports_safe_token_counts(self):
@@ -62,8 +64,31 @@ class BannerTests(unittest.TestCase):
             opener.return_value.open.return_value=Response()
             with self.assertRaises(banner_blur.BannerResponseError) as caught:banner_blur.request_boxes(b'jpeg')
             self.assertEqual(opener.return_value.open.call_count,2)
-            self.assertIn('3400',str(caught.exception));self.assertIn('1024',str(caught.exception))
+            self.assertIn('3400',str(caught.exception));self.assertIn('1024',str(caught.exception));self.assertIn('символов ответа:',str(caught.exception))
             self.assertNotIn('secret',str(caught.exception))
+
+    def test_truncation_even_if_json_parseable_is_not_accepted(self):
+        class Response:
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+            def read(self,*a):return json.dumps({'message':{'content':'{"banners":[]}'},'done_reason':'length'}).encode()
+        with patch('banner_blur.urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value=Response()
+            with self.assertRaises(banner_blur.BannerResponseError):banner_blur.request_boxes(b'jpeg')
+            self.assertEqual(opener.return_value.open.call_count,2)
+
+    def test_fallback_json_still_requires_valid_boxes(self):
+        class Response:
+            def __init__(self, obj):self.obj=obj
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+            def read(self,*a):return json.dumps(self.obj).encode()
+        responses=[Response({'message':{'content':'{'},'done_reason':'length'}),
+                   Response({'message':{'content':'{"banners":[[0,0,1000,1000]]}'},'done_reason':'stop'})]
+        with patch('banner_blur.urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect=responses
+            with self.assertRaisesRegex(banner_blur.BannerResponseError,'40%'):banner_blur.request_boxes(b'jpeg')
+            self.assertEqual(opener.return_value.open.call_count,2)
 
     def test_windows_and_offsets(self):
         sample=[{'start':10.,'end':15.,'box':[0,0,200,200]},{'start':15.,'end':20.,'box':[0,0,200,200]}]

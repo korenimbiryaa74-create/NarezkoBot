@@ -51,7 +51,7 @@ def parse_boxes(text):
     return result
 
 def request_boxes(image, progress=None, *, _retry=False):
-    req={'model':MODEL,'stream':False,'think':False,'format':SCHEMA,'options':{'temperature':0,'num_ctx':8192 if _retry else 4096,'num_predict':1024 if _retry else 512},
+    req={'model':MODEL,'stream':False,'think':False,'format':'json' if _retry else SCHEMA,'options':{'temperature':0,'num_ctx':4096,'num_predict':512},
          'messages':[{'role':'user','content':PROMPT,'images':[base64.b64encode(image).decode('ascii')]}]}
     payload=json.dumps(req).encode('utf-8')
     request=urllib.request.Request('http://127.0.0.1:11434/api/chat',data=payload,headers={'Content-Type':'application/json'},method='POST')
@@ -88,22 +88,21 @@ def request_boxes(image, progress=None, *, _retry=False):
         raise BannerError('Не удалось связаться с локальным Ollama; проверьте, что он запущен') from None
     except (ValueError,KeyError,TypeError):
         raise BannerError('Ollama вернула некорректный ответ модели баннеров; проверьте версию Ollama и модель qwen3-vl:4b') from None
-    try:
-        return parse_boxes(text)
-    except BannerResponseError as exc:
-        if data.get('done_reason')=='length':
-            if not _retry:
-                if progress:progress('Ответ модели обрезан; повторяю этот кадр с увеличенным контекстом и лимитом ответа')
-                return request_boxes(image,progress,_retry=True)
-            # Numeric counts help distinguish context pressure from runaway output,
-            # without logging model text or anything from the frame.
-            counts=[]
-            for field,label in (('prompt_eval_count','вход'),('eval_count','ответ')):
-                v=data.get(field)
-                if type(v) is int and 0<=v<=10000000:counts.append(f'{label}: {v} токенов')
-            details=f" ({', '.join(counts)})" if counts else ''
-            raise BannerResponseError('Ответ модели о баннерах снова обрезан после повтора с увеличенным контекстом и лимитом ответа'+details+'; рендер остановлен') from None
-        raise exc from None
+    if data.get('done_reason')=='length':
+        if not _retry:
+            if progress:progress('Ответ модели обрезан; повторяю этот кадр в альтернативном режиме JSON')
+            return request_boxes(image,progress,_retry=True)
+        # Only structural counts, never generated text or image contents.
+        counts=[]
+        for field,label in (('prompt_eval_count','вход'),('eval_count','ответ')):
+            v=data.get(field)
+            if type(v) is int and 0<=v<=10000000:counts.append(f'{label}: {v} токенов')
+        if isinstance(text,str):counts.append(f'символов ответа: {len(text)}')
+        thinking=data.get('message',{}).get('thinking','')
+        if isinstance(thinking,str) and thinking:counts.append(f'символов рассуждений: {len(thinking)}')
+        details=f" ({', '.join(counts)})" if counts else ''
+        raise BannerResponseError('Ответ модели обрезан даже в альтернативном режиме JSON'+details+'; рендер остановлен') from None
+    return parse_boxes(text)
 
 def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
     if not math.isfinite(interval) or interval<=0:raise BannerError('Неверный интервал анализа')
