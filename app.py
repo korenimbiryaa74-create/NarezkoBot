@@ -300,13 +300,13 @@ class App:
     def configure_streamer_blur(self):
         name=self._blur_login()
         if not name or not self.save():return
-        tw=self.config['twitch'];proxy=self.config['proxy'];p=self.config['pipeline']
+        proxy=self.config['proxy'];p=self.config['pipeline']
         cli=ROOT/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe'
         try:ffmpeg,_=stream_cutter.require_tools()
         except Exception as exc:messagebox.showerror('Блюр',str(exc));return
         state={};self.status.set(f'Получаю кадр последней записи {name}…')
         def work():
-            try:state['data']=manual_blur.latest_frame(name,tw['client_id'],tw['client_secret'],proxy['url'] if proxy['enabled'] and proxy['twitch_api'] else '',str(cli),ffmpeg,threads=p['download_threads'])
+            try:state['data']=manual_blur.latest_frame(name,proxy['url'] if proxy['enabled'] and proxy['twitch_api'] else '',str(cli),ffmpeg,threads=p['download_threads'])
             except Exception as exc:state['error']=str(exc)
         def poll():
             if thread.is_alive():self.window.after(400,poll);return
