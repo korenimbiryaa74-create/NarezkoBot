@@ -115,6 +115,7 @@ class Monitor:
                 db.execute("UPDATE observed_streams SET state='live',offline_count=0,ended_at=NULL,candidate_id=NULL,candidate_duration=NULL,stable_since=NULL,updated_at=? WHERE stream_id=? AND state='waiting_vod'",(now,stream_id))
             db.commit()
         self.poll_pending(login)
+        return live
 
     def poll_pending(self, login):
         login=normalize_login(login)

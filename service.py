@@ -20,6 +20,7 @@ class Service:
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
         self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
+        self._watch_state={}; self._watch_generation=0
 
     def log(self,text):
         with self._lock: self._logs.append((time.time(),str(text)))
@@ -36,6 +37,8 @@ class Service:
         if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
         self.recover_interrupted()
         self.stop_event.clear()
+        with self._lock:
+            self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
                        threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True)]
         for t in self._threads:t.start()
@@ -44,7 +47,44 @@ class Service:
     def request_stop(self):
         self.stop_event.set(); self.wake.set()
         self.log('Остановка: текущая операция завершится перед выходом')
-    def settings_changed(self): self.wake.set()
+    def settings_changed(self):
+        # Do not show statuses from old credentials/settings as current.
+        with self._lock:
+            self._watch_generation+=1; self._watch_state.clear()
+        self.wake.set()
+
+    def _watch_update(self, name, state, generation, stream_id=''):
+        with self._lock:
+            if generation==self._watch_generation:
+                self._watch_state[name]={'state':state,'stream_id':stream_id,'checked_at':time.time()}
+
+    def stream_rows(self, cfg):
+        """Saved watch list plus pending VODs; status is never inferred from history."""
+        running=(cfg['monitor']['enabled'] and not self.stop_event.is_set() and
+                 any(t.name=='twitch-monitor' and t.is_alive() for t in self._threads))
+        with self._lock: snapshot={k:dict(v) for k,v in self._watch_state.items()}
+        now=time.time(); max_age=max(180,3*cfg['monitor']['interval'])
+        rows=[]
+        for name in cfg['streamers']:
+            state=snapshot.get(name)
+            if not running: label='Мониторинг остановлен'; detail=''; stream_id=''
+            elif not state: label='Ожидание проверки'; detail=''; stream_id=''
+            elif now-state['checked_at']>max_age:
+                label='Нет свежих данных'; detail='Ожидается проверка Twitch'; stream_id=''
+            elif state['state']=='error':
+                label='Ошибка проверки'; detail='Проверьте Twitch и подключение'; stream_id=''
+            else:
+                label='В эфире' if state['state']=='live' else 'Не в эфире'
+                detail=''; stream_id=state['stream_id']
+            rows.append((name,stream_id,label,detail))
+        # Read waiting records even before an API client exists, e.g. after restart.
+        with self.store._connect() as db:
+            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observed_streams'").fetchone()
+            pending=list(db.execute("SELECT login,stream_id,last_error FROM observed_streams WHERE state='waiting_vod' ORDER BY updated_at DESC")) if table else []
+        for row in pending:
+            label='Ожидает запись' if running else 'Ожидает запись (остановлено)'
+            rows.append((row['login'],row['stream_id'],label,row['last_error'] or ''))
+        return rows
     def _get_monitor(self,cfg):
         tw=cfg['twitch']; p=cfg['proxy']
         proxy=p['url'] if p['enabled'] and p.get('twitch_api') else ''
@@ -124,20 +164,24 @@ class Service:
     def monitor_once(self):
         cfg=self.settings.load()
         if not cfg['monitor']['enabled']: return
+        with self._lock: generation=self._watch_generation
         if not cfg['streamers'] and not self._monitor and not (cfg['twitch']['client_id'] and cfg['twitch']['client_secret']): return
         try:
             monitor=self._get_monitor(cfg)
             self._monitor_problem('',False)
         except Exception:
+            for name in cfg['streamers']: self._watch_update(name,'error',generation)
             self._monitor_problem('',True)
             raise
         names=cfg['streamers']
         for name in names:
             if self.stop_event.is_set():break
             try:
-                monitor.tick(name)
+                live=monitor.tick(name)
+                self._watch_update(name,'live' if live is not None else 'offline',generation,str(live['id']) if live else '')
                 self._monitor_problem(name,False)
             except Exception as exc:
+                self._watch_update(name,'error',generation)
                 self._monitor_problem(name,True)
                 self.log(f'{name}: ошибка мониторинга ({type(exc).__name__})')
         # Continue waiting for an already-ended stream even after removal.
