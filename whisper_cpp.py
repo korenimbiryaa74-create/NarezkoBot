@@ -35,12 +35,16 @@ def parse_segments(data, offset, length):
             raise InvalidWhisperSegments(prefix + ': нет числовых таймкодов') from None
         if not math.isfinite(begin) or not math.isfinite(end):
             raise InvalidWhisperSegments(prefix + ': нечисловые таймкоды')
-        if begin < -0.25 or end < begin or end > length + 1 or begin >= length or end < 0:
+        limit = 30.5 if i == len(rows) else 1.0
+        if begin < -0.25 or end < begin or end > length + limit or begin >= length or end < 0:
             # Numeric diagnostics only: never log the segment text.
             raise InvalidWhisperSegments(prefix + f': таймкоды {begin:.3g}–{end:.3g} вне части 0–{length:.3g} с')
+        uncertain = end > length + 1
         begin=max(0.,begin);end=min(length,end)
         if end < begin: raise InvalidWhisperSegments(prefix + ': неверный порядок таймкодов')
-        result.append({'start': round(begin + offset, 3), 'end': round(end + offset, 3), 'text': text})
+        segment={'start': round(begin + offset, 3), 'end': round(end + offset, 3), 'text': text}
+        if uncertain: segment['timing_warning']='end_clipped'
+        result.append(segment)
     return result
 
 

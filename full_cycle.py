@@ -46,7 +46,9 @@ def remap_segments(segments, source_offset, keeps):
                 matches.append((out_start+lo-ka,out_start+hi-ka))
         text=str(segment.get('text') or '').strip()
         if matches and text:
-            result.append({'start':round(matches[0][0],6),'end':round(matches[-1][1],6),'text':text})
+            row={'start':round(matches[0][0],6),'end':round(matches[-1][1],6),'text':text}
+            if segment.get('timing_warning')=='end_clipped': row['timing_warning']='end_clipped'
+            result.append(row)
     result.sort(key=lambda x:(x['start'],x['end']))
     return result,cursor
 

@@ -183,6 +183,8 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
             atomic_json(Path(cache_dir)/local_key/f'{i:04}.json',{'key':local_key,'segments':segments})
             origin='локальный Whisper'
         if 'кэш' in origin: progress('Транскрибация',f'Часть {i+1}/{total} · {origin}')
+        if any(seg.get('timing_warning')=='end_clipped' for seg in segments):
+            progress('Транскрибация',f'Часть {i+1}/{total}: конец сегмента ограничен границей аудио; текст и таймкод у границы требуют проверки')
         result.extend(segments)
     if not result: raise PipelineError('В записи не обнаружена речь')
     return result,duration
@@ -303,7 +305,8 @@ class Pipeline:
             mapped=full_cycle.clip_segments(mapped,actual)
             # A partial render is never presented as completed.
             os.replace(rendered,output)
-            txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+transcribe.to_txt(mapped),encoding='utf-8-sig')
+            warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
+            txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
             atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'duration':actual,'transcript':txt.name})
             if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))

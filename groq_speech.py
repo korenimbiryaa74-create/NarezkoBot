@@ -35,13 +35,17 @@ def parse_segments(data, offset, length):
             raise GroqResponseError(prefix + ': нет числовых таймкодов') from None
         if not math.isfinite(a) or not math.isfinite(b):
             raise GroqResponseError(prefix + ': нечисловые таймкоды')
-        # Whisper sometimes rounds just beyond the audio boundary. Clamp only a
-        # small overhang; never invent or silently discard a meaningful segment.
-        if a < -0.25 or b < a or b > length + 1 or a >= length or b < 0:
+        # The final Whisper segment sometimes ends ~30s past the chunk.
+        # Bound only that segment and flag the uncertainty; do not discard text.
+        limit = 30.5 if i == len(rows) else 1.0
+        if a < -0.25 or b < a or b > length + limit or a >= length or b < 0:
             raise GroqResponseError(prefix + f': таймкоды {a:.2f}–{b:.2f} вне части 0–{length:.2f} с')
+        uncertain = b > length + 1
         a=max(0., a); b=min(length, b)
         if b < a: raise GroqResponseError(prefix + ': неверный порядок таймкодов')
-        result.append({'start': offset + a, 'end': offset + b, 'text': text})
+        segment={'start': offset + a, 'end': offset + b, 'text': text}
+        if uncertain: segment['timing_warning']='end_clipped'
+        result.append(segment)
     if not result and isinstance(data.get('text'), str) and data['text'].strip():
         raise GroqResponseError('Groq: текст ответа есть, но сегментов с таймкодами нет')
     return result
