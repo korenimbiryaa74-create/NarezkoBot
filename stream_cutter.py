@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import functools
+from fractions import Fraction
 import bisect
 import copy
 import json
@@ -28,6 +29,9 @@ BLUR_REGIONS: list[tuple[int, int, int, int]] = []
 BLUR_STRENGTH = 20
 
 class CutterError(Exception):
+    pass
+
+class InvalidRenderTimeline(CutterError):
     pass
 
 def run(cmd: list[str], capture: bool=True, timeout: int | None=None):
@@ -658,6 +662,41 @@ def concat_parts(ffmpeg: str, parts: list[str], out: str) -> None:
     if run(cmd).returncode != 0:
         raise CutterError('финальная склейка не удалась')
 
+def measured_timeline(groups, part_info, output_info):
+    """Map single-range encoded parts using actual concat container durations.
+
+    Concat demuxer advances by each file's container duration, not the ideal
+    range length. Initial video timestamps include encoder/muxer delay.
+    Reject unusual per-part drift instead of silently claiming exact timing.
+    """
+    if not groups or len(groups)!=len(part_info) or any(len(g)!=1 for g in groups):
+        raise InvalidRenderTimeline('Не удалось построить измеренную монтажную карту')
+    out_video=video_stream(output_info)
+    if not out_video: raise InvalidRenderTimeline('В итоговом файле нет видеодорожки')
+    try:
+        rate=float(Fraction(fps_of(output_info) or '25'))
+        if not math.isfinite(rate) or rate<=0: raise ValueError()
+    except (ValueError,ZeroDivisionError): rate=25.
+    tolerance=max(.15,2./rate+.05)
+    first=part_info[0]; first_video=video_stream(first)
+    if not first_video: raise InvalidRenderTimeline('В части нарезки нет видеодорожки')
+    global_shift=ffloat(out_video.get('start_time'))-(ffloat(first_video.get('start_time'))-ffloat(first.get('format',{}).get('start_time')))
+    cursor=0.; timeline=[]
+    for index,(group,info) in enumerate(zip(groups,part_info),1):
+        a,b=map(float,group[0]); duration=duration_of(info); v=video_stream(info)
+        if not v or not math.isfinite(duration) or duration<=0:
+            raise InvalidRenderTimeline(f'Не удалось измерить часть {index}')
+        delta=duration-(b-a)
+        if abs(delta)>tolerance:
+            raise InvalidRenderTimeline(f'Часть {index}: длительность {duration:.3f} с, ожидалось {b-a:.3f} с; расхождение слишком велико для точных таймкодов')
+        out_start=cursor+ffloat(v.get('start_time'))-ffloat(info.get('format',{}).get('start_time'))+global_shift
+        if out_start < -.05: raise InvalidRenderTimeline('Некорректное начало монтажной карты')
+        timeline.append((a,b,max(0.,out_start)));cursor+=duration
+    actual=duration_of(output_info)
+    if not math.isfinite(actual) or actual<=0 or abs(actual-cursor)>max(.3,tolerance):
+        raise InvalidRenderTimeline(f'После склейки длительность {actual:.3f} с, сумма частей {cursor:.3f} с; таймкоды не подтверждены')
+    return timeline
+
 def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=None) -> str:
     src, keep = (res['src'], res['keep'])
     out = args.out or os.path.splitext(src)[0] + '_cut' + os.path.splitext(src)[1]
@@ -721,7 +760,7 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
             print(f'заданий     : {len(jobs)}  процессов: {min(jobs_n, len(jobs))}  (копирование)')
             parts = run_jobs(ffmpeg, jobs, builder, prog, tmpdir, None, jobs_n, progress_callback)
         else:
-            groups = build_chunks(keep, args.piece, args.gap_split, args.span_limit)
+            groups = build_chunks(keep, args.piece, -1 if getattr(args,'map_timeline',False) else args.gap_split, args.span_limit)
             jobs_n = max(1, min(jobs_n, len(groups)))
             total = sum((e - s for g in groups for s, e in g))
             prog = Progress(total, len(groups))
@@ -737,6 +776,16 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
         print('склейка ...', flush=True)
         if progress_callback: progress_callback('Склейка частей')
         concat_parts(ffmpeg, parts, out)
+        if getattr(args,'map_timeline',False):
+            if args.fast: raise InvalidRenderTimeline('Измеренная монтажная карта недоступна в режиме копирования')
+            if progress_callback: progress_callback('Проверка длительности частей и таймкодов')
+            part_info=[]
+            for index,part in enumerate(parts,1):
+                part_info.append(probe(part,ffprobe))
+                if progress_callback and (index%20==0 or index==len(parts)):
+                    progress_callback(f'Проверено частей: {index}/{len(parts)}')
+            output_info=probe(out,ffprobe)
+            res['render_timeline']=measured_timeline(groups,part_info,output_info)
     print(f'готово      : {out}')
     print(f'              длительность {fmt(duration_of(probe(out, ffprobe)))}')
     return out
