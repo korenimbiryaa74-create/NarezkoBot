@@ -96,7 +96,10 @@ class Tab:
                         return msg.get('result', {})
             except (websocket.WebSocketConnectionClosedException, websocket.WebSocketTimeoutException, OSError, ValueError) as e:
                 last = e
-                if attempt == 0:
+                non_replayable=(method=='DOM.setFileInputFiles' or
+                    (method=='Runtime.evaluate' and params.get('expression') in
+                     (chatgpt_attach.JS_OPEN_ATTACH,chatgpt_attach.JS_CLICK_UPLOAD)))
+                if attempt == 0 and not non_replayable:
                     self._reconnect()
                     continue
                 raise ChatGPTWebError(f'CDP-соединение умерло ({method}): {str(e)[:120]}')
