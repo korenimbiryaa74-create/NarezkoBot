@@ -11,6 +11,7 @@ import urllib.request
 import websocket
 import proxy_setup
 import proxy_bridge
+import chatgpt_attach
 DEFAULT_CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 BASE = 'https://chatgpt.com'
@@ -56,6 +57,7 @@ class Tab:
         self.timeout = timeout
         self._id = 0
         self.ws = None
+        self._file_chooser_events = []
         self._connect()
 
     def _connect(self):
@@ -94,6 +96,8 @@ class Tab:
                 self.ws.send(json.dumps({'id': self._id, 'method': method, 'params': params}))
                 while True:
                     msg = json.loads(self.ws.recv())
+                    if msg.get('method') == 'Page.fileChooserOpened':
+                        self._file_chooser_events.append(msg.get('params') or {})
                     if msg.get('id') == self._id:
                         if 'error' in msg:
                             raise ChatGPTWebError(f"{method}: {msg['error'].get('message')}")
@@ -105,6 +109,25 @@ class Tab:
                     continue
                 raise ChatGPTWebError(f'CDP-соединение умерло ({method}): {str(e)[:120]}')
         raise ChatGPTWebError(f'CDP: {last}')
+
+    def clear_file_chooser(self):
+        self._file_chooser_events.clear()
+
+    def wait_file_chooser(self, seconds=3):
+        deadline=time.monotonic()+seconds
+        try:
+            while True:
+                if self._file_chooser_events:
+                    return self._file_chooser_events.pop(0)
+                remaining=deadline-time.monotonic()
+                if remaining<=0:return None
+                self.ws.settimeout(remaining)
+                try: msg=json.loads(self.ws.recv())
+                except websocket.WebSocketTimeoutException: return None
+                if msg.get('method')=='Page.fileChooserOpened':
+                    self._file_chooser_events.append(msg.get('params') or {})
+        finally:
+            self.ws.settimeout(self.timeout)
 
     def js(self, expr, timeout=None):
         old = self.timeout
@@ -527,9 +550,8 @@ class ChatGPTWeb:
             raise ChatGPTWebError('на кнопку отправки нажал, но доставка не подтверждена; чат оставлен открытым, автоматически повторять запрос не буду')
         self._log('не удалось дождаться готового файла/кнопки; запрос НЕ отправлен')
         return False
-    JS_PICK_FILE_INPUT = '((want)=>{\nconst all=Array.from(document.querySelectorAll(\'input[type="file"]\'));\nall.forEach(i=>i.removeAttribute(\'data-twl-file\'));\nif(!all.length)return 0;\nconst ok=i=>{const a=(i.getAttribute(\'accept\')||\'\').toLowerCase().trim();\n  if(!a)return 3; if(a.includes(\'text\')||a.includes(\'.txt\')||a.includes(\'*/*\'))return 2;\n  return a.split(\',\').every(x=>x.trim().startsWith(\'image\'))?0:1;};\nconst img=want===\'image\';\nconst best=all.map(i=>[img?(ok(i)===0?3:1):ok(i),i]).sort((x,y)=>y[0]-x[0])[0];\nif(!img&&best[0]===0)return 0;\nbest[1].setAttribute(\'data-twl-file\',\'1\');return all.length;})(%s)'
-    JS_ATTACHED = '((name)=>{\nconst a=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nconst f=a?(a.closest(\'form\')||a.parentElement.parentElement.parentElement||document):document;\nconst blob=Array.from(f.querySelectorAll(\'img\'))\n .filter(i=>(i.currentSrc||i.src||\'\').startsWith(\'blob:\')).length;\nconst txt=(f.innerText||\'\');\nconst stem=name.replace(/\\.[^.]+$/,\'\');\nreturn {blob:blob,named:txt.includes(name)||(stem.length>3&&txt.includes(stem)),\n busy:!!f.querySelector(\'[role="progressbar"],circle[stroke-dasharray],.animate-spin\')};})(%s)'
-    JS_DROP_FILE = '((name,b64)=>{\nconst i=document.querySelector(\'input[data-twl-file="1"]\')||document.querySelector(\'input[type="file"]\');\nif(!i)return false;\nconst bin=atob(b64);const u=new Uint8Array(bin.length);\nfor(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);\nconst file=new File([u],name,{type:name.toLowerCase().endsWith(\'.txt\')?\'text/plain\':\'application/octet-stream\'});\nconst dt=new DataTransfer();dt.items.add(file);\ni.files=dt.files;i.dispatchEvent(new Event(\'change\',{bubbles:true}));\nreturn true;})(%s,%s)'
+    JS_PICK_FILE_INPUT = chatgpt_attach.JS_PICK_FILE_INPUT
+    JS_ATTACHED = chatgpt_attach.JS_ATTACHED
     JS_QUOTA = '(()=>{\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nconst patterns=[/file upload limit reached/i,/you(?:[\'’]ve| have) reached (?:your |the )?(?:file |upload |attachment )*(?:limit|quota)/i,\n /too many (?:file )?uploads/i,/(?:upload|attachment|file).{0,35}(?:limit|quota).{0,25}(?:reached|exceeded)/i,\n /(?:достигнут|исчерпан|превышен).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i,\n /лимит.{0,25}(?:загруз|файл|вложен).{0,25}(?:достигнут|исчерпан|превышен)/i,\n /вы (?:достигли|исчерпали).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i];\nfor(const e of document.querySelectorAll(\'[role="alert"],[role="dialog"],[role="tooltip"],[data-testid*="toast"],button[aria-disabled="true"],p,span\')){\n if(!visible(e)||e.closest(\'[data-message-author-role="user"],[data-turn="user"],pre,code\'))continue;\n const text=((e.innerText||\'\')+\' \'+(e.getAttribute(\'title\')||\'\')+\' \'+(e.getAttribute(\'aria-label\')||\'\')).trim();\n if(text.length<=1000&&patterns.some(p=>p.test(text)))return {blocked:true,text:text.slice(0,350)};\n}\nreturn {blocked:false};})()'
 
     def _check_upload_quota(self):
@@ -561,60 +583,7 @@ class ChatGPTWeb:
             time.sleep(0.5)
         return False
 
-    def _attach(self, path: str) -> bool:
-        tab = self.tab
-        name = os.path.basename(path)
-        image = os.path.splitext(name)[1].lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
-        n_inputs = 0
-        intercepted = False
-        menu_clicked = False
-        for attempt in range(20):
-            self._check_upload_quota()
-            try:
-                n_inputs = tab.js(self.JS_PICK_FILE_INPUT % json.dumps('image' if image else 'any')) or 0
-            except Exception:
-                n_inputs = 0
-            if n_inputs:
-                break
-            if not intercepted:
-                try:
-                    # Never activate a native file dialog unless CDP intercepts it.
-                    tab.call('Page.setInterceptFileChooserDialog', enabled=True)
-                    intercepted = True
-                    tab.js("""(()=>{const b=document.querySelector('button[data-testid="composer-plus-btn"],button[aria-label="Add files and more"],button[aria-label="Добавить файлы и другое"]');if(b)b.click();})()""")
-                except Exception:
-                    self._log('не удалось безопасно перехватить окно выбора файла')
-                    return False
-            elif not menu_clicked:
-                try:
-                    menu_clicked = bool(tab.js("""(()=>{const item=Array.from(document.querySelectorAll('[role="menuitem"]')).find(e=>/Add photos.*files|Upload.*file|Добавить.*файл|Загрузить.*файл/i.test(e.innerText||''));if(!item)return false;item.click();return true;})()"""))
-                except Exception:
-                    return False
-            time.sleep(1)
-        if not n_inputs:
-            self._log('не нашёл input[type=file] — вложение пропущено')
-            return False
-        nid = tab.node_id('input[data-twl-file="1"]')
-        if nid:
-            tab.call('DOM.setFileInputFiles', files=[os.path.abspath(path)], nodeId=nid)
-            if self._wait_attached(name, image):
-                self._log(f'приложил файл: {name}')
-                return True
-            self._log(f'файл {name} не появился в поле — пробую другим способом')
-        try:
-            import base64
-            with open(path, 'rb') as fh:
-                b64 = base64.b64encode(fh.read()).decode('ascii')
-            tab.js(self.JS_PICK_FILE_INPUT % json.dumps('image' if image else 'any'))
-            if tab.js(self.JS_DROP_FILE % (json.dumps(name), json.dumps(b64)), timeout=120) and self._wait_attached(name, image, 60):
-                self._log(f'приложил файл (через страницу): {name}')
-                return True
-        except ChatGPTQuotaError:
-            raise
-        except Exception as e:
-            self._log(f'запасное вложение упало: {str(e)[:100]}')
-        self._log(f'вложение НЕ прикрепилось: {name}')
-        return False
+    _attach = chatgpt_attach.attach
 
     def ask(self, prompt: str, files: list=None, until=None) -> dict:
         with self._profile_lock:
