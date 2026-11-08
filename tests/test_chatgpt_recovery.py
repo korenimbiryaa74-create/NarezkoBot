@@ -88,12 +88,64 @@ class RecoveryTests(unittest.TestCase):
             def js(self,expr):
                 if 'data-twl-file' in expr:return 0
                 if '[role="menuitem"]' in expr:self.menu_clicks+=1;return True
+                if 'composer-plus-btn' in expr:return True
                 return None
             def call(self,*args,**kwargs):self.intercepts+=1
         web.tab=Tab();web._check_upload_quota=lambda:None
         with patch('chatgpt_web.time.sleep'):
             self.assertFalse(web._attach('test.txt'))
         self.assertEqual(web.tab.menu_clicks,1);self.assertEqual(web.tab.intercepts,1)
+    def test_file_chooser_node_used_and_never_uploaded_twice(self):
+        web=chatgpt_web.ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),verbose=False)
+        class Tab:
+            def __init__(self):self.calls=[];self.waits=0
+            def clear_file_chooser(self):pass
+            def wait_file_chooser(self,seconds):
+                self.waits+=1
+                return None if self.waits==1 else {'backendNodeId':77}
+            def js(self,expr):
+                if 'composer-plus-btn' in expr or '[role="menuitem"]' in expr:return True
+                raise AssertionError('must not guess input')
+            def call(self,method,**kw):self.calls.append((method,kw));return {}
+        web.tab=Tab();web._check_upload_quota=lambda:None
+        events=[];web.status_callback=events.append;web._wait_attached=lambda *a:False
+        self.assertFalse(web._attach('test.txt'))
+        writes=[c for c in web.tab.calls if c[0]=='DOM.setFileInputFiles']
+        self.assertEqual(len(writes),1);self.assertEqual(writes[0][1]['backendNodeId'],77)
+        self.assertTrue(any('повторная загрузка не выполняется' in m for m in events))
+
+    def test_chooser_event_survives_command_reply(self):
+        webtab=chatgpt_web.Tab.__new__(chatgpt_web.Tab);webtab._id=0;webtab.timeout=5;webtab._file_chooser_events=[]
+        class WS:
+            def __init__(self): self.messages=[json.dumps({'method':'Page.fileChooserOpened','params':{'backendNodeId':123}}),json.dumps({'id':1,'result':{'value':True}})]
+            def settimeout(self,t):pass
+            def send(self,v):pass
+            def recv(self):return self.messages.pop(0)
+        webtab.ws=WS()
+        self.assertEqual(webtab.call('Runtime.evaluate')['value'],True)
+        self.assertEqual(webtab.wait_file_chooser()['backendNodeId'],123)
+
+    @unittest.skipUnless(shutil.which('chromium'),'requires Chromium')
+    def test_composer_file_input_preferred_and_attachment_near_form(self):
+        from html.parser import HTMLParser
+        page=self.root/'composer.html'
+        js_pick=chatgpt_web.ChatGPTWeb.JS_PICK_FILE_INPUT % json.dumps('any')
+        js_attached=chatgpt_web.ChatGPTWeb.JS_ATTACHED % json.dumps('transcript.txt')
+        page.write_text('<input id="other" type="file"><section><form><textarea id="prompt-textarea"></textarea><input id="right" type="file" accept=".txt"></form><span>transcript.txt</span></section>'+
+            '<script>const count='+js_pick+';const seen='+js_attached+'; const p=document.createElement("pre");'+
+            'p.id="result";p.textContent=JSON.stringify({count,selected:document.querySelector("[data-twl-file]").id,seen});document.body.appendChild(p);</script>',encoding='utf8')
+        proc=subprocess.run(['chromium','--headless','--no-sandbox','--disable-gpu','--dump-dom',page.as_uri()],capture_output=True,text=True,timeout=30,check=True)
+        class P(HTMLParser):
+            def __init__(self):super().__init__();self.reading=False;self.result=''
+            def handle_starttag(self,tag,attrs):
+                if tag=='pre' and dict(attrs).get('id')=='result':self.reading=True
+            def handle_endtag(self,tag):
+                if tag=='pre':self.reading=False
+            def handle_data(self,data):
+                if self.reading:self.result+=data
+        parser=P();parser.feed(proc.stdout);data=json.loads(parser.result)
+        self.assertEqual(data['selected'],'right');self.assertTrue(data['seen']['named'])
+
     def test_manual_answer_skips_browser(self):
         finder=ChatGPTFinder(self.root,web_factory=lambda **kw: (_ for _ in ()).throw(AssertionError('browser used')))
         rows=finder('v.mp4',[{'start':0,'end':60,'text':'speech'}],60,'name',{'min_reaction_minutes':0,'_manual_reactions':ANSWER},lambda *a:None)
