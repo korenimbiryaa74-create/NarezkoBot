@@ -61,7 +61,7 @@ def transcribe_chunk(path, *, start, end, api_key, language='ru', proxy_url=''):
                '-i', str(path), '-t', f'{end-start:.3f}', '-map', f'0:a:{track}',
                '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', '-b:a', '32k', str(audio)]
         run = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                             encoding='utf8', errors='replace')
+                             encoding='utf8', errors='replace', creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         if run.returncode or not audio.is_file() or audio.stat().st_size == 0:
             raise transcribe.TranscribeError('Не удалось подготовить аудио для Groq (FFmpeg)')
         if audio.stat().st_size >= 24_000_000:

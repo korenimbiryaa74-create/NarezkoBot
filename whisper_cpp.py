@@ -75,7 +75,7 @@ def transcribe_file(path, *, model=None, lang='ru', device='auto', compute='auto
         if device == 'cpu': cmd.append('-ng')
         try:
             run = subprocess.run(cmd, cwd=str(CLI.parent), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                 encoding='utf-8', errors='replace', timeout=3600)
+                                 encoding='utf-8', errors='replace', timeout=3600, creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         except (OSError, subprocess.TimeoutExpired) as e:
             raise transcribe.TranscribeError('Не удалось запустить whisper.cpp: ' + str(e)) from e
         target = out.with_suffix('.json')

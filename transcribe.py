@@ -134,7 +134,7 @@ def find_tools() -> tuple[str, str]:
 def probe(path: str, ffprobe: str) -> dict:
     r = subprocess.run([ffprobe, "-v", "error", "-print_format", "json",
                         "-show_streams", "-show_format", path],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     if r.returncode != 0:
         raise TranscribeError(f"ffprobe не смог открыть файл: {r.stderr.strip()[:300]}")
     return json.loads(r.stdout or "{}")
@@ -168,7 +168,7 @@ def extract_audio(src: str, track: int, ffmpeg: str, start: float | None,
         cmd += ["-t", f"{end - (start or 0):.3f}"]
     cmd += ["-map", f"0:a:{track}", "-vn", "-ac", "1", "-ar", "16000",
             "-c:a", "pcm_s16le", dst]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     if r.returncode != 0 or not os.path.exists(dst):
         raise TranscribeError(f"ffmpeg не смог извлечь звук: {r.stderr.strip()[:300]}")
 
@@ -350,7 +350,7 @@ def _run_groq(src: str, track: int, ffmpeg: str, start: float, end: float, key: 
         cmd = [ffmpeg, "-hide_banner", "-v", "error", "-y", "-ss", f"{pos:.3f}", "-i", src,
                "-t", f"{length:.3f}", "-map", f"0:a:{track}", "-vn", "-ac", "1", "-ar", "16000",
                "-c:a", "libmp3lame", "-b:a", "32k", part]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
         if r.returncode != 0:
             raise TranscribeError(f"ffmpeg не смог извлечь звук: {r.stderr.strip()[:300]}")
         res = _groq_post(part, key, model, lang, prompt, proxies, max_wait)
