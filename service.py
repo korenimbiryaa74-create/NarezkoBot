@@ -6,7 +6,7 @@ import time
 from collections import deque
 from job_store import JobStore
 from monitor import Monitor,TwitchClient
-from pipeline import Pipeline, atomic_json, manual_answer_path, job_identity
+from pipeline import Pipeline, atomic_json, manual_answer_path, job_identity, organize_completed
 import reactions
 from stream_cutter import InvalidRenderTimeline
 from bot_debug import redact
@@ -26,7 +26,7 @@ class Service:
         with self._lock: return list(self._logs)
     def recover_interrupted(self):
         if any(t.is_alive() for t in self._threads): return 0
-        interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Готово'))
+        interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов','Готово'))
         if interrupted:self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
         return interrupted
     def start(self):
@@ -86,6 +86,13 @@ class Service:
         self.log(f"VOD {job['vod_id']}: сохранён ответ ChatGPT для ручного продолжения")
         return len(intervals)
 
+    def organize_finished(self,job_id):
+        job=next((j for j in self.store.list_jobs(1000) if j['id']==job_id),None)
+        if not job: raise ValueError('Задание не найдено в истории')
+        ready,outputs=organize_completed(self.root,job)
+        self.log(f"VOD {job['vod_id']}: готовые файлы собраны: {ready}")
+        return ready,len(outputs)
+
     def monitor_once(self):
         cfg=self.settings.load()
         if not cfg['monitor']['enabled']: return
@@ -122,7 +129,7 @@ class Service:
             def progress(stage,detail=''):
                 detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
-                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки'): self.log(f"VOD {job['vod_id']}: {detail}")
+                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             self.store.finish(job['id'],'done',f"Видео: {len(outcome['outputs'])}; {outcome['folder']}")
             self.log(f"VOD {job['vod_id']}: готово")
@@ -136,7 +143,7 @@ class Service:
                         if secret: detail=detail.replace(secret,'[скрыто]')
                 except (TypeError,KeyError): pass
             current=next((x for x in self.store.list_jobs(1000) if x['id']==job['id']),None)
-            safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер') and not isinstance(exc,InvalidRenderTimeline)
+            safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов') and not isinstance(exc,InvalidRenderTimeline)
             if safe and job['attempts']<3:
                 delay=60*job['attempts']
                 self.store.finish(job['id'],'retry',detail,retry_after=delay)

@@ -299,21 +299,142 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     duration=media_duration(output)
     return RenderedKeeps(keeps,res.get('render_timeline')),duration
 
+READY_SILENCE = 'Готовые без тишины'
+READY_GENERIC = 'Готовые нарезки'
+
+def job_output_folder(root, job):
+    vod_id=str(job['vod_id']); login=str(job['streamer']); local_name=job.get('local_name')
+    if local_name:
+        if not re.fullmatch(r'test-[a-f0-9]{32}',vod_id): raise PipelineError('Некорректный ID теста')
+        if local_name in ('.','..') or '/' in local_name or '\\' in local_name or Path(local_name).name != local_name:
+            raise PipelineError('Некорректное имя тестового файла')
+        return Path(root)/'recordings'/f'Тест {safe_name(Path(local_name).stem)} {vod_id}'
+    if not vod_id.isdecimal(): raise PipelineError('Некорректный ID VOD')
+    return Path(root)/'recordings'/f'{safe_name(login)} VOD {vod_id}'
+
+def clip_stem(i,row): return f'{i:02d} {safe_name(row["title"])}'
+
+def locate_clip_file(folder,name):
+    found=[p for p in (folder/name,folder/READY_SILENCE/name,folder/READY_GENERIC/name) if p.exists()]
+    if len(found)>1: raise PipelineError(f'Найдено несколько файлов {name}; не перезаписываю')
+    return found[0] if found else None
+
+def precise_timestamp(seconds):
+    ms=round(float(seconds)*1000)
+    return f'{ms//3600000:02}:{ms//60000%60:02}:{ms//1000%60:02}.{ms%1000:03}'
+
+def cut_report(folder,job,i,row,mode):
+    stem=clip_stem(i,row)
+    label='исходного тестового видео' if job.get('local_name') else 'исходной записи Twitch (VOD)'
+    lines=[f'Нарезка: {row["title"]}',f'Интервал: {precise_timestamp(row["start"])} — {precise_timestamp(row["end"])}',
+           f'Таймкоды указаны от начала {label}.', 'Границы указаны по плану монтажа; фактические границы могут немного отличаться из-за кадров и кодирования.', '']
+    if mode is False:
+        lines.append('Удаление тишины было выключено; паузы не вырезались.')
+    elif mode is None:
+        lines.append('Нет достоверных данных об удалении пауз для этой нарезки.')
+    else:
+        timeline=load_json(folder/'_work'/(stem+'.rendering.timeline.json'))
+        cuts=timeline.get('cuts') if isinstance(timeline,dict) else None
+        offset=0 if job.get('local_name') else math.floor(float(row['start']))
+        checked=[]
+        if isinstance(cuts,list):
+            try:
+                for cut in cuts:
+                    a=float(cut['start'])+offset; b=float(cut['end'])+offset
+                    if not math.isfinite(a) or not math.isfinite(b) or b<=a or a<float(row['start'])-.01 or b>float(row['end'])+.01:
+                        raise ValueError()
+                    checked.append((a,b))
+                if any(a2 < b1-.01 for (_,b1),(a2,_) in zip(checked,checked[1:])): raise ValueError()
+            except (ValueError,TypeError,KeyError,OverflowError): cuts=None
+        if not isinstance(cuts,list):
+            lines.append('Данные о вырезанных паузах недоступны или повреждены. Нельзя определить, были ли паузы удалены.')
+        elif not checked:
+            lines.append('Вырезанных пауз не найдено.')
+        else:
+            for n,(a,b) in enumerate(checked,1):
+                lines.append(f'{n:03}. {precise_timestamp(a)} — {precise_timestamp(b)}  ({b-a:.3f} с)')
+            lines.extend(['',f'Всего удалено: {len(checked)} пауз, {sum(b-a for a,b in checked):.3f} с.'])
+    return '\n'.join(lines)+'\n'
+
+def organize_clips(folder,job,rows,mode):
+    folder=Path(folder)
+    ready=folder/(READY_SILENCE if mode is True else READY_GENERIC)
+    plans=[]
+    for i,row in enumerate(rows,1):
+        stem=clip_stem(i,row); meta=load_json(folder/(stem+'.pipeline.json'))
+        if not isinstance(meta,dict) or meta.get('vod_id')!=str(job['vod_id']) or meta.get('reaction')!=row:
+            raise PipelineError(f'Не найдены подтверждённые данные нарезки {i}; файлы не перемещены')
+        srcs=[]
+        for ext in ('.mp4','.txt'):
+            name=stem+ext; src=locate_clip_file(folder,name)
+            if src is None or not src.is_file(): raise PipelineError(f'Не найден файл {name}; файлы не перемещены')
+            dest=ready/name
+            if src != dest and dest.exists(): raise PipelineError(f'Файл {name} уже существует; не перезаписываю')
+            srcs.append((src,dest))
+        report=ready/(stem+' — удалённая тишина.txt')
+        text=cut_report(folder,job,i,row,mode)
+        if report.exists() and report.read_text(encoding='utf-8-sig')!=text:
+            raise PipelineError(f'Отчёт {report.name} уже существует и отличается; не перезаписываю')
+        plans.append((srcs,report,text))
+    ready.mkdir(parents=True,exist_ok=True)
+    for srcs,report,text in plans:
+        for src,dest in srcs:
+            if src != dest:
+                if dest.exists(): raise PipelineError(f'Файл {dest.name} уже существует; не перезаписываю')
+                os.rename(src,dest)
+        if not report.exists():
+            # Write completely before publishing; never overwrite a user's report.
+            fd,tmp=tempfile.mkstemp(prefix='.report-',dir=ready)
+            try:
+                with os.fdopen(fd,'w',encoding='utf-8-sig',newline='\n') as f:
+                    f.write(text); f.flush(); os.fsync(f.fileno())
+                if os.name=='nt': os.rename(tmp,report)  # Windows refuses an existing destination
+                else: os.link(tmp,report)  # atomic, exclusive on POSIX
+            finally:
+                if os.path.exists(tmp): os.unlink(tmp)
+    return ready,[str(pairs[0][1]) for pairs,_,_ in plans]
+
+def timeline_matches_metadata(folder,stem,meta):
+    # Old metadata did not record this switch. Only reuse a timeline whose
+    # keep plan agrees with the finished clip, avoiding stale analysis files.
+    timeline=load_json(folder/'_work'/(stem+'.rendering.timeline.json'))
+    if not isinstance(timeline,dict) or not isinstance(meta,dict): return False
+    keeps=timeline.get('keeps'); saved=meta.get('keep')
+    if not isinstance(keeps,list) or not isinstance(saved,list) or len(keeps)!=len(saved) or not isinstance(timeline.get('cuts'),list): return False
+    try:
+        return all(abs(float(k['start'])-float(v[0]))<.01 and abs(float(k['end'])-float(v[1]))<.01 for k,v in zip(keeps,saved))
+    except (ValueError,TypeError,KeyError,IndexError,OverflowError): return False
+
+def organize_completed(root,job):
+    if job.get('state')!='done': raise PipelineError('Выберите задание со статусом «Готово»')
+    folder=job_output_folder(root,job)
+    data=load_json(folder/'reactions.json')
+    if not isinstance(data,dict) or data.get('vod_id')!=str(job['vod_id']) or not isinstance(data.get('reactions'),list):
+        raise PipelineError('Не найдены данные о реакциях этого задания')
+    rows=data['reactions']
+    for row in rows:
+        if not isinstance(row,dict) or not isinstance(row.get('title'),str): raise PipelineError('Некорректные данные о реакциях')
+        try:
+            a=float(row['start']); b=float(row['end'])
+            if not math.isfinite(a) or not math.isfinite(b) or a<0 or b<=a: raise ValueError()
+        except (KeyError,TypeError,ValueError,OverflowError): raise PipelineError('Некорректные данные о реакциях') from None
+    metas=[load_json(folder/(clip_stem(i,row)+'.pipeline.json')) for i,row in enumerate(rows,1)]
+    modes=[m.get('silence_enabled') if isinstance(m,dict) else None for m in metas]
+    if modes and all(x is True for x in modes): mode=True
+    elif modes and all(x is False for x in modes): mode=False
+    elif modes and all(x is None for x in modes) and all(
+            timeline_matches_metadata(folder,clip_stem(i,row),meta)
+            for i,(row,meta) in enumerate(zip(rows,metas),1)): mode=True
+    else: mode=None
+    return organize_clips(folder,job,rows,mode)
+
 class Pipeline:
     def __init__(self, root, finder, download=default_download, renderer=render_clip, speech=speech_chunks):
         self.root=Path(root).resolve(); self.finder=finder; self.download=download; self.renderer=renderer; self.speech=speech
 
     def run(self, job, cfg, progress=lambda stage,detail='':None):
-        vod_id=str(job['vod_id']); login=str(job['streamer'])
-        local_name=job.get('local_name')
-        if local_name:
-            if not re.fullmatch(r'test-[a-f0-9]{32}',vod_id): raise PipelineError('Некорректный ID теста')
-            if local_name in ('.','..') or '/' in local_name or '\\' in local_name or Path(local_name).name != local_name:
-                raise PipelineError('Некорректное имя тестового файла')
-            folder=self.root/'recordings'/f'Тест {safe_name(Path(local_name).stem)} {vod_id}'
-        else:
-            if not vod_id.isdecimal(): raise PipelineError('Некорректный ID VOD')
-            folder=self.root/'recordings'/f'{safe_name(login)} VOD {vod_id}'
+        vod_id=str(job['vod_id']); login=str(job['streamer']); local_name=job.get('local_name')
+        folder=job_output_folder(self.root,job)
         folder.mkdir(parents=True,exist_ok=True)
         work=folder/'_work'; work.mkdir(exist_ok=True)
         cli=cfg.get('cli_path') or str(self.root/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe')
@@ -373,12 +494,13 @@ class Pipeline:
         outputs=[]
         for i,row in enumerate(rows,1):
             progress('Нарезка',f'{i}/{len(rows)} · {timestamp(row["start"])}–{timestamp(row["end"])}')
-            stem=f'{i:02d} {safe_name(row["title"])}'; output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
+            stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
+            old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
             config_hash=hashlib.sha256(json.dumps({'row':row,'quality':quality,'silence':cfg.get('silence',{})},sort_keys=True).encode()).hexdigest()
             previous=load_json(meta)
-            if output.exists() and txt.exists() and isinstance(previous,dict) and previous.get('key')==config_hash:
-                media_duration(output); outputs.append(str(output)); continue
-            if output.exists() or meta.exists() or txt.exists(): raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
+            if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
+                media_duration(old_output); outputs.append(str(old_output)); continue
+            if old_output or meta.exists() or old_txt: raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
             begin,end=full_cycle.download_bounds(row['start'],row['end'])
             raw=work/(f'clip-{i:04}.mp4'); temp=work/(f'clip-{i:04}.download.mp4'); rendered=folder/(stem+'.rendering.mp4')
             if rendered.exists():rendered.unlink()
@@ -409,8 +531,10 @@ class Pipeline:
             os.replace(rendered,output)
             warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
             txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
-            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name})
+            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
             if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))
+        progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
+        ready,outputs=organize_clips(folder,job,rows,bool(cfg.get('silence',{}).get('enabled',True)))
         progress('Готово',f'Найдено реакций: {len(rows)}; сохранено видео: {len(outputs)}')
-        return {'folder':str(folder),'outputs':outputs,'reactions':len(rows)}
+        return {'folder':str(ready),'outputs':outputs,'reactions':len(rows)}
