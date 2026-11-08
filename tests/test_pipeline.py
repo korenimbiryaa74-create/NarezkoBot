@@ -58,3 +58,33 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(pipeline.PipelineError):
             pipeline.validate_intervals([{'start':1,'end':10},{'start':9,'end':11}],100)
 if __name__=='__main__': unittest.main()
+
+class IncompleteDownloadTests(unittest.TestCase):
+    def test_incomplete_download_not_promoted_and_retry_redownloads(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); calls=[]
+            def download(vod,quality,out,**kw):
+                calls.append(quality); Path(out).write_bytes(b'x'*2000)
+            def speech(*args, **kwargs): raise RuntimeError('speech reached')
+            engine=pipeline.Pipeline(root,lambda *a:[],download=download,speech=speech)
+            job={'vod_id':'123','streamer':'name','duration_seconds':100}
+            with patch.object(pipeline,'media_duration',return_value=40):
+                with self.assertRaises(pipeline.IncompleteVod): engine.run(job,{})
+            work=root/'recordings'/'name VOD 123'/'_work'
+            self.assertFalse((work/'full-160p.mp4').exists())
+            with patch.object(pipeline,'media_duration',return_value=100):
+                with self.assertRaisesRegex(RuntimeError,'speech reached'): engine.run(job,{})
+            self.assertEqual(calls,['160p30','160p30'])
+
+    def test_short_old_cache_preserved_and_other_errors_do_not_move_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); work=root/'recordings'/'name VOD 123'/'_work'; work.mkdir(parents=True)
+            src=work/'full-160p.mp4'; src.write_bytes(b'x'*2000)
+            engine=pipeline.Pipeline(root,lambda *a:[])
+            job={'vod_id':'123','streamer':'name','duration_seconds':100}
+            with patch.object(pipeline,'media_duration',side_effect=pipeline.PipelineError('ffprobe')):
+                with self.assertRaises(pipeline.PipelineError): engine.run(job,{})
+            self.assertTrue(src.exists())
+            with patch.object(pipeline,'media_duration',return_value=40):
+                with self.assertRaises(pipeline.IncompleteVod): engine.run(job,{})
+            self.assertFalse(src.exists()); self.assertEqual(len(list(work.glob('full-160p.incomplete-*.mp4'))),1)

@@ -16,6 +16,17 @@ def normalize_login(value):
     if not LOGIN.fullmatch(value): raise ValueError('Некорректный логин Twitch')
     return value
 
+def parse_twitch_duration(value):
+    # Twitch Helix duration: e.g. 1h2m3s, 2h, 35m or 8s.
+    match = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', str(value))
+    if not match or not any(part is not None for part in match.groups()):
+        raise ValueError('Некорректная длительность VOD Twitch')
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    duration = hours * 3600 + minutes * 60 + seconds
+    if duration <= 0:
+        raise ValueError('Пустая запись VOD Twitch')
+    return duration
+
 class TwitchClient:
     def __init__(self, client_id, client_secret, proxy_url=''):
         import requests
@@ -112,8 +123,13 @@ class Monitor:
             try:
                 videos=self.api.videos(row['user_id'])
                 match=next((v for v in videos if str(v.get('stream_id') or '')==row['stream_id'] and v.get('id') and v.get('duration')),None)
-                if not match: continue
+                if not match:
+                    # Absence breaks continuity; never count the missing interval as stable.
+                    with self.store._connect() as db:
+                        db.execute("UPDATE observed_streams SET candidate_id=NULL,candidate_duration=NULL,stable_since=NULL,updated_at=? WHERE stream_id=? AND state='waiting_vod'", (now,row['stream_id']))
+                    continue
                 vod_id=str(match['id']); duration=str(match['duration'])
+                duration_seconds=parse_twitch_duration(duration)
                 if not vod_id.isdecimal(): raise ValueError('Некорректный ID VOD')
                 # Candidate must remain unchanged across independent polls.
                 same=row['candidate_id']==vod_id and row['candidate_duration']==duration and row['stable_since'] is not None
@@ -124,7 +140,7 @@ class Monitor:
                     db.commit()
                 if same and now-stable_since>=self.stability_seconds:
                     # Queue insertion and state are separately committed; UNIQUE VOD makes recovery idempotent.
-                    self.store.add(vod_id,login,str(match.get('title') or row['title']))
+                    self.store.add(vod_id,login,str(match.get('title') or row['title']), duration_seconds=duration_seconds)
                     with self.store._connect() as db:
                         db.execute("UPDATE observed_streams SET state='queued',queued_vod_id=?,updated_at=? WHERE stream_id=? AND state='waiting_vod'",(vod_id,now,row['stream_id']))
             except Exception as exc:

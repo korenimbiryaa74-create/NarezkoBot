@@ -23,6 +23,12 @@ class JobStore:
               timestamp REAL NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS ix_jobs_ready ON jobs(state,available_at,id);
             ''')
+            # Existing installations retain all rows and gain the optional duration.
+            db.execute('BEGIN IMMEDIATE')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            if 'duration_seconds' not in columns:
+                db.execute('ALTER TABLE jobs ADD COLUMN duration_seconds REAL')
+            db.commit()
 
     @contextmanager
     def _connect(self):
@@ -34,15 +40,22 @@ class JobStore:
         finally:
             db.close()
 
-    def add(self, vod_id, streamer, title=''):
+    def add(self, vod_id, streamer, title='', duration_seconds=None):
         vod_id, streamer = str(vod_id).strip(), str(streamer).strip()
         if not vod_id.isdecimal() or not streamer:
             raise ValueError('Требуются числовой ID записи и имя стримера')
+        if duration_seconds is not None:
+            import math
+            duration_seconds = float(duration_seconds)
+            if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+                raise ValueError('Некорректная длительность записи')
         now = time.time()
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            cur = db.execute('INSERT OR IGNORE INTO jobs(vod_id,streamer,title,created_at,updated_at) VALUES (?,?,?,?,?)',
-                             (vod_id, streamer, str(title), now, now))
+            cur = db.execute('INSERT OR IGNORE INTO jobs(vod_id,streamer,title,created_at,updated_at,duration_seconds) VALUES (?,?,?,?,?,?)',
+                             (vod_id, streamer, str(title), now, now, duration_seconds))
+            if not cur.rowcount and duration_seconds is not None:
+                db.execute("UPDATE jobs SET duration_seconds=? WHERE vod_id=? AND duration_seconds IS NULL AND state IN ('queued','retry')", (duration_seconds, vod_id))
             row = db.execute('SELECT * FROM jobs WHERE vod_id=?', (vod_id,)).fetchone()
             if cur.rowcount: self._event(db, row['id'], now, 'Ожидает обработки')
             db.commit()

@@ -34,3 +34,18 @@ class JobStoreTests(unittest.TestCase):
         ids = [r['id'] for r in claims if r]
         self.assertEqual(len(ids),20); self.assertEqual(len(set(ids)),20)
 if __name__ == '__main__': unittest.main()
+
+class MigrationTests(unittest.TestCase):
+    def test_old_database_migration_preserves_queued_jobs(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'old.db'
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, vod_id TEXT UNIQUE NOT NULL, streamer TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'queued', stage TEXT NOT NULL DEFAULT 'Ожидает обработки', detail TEXT NOT NULL DEFAULT '', output_dir TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+                db.execute("INSERT INTO jobs (vod_id,streamer,created_at,updated_at) VALUES ('1','nix',0,0)")
+            db.close()
+            store=JobStore(path)
+            row,created=store.add('1','nix',duration_seconds=3600)
+            self.assertFalse(created); self.assertEqual(row['duration_seconds'],3600)
+            self.assertEqual(store.claim()['duration_seconds'],3600)
+            self.assertEqual(JobStore(path).list_jobs()[0]['vod_id'],'1')

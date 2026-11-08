@@ -20,6 +20,7 @@ import transcribe
 import whisper_cpp
 
 class PipelineError(RuntimeError): pass
+class IncompleteVod(PipelineError): pass
 
 def safe_name(value):
     value=re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(value)).strip(' .')
@@ -150,15 +151,26 @@ class Pipeline:
         threads=int(cfg.get('download_threads',4)); quality=cfg.get('quality','1080p60')
         src=work/'full-160p.mp4'
         progress('Скачивание','Загружается запись для транскрибации')
-        if not src.exists():
+        expected=job.get('duration_seconds')
+        def check_duration(path):
+            actual=media_duration(path)
+            if expected and actual < float(expected)-max(5.,float(expected)*.005):
+                raise IncompleteVod('Запись короче заявленной Twitch; не обрабатываю неполный VOD')
+            return actual
+        if src.exists():
+            # Preserve old downloads for inspection but do not reuse a known short file.
+            try:
+                duration=check_duration(src)
+            except IncompleteVod:
+                import uuid
+                os.replace(src,work/('full-160p.incomplete-'+uuid.uuid4().hex+'.mp4'))
+                raise
+        else:
             temp=work/'full-160p.downloading.mp4'
             if temp.exists(): temp.unlink() # only our own explicitly named temporary file
             self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
-            media_duration(temp); os.replace(temp,src)
-        duration=media_duration(src)
-        expected=job.get('duration_seconds')
-        if expected and duration < float(expected)-max(5.,float(expected)*.005):
-            raise PipelineError('Запись короче заявленной Twitch; не обрабатываю неполный VOD')
+            duration=check_duration(temp) # do not promote a partial VOD into the cache
+            os.replace(temp,src)
         segs,duration=self.speech(src,work/'transcripts',cfg.get('speech',{}),progress,duration=duration)
         progress('Поиск реакций','Анализируется полный транскрипт')
         rows=validate_intervals(self.finder(str(src),segs,duration,login,cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
