@@ -187,6 +187,7 @@ try {
     if (-not (Api-Ready)) { throw 'Не удалось запустить локальный сервер Ollama на 127.0.0.1:11434.' }
     Write-Host 'Загрузка локальной модели Qwen3-8B (~5,2 ГБ)...'
     Run-Checked -file $ollama -arguments @('pull','qwen3:8b')
+    Run-Checked -file $ollama -arguments @('pull','qwen3-vl:4b')
     # Official pre-release build pinned to its release digest. RTX 5060 compatibility
     # and actual GPU execution still need a real Windows test.
     $whisper = Join-Path $root 'desktop\tools\whisper'
