@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import full_cycle
@@ -19,6 +20,7 @@ import stream_cutter
 import transcribe
 import whisper_cpp
 import groq_speech
+from job_store import JobStore
 
 class PipelineError(RuntimeError): pass
 class IncompleteVod(PipelineError): pass
@@ -48,6 +50,48 @@ def load_json(path):
 
 def file_stamp(path):
     st=Path(path).stat(); return {'size':st.st_size,'mtime_ns':st.st_mtime_ns}
+
+def test_transcript_cache(root, video, job, progress, check_local):
+    """Separate test transcription from job output, using a full-content fingerprint."""
+    progress('Транскрибация','Проверка тестового видео для кэша транскрипции')
+    digest=hashlib.sha256()
+    last_report=time.monotonic(); read=0; size=Path(video).stat().st_size
+    with open(video,'rb') as f:
+        while True:
+            block=f.read(4*1024*1024)
+            if not block: break
+            digest.update(block); read+=len(block)
+            if time.monotonic()-last_report >= 5:
+                progress('Транскрибация',f'Проверка тестового видео для кэша: {min(100,int(read*100/max(size,1)))}%')
+                last_report=time.monotonic()
+    check_local()
+    source_hash=digest.hexdigest()
+    target=Path(root)/'state'/'test_transcripts'/source_hash
+    # Old builds kept chunks under a unique job folder. Match saved filename,
+    # size and mtime before importing; old chunks cannot prove a content hash.
+    db_path=Path(root)/'state'/'jobs.sqlite3'
+    if db_path.exists():
+        store=JobStore(db_path)
+        ids=store.local_test_ids(job['local_name'],job['local_size'],job['local_mtime_ns'])
+        if ids and not store.bind_legacy_test_cache(job['local_name'],job['local_size'],job['local_mtime_ns'],source_hash):
+            ids=[] # Metadata was reused by a different file; never import legacy chunks again.
+        count=0
+        for vod_id in ids:
+            if not re.fullmatch(r'test-[a-f0-9]{32}',str(vod_id)): continue
+            legacy=Path(root)/'recordings'/f"Тест {safe_name(Path(job['local_name']).stem)} {vod_id}"/'_work'/'transcripts'
+            if not legacy.is_dir() or legacy.is_symlink(): continue
+            for directory in legacy.iterdir():
+                if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r'[a-f0-9]{64}',directory.name): continue
+                for source in directory.iterdir():
+                    if source.is_symlink() or not source.is_file() or not re.fullmatch(r'\d{4}(?:\.half-[01])?\.json',source.name): continue
+                    dest=target/directory.name/source.name
+                    if dest.exists(): continue
+                    obj=load_json(source)
+                    if not isinstance(obj,dict) or obj.get('key')!=directory.name: continue
+                    atomic_json(dest,obj); count+=1
+        if count:
+            progress('Транскрибация',f'Перенесён кэш из прежних тестов: {count} частей (совпали имя, размер и время файла)')
+    return target
 
 def job_identity(job):
     return {k:job.get(k) for k in ('id','vod_id','streamer','local_name','local_size','local_mtime_ns')}
@@ -276,7 +320,9 @@ class Pipeline:
                 self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
                 duration=check_duration(temp) # do not promote a partial VOD into the cache
                 os.replace(temp,src)
-        segs,duration=self.speech(src,work/'transcripts',cfg.get('speech',{}),progress,duration=duration)
+        cache=test_transcript_cache(self.root,src,job,progress,check_local) if local_name else work/'transcripts'
+        check_local()
+        segs,duration=self.speech(src,cache,cfg.get('speech',{}),progress,duration=duration)
         check_local()
         progress('Поиск реакций','Анализируется полный транскрипт')
         finder_cfg=cfg

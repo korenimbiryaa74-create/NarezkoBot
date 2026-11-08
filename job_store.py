@@ -22,13 +22,16 @@ class JobStore:
               id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
               timestamp REAL NOT NULL, stage TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS ix_jobs_ready ON jobs(state,available_at,id);
+            CREATE TABLE IF NOT EXISTS legacy_test_cache_identity (
+              name TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL,
+              PRIMARY KEY(name,size,mtime_ns));
             ''')
             # Existing installations retain all rows and gain the optional duration.
             db.execute('BEGIN IMMEDIATE')
             columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'duration_seconds' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN duration_seconds REAL')
-            for name, kind in (('local_name','TEXT'),('local_size','INTEGER'),('local_mtime_ns','INTEGER')):
+            for name, kind in (('local_name','TEXT'),('local_size','INTEGER'),('local_mtime_ns','INTEGER'),('hidden','INTEGER NOT NULL DEFAULT 0')):
                 if name not in columns:
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
             db.commit()
@@ -152,7 +155,40 @@ class JobStore:
 
     def list_jobs(self, limit=100):
         with self._connect() as db:
-            return [dict(r) for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+            return [dict(r) for r in db.execute('SELECT * FROM jobs WHERE hidden=0 ORDER BY id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+
+    def local_test_ids(self, name, size, mtime_ns):
+        # Keep even hidden records: legacy per-job caches can still be reused.
+        with self._connect() as db:
+            return [r['vod_id'] for r in db.execute(
+                "SELECT vod_id FROM jobs WHERE local_name=? AND local_size=? AND local_mtime_ns=? ORDER BY id DESC",
+                (name,size,mtime_ns))]
+
+    def bind_legacy_test_cache(self, name, size, mtime_ns, digest):
+        # A weak legacy identity may be associated with only one content hash.
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT OR IGNORE INTO legacy_test_cache_identity VALUES (?,?,?,?)',(name,size,mtime_ns,digest))
+            row=db.execute('SELECT sha256 FROM legacy_test_cache_identity WHERE name=? AND size=? AND mtime_ns=?',(name,size,mtime_ns)).fetchone()
+            db.commit(); return row['sha256']==digest
+
+    def clear_history(self):
+        # Hide instead of deleting: VOD de-duplication and cache migration need these records.
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cur=db.execute("UPDATE jobs SET hidden=1 WHERE hidden=0 AND state IN ('done','failed','cancelled')")
+            count=cur.rowcount; db.commit(); return count
+
+    def clear_queue(self):
+        # Transaction serializes against claim(): a running job is never touched.
+        now=time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows=db.execute("SELECT id FROM jobs WHERE hidden=0 AND state IN ('queued','retry')").fetchall()
+            for row in rows:
+                db.execute("UPDATE jobs SET state='cancelled',stage='Отменено',detail='Очищено пользователем',hidden=1,updated_at=? WHERE id=?",(now,row['id']))
+                self._event(db,row['id'],now,'Отменено','Очищено пользователем')
+            db.commit(); return len(rows)
 
     def events(self, job_id):
         with self._connect() as db:
