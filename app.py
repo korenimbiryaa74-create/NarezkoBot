@@ -12,6 +12,8 @@ from chatgpt_finder import ChatGPTFinder
 import banner_blur
 import stream_cutter
 import manual_blur
+import windows_autostart
+import single_instance
 
 ROOT=Path(__file__).resolve().parent
 
@@ -27,6 +29,7 @@ class App:
         self.variables={}; self._last_job=None
         self._build()
         self._load_controls()
+        self._import_profiles_once()
         self.window.protocol('WM_DELETE_WINDOW',self.close)
         if self.config['monitor']['enabled']:
             self.service.start()
@@ -48,7 +51,15 @@ class App:
         ttk.Label(header,text='Экспериментальная сборка — не для работы без контроля').pack(side='left',padx=16)
         tabs=ttk.Notebook(outer); tabs.pack(fill='both',expand=True,pady=10)
         dashboard=ttk.Frame(tabs,padding=10); settings=ttk.Frame(tabs,padding=10)
-        tabs.add(dashboard,text='Состояние'); tabs.add(settings,text='Настройки')
+        notices=ttk.Frame(tabs,padding=10)
+        tabs.add(dashboard,text='Состояние'); tabs.add(notices,text='Уведомления'); tabs.add(settings,text='Настройки')
+        noticebar=ttk.Frame(notices);noticebar.pack(fill='x')
+        ttk.Label(noticebar,text='События стримов и обработки').pack(side='left')
+        ttk.Button(noticebar,text='Очистить уведомления',command=self.clear_notifications).pack(side='right')
+        noticeframe=ttk.Frame(notices);noticeframe.pack(fill='both',expand=True,pady=8)
+        self.notifications=tk.Text(noticeframe,state='disabled',wrap='word')
+        scroll=ttk.Scrollbar(noticeframe,orient='vertical',command=self.notifications.yview)
+        self.notifications.configure(yscrollcommand=scroll.set);self.notifications.pack(side='left',fill='both',expand=True);scroll.pack(side='right',fill='y')
         bar=ttk.Frame(dashboard);bar.pack(fill='x')
         ttk.Button(bar,text='Сохранить и запустить',command=self.start).pack(side='left')
         ttk.Button(bar,text='Остановить после текущей операции',command=self.stop).pack(side='left',padx=5)
@@ -100,7 +111,7 @@ class App:
         for f in (common,processing,speech):f.columnconfigure(1,weight=1)
         self._row(common,0,'Twitch Client ID','client_id')
         self._row(common,1,'Twitch Client Secret','client_secret',secret=True)
-        self._row(common,2,'Стримеры через запятую','streamers')
+        self._row(common,2,'Стримеры через запятую (добавляются из профилей блюра)','streamers')
         self._row(common,3,'Интервал проверки, секунды','interval')
         self._toggle(common,4,'Мониторинг включён','monitor_enabled')
         self._toggle(common,5,'Использовать прокси','proxy_enabled')
@@ -108,6 +119,10 @@ class App:
         self._toggle(common,7,'Прокси для Twitch API','proxy_twitch')
         self._toggle(common,8,'Прокси для ChatGPT','proxy_chatgpt')
         ttk.Label(common,text='Загрузка видео работает напрямую. После смены прокси перезапустите приложение.').grid(row=9,column=0,columnspan=2,sticky='w',padx=8,pady=7)
+        startup=ttk.Frame(common);startup.grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=5)
+        ttk.Button(startup,text='Включить автозапуск Windows',command=lambda:self.set_autostart(True)).pack(side='left')
+        ttk.Button(startup,text='Отключить автозапуск',command=lambda:self.set_autostart(False)).pack(side='left',padx=5)
+        ttk.Label(common,text='Автозапуск — после входа в Windows. ПК не должен переходить в сон.').grid(row=11,column=0,columnspan=2,sticky='w',padx=8)
         self._row(processing,0,'Качество Twitch','quality')
         self._row(processing,1,'Потоки скачивания','threads')
         self._row(processing,2,'Минимальная длина реакции, мин','min_reaction')
@@ -149,7 +164,7 @@ class App:
             v=self.variables; c=copy.deepcopy(self.config)
             c['twitch']={'client_id':v['client_id'].get().strip(),'client_secret':v['client_secret'].get().strip()}
             c['streamers']=[x.strip() for x in v['streamers'].get().split(',') if x.strip()]
-            c['monitor']={'enabled':v['monitor_enabled'].get(),'interval':v['interval'].get()}
+            c['monitor'].update(enabled=v['monitor_enabled'].get(),interval=v['interval'].get())
             c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get(),'groq':v['proxy_groq'].get()}
             p=c['pipeline'];p.update(quality=v['quality'].get().strip(),download_threads=v['threads'].get(),min_reaction_minutes=v['min_reaction'].get(),bridge_minutes=v['bridge'].get(),keep_original=v['keep_original'].get(),remove_donations=v['remove_donations'].get())
             p['banner_blur'].update(enabled=v['banner_blur'].get(),test_streamer=v['banner_test_streamer'].get().strip())
@@ -168,10 +183,11 @@ class App:
             messagebox.showinfo('Groq','Ключ загружен в поле. Нажмите «Сохранить настройки».')
         except ValueError as exc: messagebox.showerror('Groq',str(exc))
     def start(self):
+        v=self.variables
+        if not v['client_id'].get().strip() or not v['client_secret'].get().strip() or not v['streamers'].get().strip():
+            messagebox.showwarning('Нужны данные','Для мониторинга укажите Twitch Client ID, Client Secret и хотя бы одного стримера.');return
         self.variables['monitor_enabled'].set(True)
         if not self.save():return
-        if not self.config['twitch']['client_id'] or not self.config['twitch']['client_secret'] or not self.config['streamers']:
-            messagebox.showwarning('Нужны данные','Укажите Twitch Client ID, Client Secret и хотя бы одного стримера.');return
         if self.service.start(): self.status.set('Мониторинг запущен')
         else: messagebox.showwarning('Остановка', 'Дождитесь завершения текущей операции перед повторным запуском.')
     def stop(self):
@@ -289,13 +305,31 @@ class App:
         if name is None:return None
         try:return manual_blur.normalize_login(name)
         except ValueError:messagebox.showerror('Блюр','Введите корректный логин Twitch: латинские буквы, цифры или _.');return None
-    def _blur_saved(self):
-        self.banner_info.set('Профиль сохранён. Области действуют на протяжении всей нарезки; проверьте готовое видео.')
+    def _import_profiles_once(self):
+        # Migrate existing profiles once; later the user can remove a name from
+        # the editable watch list without it silently reappearing on restart.
+        if self.config['monitor'].get('profiles_imported'):return
+        names=[x.strip() for x in self.variables['streamers'].get().split(',') if x.strip()]
+        existing={x.lower() for x in names}
+        for name in manual_blur.profile_logins(ROOT):
+            if name not in existing:names.append(name);existing.add(name)
+        self.variables['streamers'].set(', '.join(names))
+        self.config['monitor']['profiles_imported']=True
+        if not self.save():self.config['monitor']['profiles_imported']=False
+
+    def _blur_saved(self,name):
+        names=[x.strip() for x in self.variables['streamers'].get().split(',') if x.strip()]
+        if name not in {x.lower() for x in names}:names.append(name)
+        self.variables['streamers'].set(', '.join(names))
+        if self.save():
+            self.banner_info.set(f'Профиль {name} сохранён и добавлен в список мониторинга. Блюр действует на всей нарезке.')
+        else:
+            self.banner_info.set('Профиль сохранён. Исправьте настройки и нажмите «Сохранить настройки», чтобы добавить стримера в мониторинг.')
     def streamer_without_blur(self):
         name=self._blur_login()
         if not name:return
         if not messagebox.askyesno('Без блюра',f'Сохранить профиль {name} без блюра? Старые области этого профиля будут заменены.') :return
-        try:manual_blur.save_profile(ROOT,name,[]);self._blur_saved()
+        try:manual_blur.save_profile(ROOT,name,[]);self._blur_saved(name)
         except Exception as exc:messagebox.showerror('Блюр',str(exc))
     def configure_streamer_blur(self):
         name=self._blur_login()
@@ -315,7 +349,7 @@ class App:
             image,vod,t=state['data'];self.status.set(f'Кадр VOD {vod}: {t} с')
             try:
                 from manual_blur_picker import ManualBlurPicker
-                ManualBlurPicker(self.window,ROOT,name,image,self._blur_saved)
+                ManualBlurPicker(self.window,ROOT,name,image,lambda:self._blur_saved(name))
             except Exception as exc:messagebox.showerror('Блюр',str(exc))
         thread=threading.Thread(target=work,daemon=True);thread.start();self.window.after(400,poll)
     def blur_from_local(self):
@@ -329,8 +363,21 @@ class App:
         if seconds is None:return
         try:
             ffmpeg,_=stream_cutter.require_tools();image=banner_blur.full_frame_at(path,seconds,ffmpeg)
-            ManualBlurPicker(self.window,ROOT,name,image,self._blur_saved)
+            ManualBlurPicker(self.window,ROOT,name,image,lambda:self._blur_saved(name))
         except Exception as exc:messagebox.showerror('Блюр',str(exc))
+    def set_autostart(self,enabled):
+        action='Включить' if enabled else 'Отключить'
+        if not messagebox.askyesno('Автозапуск',f'{action} запуск Нарезкобота после входа в текущую учётную запись Windows?'):return
+        try:
+            windows_autostart.set_autostart(ROOT,enabled)
+            messagebox.showinfo('Автозапуск',('Включён. После входа в Windows приложение откроется; мониторинг возобновится, если он был включён.' if enabled else 'Автозапуск отключён.'))
+        except Exception as exc:messagebox.showerror('Автозапуск',str(exc))
+
+    def clear_notifications(self):
+        if not messagebox.askyesno('Уведомления','Очистить список уведомлений? Очередь, профили и результаты сохранятся.'):return
+        try:self.service.store.clear_notifications()
+        except Exception as exc:messagebox.showerror('Уведомления','Не удалось очистить уведомления: '+type(exc).__name__)
+
     def open_outputs(self):
         folder=ROOT/'recordings';folder.mkdir(exist_ok=True)
         if hasattr(os,'startfile'):os.startfile(str(folder))
@@ -353,6 +400,10 @@ class App:
             # Keep it until the selection is cleared, then catch up on new events.
             if not self.events.tag_ranges('sel') and self.events.get('1.0','end-1c') != text:
                 self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
+            rows=self.service.store.notifications(200)
+            notice_text='\n'.join(__import__('datetime').datetime.fromtimestamp(r['timestamp']).strftime('%d.%m %H:%M')+'  '+r['message'] for r in reversed(rows))
+            if not self.notifications.tag_ranges('sel') and self.notifications.get('1.0','end-1c') != notice_text:
+                self.notifications.configure(state='normal');self.notifications.delete('1.0','end');self.notifications.insert('1.0',notice_text);self.notifications.configure(state='disabled');self.notifications.see('end')
         except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
         self.window.after(3000,self.refresh)
     def close(self):
@@ -364,4 +415,11 @@ class App:
         self.window.destroy()
 
 if __name__=='__main__':
-    root=tk.Tk(); App(root); root.mainloop()
+    root=tk.Tk()
+    try:
+        lock=single_instance.acquire(ROOT)
+    except (single_instance.AlreadyRunning,OSError) as exc:
+        root.withdraw();messagebox.showwarning('Нарезкобот',str(exc));root.destroy()
+    else:
+        try:App(root);root.mainloop()
+        finally:single_instance.release(lock)
