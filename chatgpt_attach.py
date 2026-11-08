@@ -6,6 +6,28 @@ import time
 JS_PICK_FILE_INPUT = '((want)=>{\nconst all=Array.from(document.querySelectorAll(\'input[type="file"]\'));\nall.forEach(i=>i.removeAttribute(\'data-twl-file\'));\nconst composer=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nconst form=composer&&composer.closest(\'form\');\nconst compatible=i=>{\n if(i.disabled)return false;\n const a=(i.getAttribute(\'accept\')||\'\').toLowerCase().trim();\n if(want===\'image\')return !a||a.includes(\'image\')||a.includes(\'*/*\');\n if(!a||a.includes(\'text\')||a.includes(\'.txt\')||a.includes(\'*/*\'))return true;\n return !a.split(\',\').every(x=>x.trim().startsWith(\'image\'));\n};\nconst eligible=all.filter(compatible);\nconst near=eligible.filter(i=>form&&form.contains(i));\nlet best=near.length===1?near[0]:null;\nif(!best&&near.length>1){\n const broad=near.filter(i=>!(i.getAttribute(\'accept\')||\'\').trim()||(i.getAttribute(\'accept\')||\'\').includes(\'.txt\'));\n if(broad.length===1)best=broad[0];\n}\nif(!best&&near.length===0&&eligible.length===1)best=eligible[0];\nif(!best)return 0;\nbest.setAttribute(\'data-twl-file\',\'1\');return eligible.length;\n})(%s)'
 JS_ATTACHED = '((name)=>{\nconst a=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nif(!a)return {blob:0,named:false,busy:false};\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nlet f=a.closest(\'form\')||a.parentElement;\nfor(let n=0;n<5&&f&&f!==document.body;n++,f=f.parentElement){\n if(f.querySelector(\'[data-message-author-role],[data-turn="user"],[data-turn="assistant"]\'))break;\n const txt=f.innerText||\'\';const stem=name.replace(/\\.[^.]+$/,\'\');\n const named=txt.includes(name)||(stem.length>3&&txt.includes(stem));\n const blob=Array.from(f.querySelectorAll(\'img\')).filter(i=>visible(i)&&(i.currentSrc||i.src||\'\').startsWith(\'blob:\')).length;\n const busy=Array.from(f.querySelectorAll(\'[role="progressbar"],circle[stroke-dasharray],.animate-spin,[aria-busy="true"]\')).some(visible);\n if(named||blob)return {blob,named,busy};\n}\nreturn {blob:0,named:false,busy:false};\n})(%s)'
 
+
+# Inspect visible UI only, never messages or transcript content. Return no page text.
+JS_QUOTA = r'''(()=>{
+const visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
+const patterns=[/file upload limit reached/i,/you(?:['’]ve| have) reached (?:your |the )?(?:file |upload |attachment )*(?:limit|quota)/i,
+ /too many (?:file )?uploads/i,/(?:upload|attachment|file).{0,35}(?:limit|quota).{0,25}(?:reached|exceeded)/i,
+ /(?:достигнут|исчерпан|превышен).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i,
+ /лимит.{0,25}(?:загруз|файл|вложен).{0,25}(?:достигнут|исчерпан|превышен)/i,
+ /вы (?:достигли|исчерпали).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i,
+ /перейти на plus.{0,35}чтобы загружать больше/i,
+ /подождите.{0,50}чтобы повторить загрузку/i,
+ /upgrade to plus.{0,50}upload more/i,
+ /(?:wait|try again).{0,60}(?:upload|attach).{0,30}(?:file|again)?/i];
+for(const e of document.querySelectorAll('[role="alert"],[role="dialog"],[role="menu"],[role="menuitem"],[role="tooltip"],[data-testid*="toast"],button,p,span,div')){
+ if(!visible(e)||e.closest('[data-message-author-role],[data-turn],pre,code,[contenteditable="true"],textarea'))continue;
+ if(e.querySelector('[data-message-author-role],[data-turn],pre,code,[contenteditable="true"],textarea'))continue;
+ const text=((e.innerText||'')+' '+(e.getAttribute('title')||'')+' '+(e.getAttribute('aria-label')||'')).trim();
+ if(text.length<=400&&patterns.some(p=>p.test(text)))return {blocked:true};
+}
+return {blocked:false};})()
+'''
+
 def attach(self, path: str) -> bool:
     tab=self.tab; name=os.path.basename(path)
     image=os.path.splitext(name)[1].lower() in ('.png','.jpg','.jpeg','.webp','.gif')
@@ -36,6 +58,7 @@ def attach(self, path: str) -> bool:
             time.sleep(.5)
         if menu_clicked and hasattr(tab,'wait_file_chooser'):
             event=tab.wait_file_chooser(3)
+    self._check_upload_quota()
     backend=(event or {}).get('backendNodeId')
     if backend:
         self._status('найдено поле загрузки, выбранное меню ChatGPT')
