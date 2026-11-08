@@ -6,6 +6,7 @@ import threading
 import unicodedata
 import os
 import subprocess
+import socket
 import time
 import urllib.request
 import websocket
@@ -22,17 +23,8 @@ def _cookie_domain(value):
     value = str(value or '').lstrip('.').lower()
     return any((value == d or value.endswith('.' + d) for d in ('chatgpt.com', 'openai.com')))
 
-class ChatGPTWebError(RuntimeError):
-    pass
+from chatgpt_errors import ChatGPTWebError, ChatGPTSafetyError, ChatGPTLoginError, ChatGPTQuotaError, ChatGPTTechnicalError
 
-class ChatGPTSafetyError(ChatGPTWebError):
-    safety_blocked = True
-
-class ChatGPTQuotaError(ChatGPTWebError):
-    quota_blocked = True
-
-class ChatGPTTechnicalError(ChatGPTWebError):
-    pass
 JS_EXPIRED_RE = '/Срок действия вашего сеанса истек|сеанс истек|Session has expired|session has expired|Войдите снова|войдите снова|Log in again/i'
 
 def _http_json(url, data=None, method=None, timeout=10):
@@ -183,12 +175,20 @@ class ChatGPTWeb:
                 return p
         raise ChatGPTWebError('не нашёл ни Chrome, ни Edge')
 
+    def _debug_port_busy(self):
+        try:
+            with socket.create_connection(('127.0.0.1',self.port),timeout=.3): return True
+        except OSError:
+            return False
+
     def start(self):
         if self.proc and self.proc.poll() is None:
             return
         if self.proc:
             self.proc = None
             self.tab = None
+        if self._debug_port_busy():
+            raise ChatGPTWebError('Порт браузера ChatGPT занят; закройте старое окно приложения и повторите')
         args = [self._chrome_path(), f'--remote-debugging-port={self.port}', '--remote-debugging-address=127.0.0.1', f'--user-data-dir={self.profile}', '--no-first-run', '--no-default-browser-check', '--disable-session-crashed-bubble', '--disable-blink-features=AutomationControlled', '--remote-allow-origins=*', '--window-size=1400,1000']
         if self.headless:
             args.append('--headless=new')
@@ -415,7 +415,7 @@ class ChatGPTWeb:
 
     def new_chat(self, wait: int=None, force: bool=False) -> bool:
         if not self.ensure_login():
-            return False
+            raise ChatGPTLoginError('В этом профиле требуется вход в ChatGPT')
         wait = wait or self.load_timeout
         st = self._wait_ready(min(wait, 60), settle=1.5) or {}
         if not force and st.get('ok') and (st.get('path') == '/') and (not st.get('msgs')):
@@ -552,7 +552,7 @@ class ChatGPTWeb:
         return False
     JS_PICK_FILE_INPUT = chatgpt_attach.JS_PICK_FILE_INPUT
     JS_ATTACHED = chatgpt_attach.JS_ATTACHED
-    JS_QUOTA = '(()=>{\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nconst patterns=[/file upload limit reached/i,/you(?:[\'’]ve| have) reached (?:your |the )?(?:file |upload |attachment )*(?:limit|quota)/i,\n /too many (?:file )?uploads/i,/(?:upload|attachment|file).{0,35}(?:limit|quota).{0,25}(?:reached|exceeded)/i,\n /(?:достигнут|исчерпан|превышен).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i,\n /лимит.{0,25}(?:загруз|файл|вложен).{0,25}(?:достигнут|исчерпан|превышен)/i,\n /вы (?:достигли|исчерпали).{0,30}лимит.{0,30}(?:загруз|файл|вложен)/i];\nfor(const e of document.querySelectorAll(\'[role="alert"],[role="dialog"],[role="tooltip"],[data-testid*="toast"],button[aria-disabled="true"],p,span\')){\n if(!visible(e)||e.closest(\'[data-message-author-role="user"],[data-turn="user"],pre,code\'))continue;\n const text=((e.innerText||\'\')+\' \'+(e.getAttribute(\'title\')||\'\')+\' \'+(e.getAttribute(\'aria-label\')||\'\')).trim();\n if(text.length<=1000&&patterns.some(p=>p.test(text)))return {blocked:true,text:text.slice(0,350)};\n}\nreturn {blocked:false};})()'
+    JS_QUOTA = chatgpt_attach.JS_QUOTA
 
     def _check_upload_quota(self):
         try:
@@ -561,7 +561,7 @@ class ChatGPTWeb:
             return
         if isinstance(state, dict) and state.get('blocked'):
             self._quota_blocked = True
-            raise ChatGPTQuotaError('ChatGPT: лимит загрузок исчерпан. ' + str(state.get('text') or ''))
+            raise ChatGPTQuotaError('ChatGPT: обнаружен лимит загрузки файлов')
 
     def _wait_attached(self, name: str, image: bool, seconds: int=45) -> bool:
         deadline = time.monotonic() + self._remaining(seconds)
@@ -880,4 +880,7 @@ class ChatGPTWeb:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
+                deadline=time.monotonic()+5
+                while self._debug_port_busy() and time.monotonic()<deadline:
+                    time.sleep(.1)
                 self._log('браузер закрыт, профиль сохранён')
