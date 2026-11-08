@@ -74,6 +74,7 @@ class App:
         ttk.Button(recoverybar,text='Очистить историю',command=self.clear_history).pack(side='left',padx=(0,5))
         ttk.Button(recoverybar,text='Очистить очередь',command=self.clear_queue).pack(side='left',padx=(0,5))
         ttk.Button(recoverybar,text='Вставить ответ ChatGPT',command=self.import_chatgpt_answer).pack(side='left')
+        ttk.Button(recoverybar,text='Собрать готовые файлы',command=self.organize_finished).pack(side='left',padx=5)
         eventbar=ttk.Frame(dashboard); eventbar.pack(fill='x',pady=(8,0))
         ttk.Label(eventbar,text='Последние события (выделение приостанавливает обновление текста)').pack(side='left')
         ttk.Button(eventbar,text='Скопировать все события',command=self.copy_events).pack(side='right')
@@ -193,6 +194,17 @@ class App:
             self.service.log(f'Очередь очищена: отменено заданий {count}')
             self.status.set(f'Очередь очищена: {count}')
         except Exception as exc: messagebox.showerror('Очередь','Не удалось очистить очередь: '+type(exc).__name__)
+
+    def organize_finished(self):
+        selected=self.jobs.selection()
+        if not selected:
+            messagebox.showinfo('Готовые файлы','Выберите завершённое задание в истории.');return
+        if not messagebox.askyesno('Готовые файлы','Собрать видео и транскрипты выбранного завершённого задания в отдельную папку и создать отчёты о паузах? Повторная обработка не потребуется.'):
+            return
+        try:
+            folder,count=self.service.organize_finished(int(selected[0]))
+            messagebox.showinfo('Готовые файлы',f'Собрано видео: {count}\nПапка: {folder}')
+        except Exception as exc: messagebox.showerror('Готовые файлы',str(exc))
 
     def import_chatgpt_answer(self):
         selected=self.jobs.selection()
