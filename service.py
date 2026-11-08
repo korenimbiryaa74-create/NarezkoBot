@@ -79,11 +79,22 @@ class Service:
     def worker_once(self):
         job=self.store.claim()
         if not job:return False
+        cfg=None
         try:
             cfg=copy.deepcopy(self.settings.load())
             engine=self.pipeline_factory(self.root,self.finder)
+            speech=cfg['pipeline']['speech']
+            speech['groq_proxy_url']=cfg['proxy']['url'] if cfg['proxy']['enabled'] and cfg['proxy'].get('groq') else ''
+            secrets=(cfg['twitch']['client_secret'],cfg['proxy']['url'],speech.get('groq_api_key',''))
+            def clean(text):
+                text=redact(str(text))
+                for secret in secrets:
+                    if secret: text=text.replace(secret,'[скрыто]')
+                return text
             def progress(stage,detail=''):
+                detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
+                if stage=='Транскрибация': self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             self.store.finish(job['id'],'done',f"Видео: {len(outcome['outputs'])}; {outcome['folder']}")
             self.log(f"VOD {job['vod_id']}: готово")
@@ -91,11 +102,11 @@ class Service:
             # No replay without reconciliation: a web request may have been delivered.
             detail=redact(f'{type(exc).__name__}: {str(exc)[:2000]}')
             # Defensive redact of configured secrets and proxy credentials.
-            try:
-                cfg=self.settings.load()
-                for secret in (cfg['twitch']['client_secret'],cfg['proxy']['url']):
-                    if secret: detail=detail.replace(secret,'[скрыто]')
-            except Exception: pass
+            for saved in (cfg,):
+                try:
+                    for secret in (saved['twitch']['client_secret'],saved['proxy']['url'],saved['pipeline']['speech'].get('groq_api_key','')):
+                        if secret: detail=detail.replace(secret,'[скрыто]')
+                except (TypeError,KeyError): pass
             current=next((x for x in self.store.list_jobs(1000) if x['id']==job['id']),None)
             safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер')
             if safe and job['attempts']<3:

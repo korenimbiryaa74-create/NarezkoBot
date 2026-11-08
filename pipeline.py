@@ -18,6 +18,7 @@ import full_cycle
 import stream_cutter
 import transcribe
 import whisper_cpp
+import groq_speech
 
 class PipelineError(RuntimeError): pass
 class IncompleteVod(PipelineError): pass
@@ -87,32 +88,66 @@ def default_download(vod_id, quality, output, begin=None, end=None, cli=None, th
     result=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace')
     if result.returncode or not output.is_file(): raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')')
 
-def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration=None):
+def _valid_speech_segments(segments, start, end):
+    if not isinstance(segments, list): raise PipelineError('Распознаватель не вернул список сегментов')
+    clean=[]
+    for seg in segments:
+        if not isinstance(seg,dict) or not isinstance(seg.get('text'),str): raise PipelineError('Повреждённый сегмент транскрипта')
+        try:
+            if isinstance(seg.get('start'),bool) or isinstance(seg.get('end'),bool): raise ValueError()
+            a,b=float(seg['start']),float(seg['end'])
+        except (ValueError,TypeError,KeyError): raise PipelineError('Повреждённые времена транскрипта') from None
+        if not math.isfinite(a) or not math.isfinite(b) or a<start-.5 or b>end+1 or b<a:
+            raise PipelineError('Времена транскрипта вне части')
+        clean.append(dict(seg,start=a,end=b))
+    return clean
+
+def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration=None, groq_transcriber=None):
     duration=media_duration(video) if duration is None else float(duration)
     chunk_seconds=600
     source=file_stamp(video)
     settings={'engine':'whisper.cpp-b5454','source':source,'model':cfg.get('model','large-v3-turbo'),'language':cfg.get('language','ru'),
               'device':cfg.get('device','auto'),'compute':cfg.get('compute','auto'),'beam':int(cfg.get('beam',1)), 'chunk_seconds':chunk_seconds}
-    key=hashlib.sha256(json.dumps(settings,sort_keys=True).encode()).hexdigest()
-    folder=Path(cache_dir)/key; folder.mkdir(parents=True,exist_ok=True)
+    groq_settings={'engine':'groq-whisper-large-v3-turbo','source':source,'language':settings['language'],'chunk_seconds':chunk_seconds}
+    def cache_key(params): return hashlib.sha256(json.dumps(params,sort_keys=True).encode()).hexdigest()
+    local_key=cache_key(settings); cloud_key=cache_key(groq_settings)
+    use_groq=bool(cfg.get('groq_enabled',True) and cfg.get('groq_api_key','').strip())
+    if cfg.get('groq_enabled',True) and not use_groq:
+        progress('Транскрибация','Ключ Groq не указан — используется локальный Whisper')
     total=math.ceil(duration/chunk_seconds); result=[]
     for i in range(total):
         start=i*chunk_seconds; end=min(duration,start+chunk_seconds)
-        filename=folder/f'{i:04}.json'; cached=load_json(filename)
-        progress('Транскрибация',f'Часть {i+1}/{total}, {timestamp(start)}–{timestamp(end)}')
-        if isinstance(cached,dict) and cached.get('key')==key and isinstance(cached.get('segments'),list):
-            segments=cached['segments']
-        else:
+        def read_cached(key):
+            obj=load_json(Path(cache_dir)/key/f'{i:04}.json')
+            if not isinstance(obj,dict) or obj.get('key')!=key: return None
+            try: return _valid_speech_segments(obj.get('segments'),start,end)
+            except PipelineError: return None
+        segments=read_cached(cloud_key) if use_groq else None
+        origin='Groq (кэш)' if segments is not None else ''
+        if segments is None:
+            segments=read_cached(local_key)
+            if segments is not None: origin='локальный Whisper (кэш)'
+        if segments is None and use_groq:
+            progress('Транскрибация',f'Часть {i+1}/{total} · Groq · {timestamp(start)}–{timestamp(end)}')
+            try:
+                fn=groq_transcriber or groq_speech.transcribe_chunk
+                segments=_valid_speech_segments(fn(str(video),start=start,end=end,api_key=cfg['groq_api_key'].strip(),
+                    language=settings['language'],proxy_url=cfg.get('groq_proxy_url','')),start,end)
+                atomic_json(Path(cache_dir)/cloud_key/f'{i:04}.json',{'key':cloud_key,'segments':segments})
+                origin='Groq'
+            except (groq_speech.GroqError,PipelineError) as exc:
+                # The error class never contains response bodies, credentials or URLs.
+                reason=str(exc) if isinstance(exc,groq_speech.GroqError) else 'Некорректные сегменты Groq'
+                progress('Транскрибация',f'{reason}; оставшиеся части — локальный Whisper')
+                use_groq=False
+        if segments is None:
+            progress('Транскрибация',f'Часть {i+1}/{total} · локальный Whisper · {timestamp(start)}–{timestamp(end)}')
             fn=transcriber or whisper_cpp.transcribe_file
-            segments=fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=start,end=end,quiet=True)
-            if not isinstance(segments,list): raise PipelineError('Распознаватель не вернул список сегментов')
-            atomic_json(filename,{'key':key,'segments':segments})
-        for seg in segments:
-            if not isinstance(seg,dict) or not isinstance(seg.get('text'),str): raise PipelineError('Повреждённый сегмент транскрипта')
-            try: a,b=float(seg['start']),float(seg['end'])
-            except (ValueError,TypeError,KeyError): raise PipelineError('Повреждённые времена транскрипта')
-            if not math.isfinite(a+b) or a<start-.5 or b>end+1 or b<a: raise PipelineError('Времена транскрипта вне части')
-            result.append(dict(seg,start=a,end=b))
+            segments=_valid_speech_segments(fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=start,end=end,quiet=True),start,end)
+            atomic_json(Path(cache_dir)/local_key/f'{i:04}.json',{'key':local_key,'segments':segments})
+            origin='локальный Whisper'
+        if 'кэш' in origin: progress('Транскрибация',f'Часть {i+1}/{total} · {origin}')
+        result.extend(segments)
     if not result: raise PipelineError('В записи не обнаружена речь')
     return result,duration
 

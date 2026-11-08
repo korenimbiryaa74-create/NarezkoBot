@@ -5,8 +5,8 @@ import os
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox
-from settings import Settings
+from tkinter import ttk, messagebox, filedialog
+from settings import Settings, import_legacy_groq_key
 from service import Service
 from chatgpt_finder import ChatGPTFinder
 
@@ -84,9 +84,9 @@ class App:
         self.events.bind('<Button-3>',self.show_event_menu)
         # Settings are organised into independently scrollable tabs rather than an oversized form.
         sub=ttk.Notebook(settings);sub.pack(fill='both',expand=True)
-        common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8)
-        sub.add(common,text='Twitch и прокси');sub.add(processing,text='Обработка')
-        for f in (common,processing):f.columnconfigure(1,weight=1)
+        common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8); speech=ttk.Frame(sub,padding=8)
+        sub.add(common,text='Twitch и прокси');sub.add(processing,text='Обработка');sub.add(speech,text='Распознавание речи')
+        for f in (common,processing,speech):f.columnconfigure(1,weight=1)
         self._row(common,0,'Twitch Client ID','client_id')
         self._row(common,1,'Twitch Client Secret','client_secret',secret=True)
         self._row(common,2,'Стримеры через запятую','streamers')
@@ -107,14 +107,20 @@ class App:
         self._row(processing,7,'Порог над шумом, дБ','onset')
         self._row(processing,8,'Максимальная высота видео','height')
         self._toggle(processing,9,'Сохранять исходные фрагменты','keep_original')
-        ttk.Label(processing,text='Речь: локальный Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.').grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.').grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        self._toggle(speech,0,'Использовать Groq; при ошибке — локальный Whisper','groq_enabled')
+        self._row(speech,1,'Groq API key','groq_api_key',secret=True)
+        ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)
+        self._toggle(speech,3,'Прокси для Groq (дополнительно включите общий прокси)','proxy_groq')
+        ttk.Label(speech,text='Аудио отправляется в Groq. Возможны лимиты и плата.\nБез ключа или при ошибке используется локальный Whisper.\nКлюч хранится в config.json открытым текстом; не делитесь этим файлом.').grid(row=4,column=0,columnspan=2,sticky='w',padx=8,pady=8)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
         c=self.config; p=c['pipeline']; s=p['silence']; v=self.variables
         values={'client_id':c['twitch']['client_id'],'client_secret':c['twitch']['client_secret'],
           'streamers':', '.join(c['streamers']),'interval':c['monitor']['interval'],'monitor_enabled':c['monitor']['enabled'],
-          'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],
+          'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],'proxy_groq':c['proxy']['groq'],
+          'groq_enabled':p['speech']['groq_enabled'],'groq_api_key':p['speech']['groq_api_key'],
           'quality':p['quality'],'threads':p['download_threads'],'min_reaction':p['min_reaction_minutes'],'bridge':p['bridge_minutes'],
           'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original']}
         for key,value in values.items(): v[key].set(value)
@@ -124,13 +130,22 @@ class App:
             c['twitch']={'client_id':v['client_id'].get().strip(),'client_secret':v['client_secret'].get().strip()}
             c['streamers']=[x.strip() for x in v['streamers'].get().split(',') if x.strip()]
             c['monitor']={'enabled':v['monitor_enabled'].get(),'interval':v['interval'].get()}
-            c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get()}
+            c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get(),'groq':v['proxy_groq'].get()}
             p=c['pipeline'];p.update(quality=v['quality'].get().strip(),download_threads=v['threads'].get(),min_reaction_minutes=v['min_reaction'].get(),bridge_minutes=v['bridge'].get(),keep_original=v['keep_original'].get())
+            p['speech'].update(groq_enabled=v['groq_enabled'].get(),groq_api_key=v['groq_api_key'].get().strip())
             p['silence'].update(enabled=v['silence'].get(),min_cut=v['min_cut'].get(),max_gap=v['max_gap'].get(),onset_db=v['onset'].get(),max_height=v['height'].get())
             self.config=self.settings.save(c);self.service.settings_changed();self.status.set('Настройки сохранены')
             return True
         except Exception as exc:
             messagebox.showerror('Ошибка настроек',str(exc));return False
+    def import_groq_key(self):
+        path=filedialog.askopenfilename(title='Выберите старый config.json',filetypes=[('JSON','*.json'),('Все файлы','*.*')])
+        if not path: return
+        try:
+            self.variables['groq_api_key'].set(import_legacy_groq_key(path))
+            self.variables['groq_enabled'].set(True)
+            messagebox.showinfo('Groq','Ключ загружен в поле. Нажмите «Сохранить настройки».')
+        except ValueError as exc: messagebox.showerror('Groq',str(exc))
     def start(self):
         self.variables['monitor_enabled'].set(True)
         if not self.save():return

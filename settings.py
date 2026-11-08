@@ -10,9 +10,9 @@ from proxy_setup import parse_proxy
 DEFAULTS={
  'twitch':{'client_id':'','client_secret':''},
  'streamers':[], 'monitor':{'enabled':False,'interval':60},
- 'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True},
+ 'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True,'groq':False},
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
-             'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1},
+             'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
              'keep_original':False}}
 
@@ -43,6 +43,16 @@ def validate(config):
     if silence['max_height'] not in (0,480,720,1080,1440,2160): raise ValueError('Некорректное разрешение')
     if silence['speed'] not in ('quality','fast','max','turbo'): raise ValueError('Некорректная скорость рендера')
     return result
+
+def import_legacy_groq_key(path):
+    """Read only the Groq key from a user-selected local legacy configuration."""
+    try:
+        with open(path,encoding='utf-8-sig') as f: data=json.load(f)
+        key=data.get('timecodes',{}).get('groq_api_key','')
+        if not isinstance(key,str) or not key.strip(): raise ValueError()
+        return key.strip()
+    except (OSError,ValueError,TypeError,AttributeError):
+        raise ValueError('Не удалось прочитать ключ timecodes.groq_api_key из выбранного JSON') from None
 
 class Settings:
     def __init__(self,path): self.path=Path(path)
