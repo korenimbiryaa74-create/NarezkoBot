@@ -263,6 +263,7 @@ class ChatGPTWeb:
                 pass
             if time.monotonic() - last_log >= 15:
                 last_log = time.monotonic()
+                self._status('ожидаю загрузки и проверки входа; страницу не перезагружаю')
                 self._log('жду интерфейс ChatGPT; страницу повторно НЕ перезагружаю')
             time.sleep(0.5)
         raise ChatGPTWebError('не дождался интерфейса ChatGPT; проверь загрузку страницы и прокси, а не транскрипцию')
@@ -364,7 +365,11 @@ class ChatGPTWeb:
     def _wait_ready(self, wait: int=None, settle: float=2.5) -> dict | None:
         deadline = time.time() + self._remaining(wait or self.load_timeout)
         mark, since = (None, 0.0)
+        next_status=time.monotonic()+15
         while time.time() < deadline:
+            if time.monotonic() >= next_status:
+                self._status('ожидаю готовности поля ввода в браузере')
+                next_status=time.monotonic()+15
             try:
                 st = self.tab.js(self.JS_READY) or {}
             except Exception:
@@ -478,6 +483,7 @@ class ChatGPTWeb:
                 payload_consumed = True
             if payload_consumed:
                 if time.monotonic() >= next_log:
+                    self._status('проверяю доставку; повторно не отправляю')
                     self._log('поле очистилось после клика; жду подтверждения, повторно НЕ отправляю')
                     next_log = time.monotonic() + 10
                 time.sleep(0.5)
@@ -492,6 +498,7 @@ class ChatGPTWeb:
                 stable_key = None
             if time.monotonic() >= next_log:
                 reason = 'идёт загрузка файла' if st.get('uploading') else 'кнопка ещё неактивна' if st.get('disabled') else 'кнопка не найдена' if not st.get('has') else 'проверяю полный текст' if current != expected else 'кнопка готова'
+                self._status('подготовка отправки: '+reason)
                 self._log('отправка: ' + reason)
                 next_log = time.monotonic() + 10
             can_click = stable >= 3 and (clicks == 0 or (clicks == 1 and time.monotonic() - last_click >= 15))
@@ -537,7 +544,11 @@ class ChatGPTWeb:
     def _wait_attached(self, name: str, image: bool, seconds: int=45) -> bool:
         deadline = time.monotonic() + self._remaining(seconds)
         stable = 0
+        next_status = time.monotonic()+15
         while time.monotonic() < deadline:
+            if time.monotonic() >= next_status:
+                self._status('ожидаю подтверждения прикреплённого файла')
+                next_status=time.monotonic()+15
             self._check_upload_quota()
             try:
                 state = self.tab.js(self.JS_ATTACHED % json.dumps(name)) or {}
@@ -626,8 +637,10 @@ class ChatGPTWeb:
         for attempt in range(3):
             if self._remaining(1) <= 0:
                 raise ChatGPTWebError('время отправки запроса истекло')
+            self._status('подготавливаю браузер и проверяю вход')
             if not self.new_chat(force=attempt > 0):
                 raise ChatGPTWebError('не залогинились в ChatGPT — куки протухли, переэкспортируй их из браузера')
+            self._status('чат готов, проверяю интерфейс')
             tab = self.tab
             page = self._page_id()
             self._send_baseline = tab.js(self.JS_SEND_STATE) or {}
@@ -637,11 +650,13 @@ class ChatGPTWeb:
             self._notice_baseline = list(initial.get('notices') or [])
             attached = True
             for path in files or []:
+                self._status('прикрепляю транскрипт; дождитесь загрузки')
                 attached = self._attach(path) and attached
                 time.sleep(1.5)
             docs = [p for p in files or [] if os.path.splitext(p)[1].lower() not in ('.png', '.jpg', '.jpeg', '.webp', '.gif')]
             if docs and (not attached):
                 raise ChatGPTWebError('транскрипт не прикрепился — запрос без файла НЕ отправлен; проверьте браузер и повторите вручную')
+            self._status('файл прикреплён; ввожу запрос')
             self._log('файл готов; ввожу критерии поиска')
             if not self._type_prompt(prompt):
                 last = 'текст не вводится в поле'
@@ -650,9 +665,11 @@ class ChatGPTWeb:
                 last = 'страница перезагрузилась во время ввода'
                 self._log(last + ' — заново')
                 continue
+            self._status('проверяю готовность файла и отправку запроса')
             if not self._send():
                 last = 'файл или кнопка отправки не готовы; Enter не используется'
                 continue
+            self._status('отправка подтверждена; ожидаю ответ')
             self._log(f'отправил запрос: {prompt[:80]!r}')
             try:
                 text, images = self._wait_answer(known, page, until)
@@ -667,7 +684,7 @@ class ChatGPTWeb:
             self.dump_cookies()
             return {'text': text, 'images': images}
         raise ChatGPTWebError(f'не удалось отправить запрос: {last}')
-    JS_STATE = '(()=>{\nconst pending="";\nconst prior=[];\nconst priorNotices=[];\nconst norm=t=>(t||\'\').normalize(\'NFC\').replace(/[\\u200B-\\u200D\\uFEFF\\s]+/g,\'\').toLowerCase();\nconst promptNorm=norm(pending);\nconst previous=new Set(prior.map(norm));\nconst allowed=t=>{\n const n=norm(t);\n if(!n||previous.has(n)||Array.from(previous).some(p=>p.length>20&&n.includes(p)))return false;\n // Отдельный пример JSON в сообщении пользователя — не ответ ассистента.\n if(promptNorm&&(promptNorm.includes(n)||n.includes(promptNorm)))return false;\n return true;\n};\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nconst user=\'[data-message-author-role="user"],[data-turn="user"]\';\nconst excluded=\'[data-testid*="advert"],[data-testid*="sponsor"],[data-testid*="recommend"],\'+\n \'[data-ad],.adsbygoogle,[aria-label="Advertisement"],[aria-label="Реклама"],\'+\n \'[data-testid*="thinking"],[data-testid*="reasoning"],.result-thinking\';\nconst skip=e=>!!e.closest(user+\',\'+excluded+\',form,[contenteditable="true"]\');\nconst article=\'article[data-testid^="conversation-turn"],article[data-turn-id],article[data-turn]\';\nconst content=\'.markdown,.prose,[data-testid="markdown"],[data-testid="message-content"]\';\nconst users=Array.from(document.querySelectorAll(user)).filter(visible);\nconst lastUser=users.length?users[users.length-1]:null;\nconst roots=[];\nconst add=e=>{\n if(!visible(e)||skip(e))return;\n const root=e.closest(article)||e;\n if(skip(root)||root.matches(\'[data-turn="user"]\')||root.querySelector(user))return;\n // Не возвращаем старый ответ, пока новый запрос ещё обрабатывается.\n if(lastUser && !(lastUser.compareDocumentPosition(root)&Node.DOCUMENT_POSITION_FOLLOWING))return;\n if(!roots.includes(root))roots.push(root);\n};\nfor(const e of document.querySelectorAll(\'[data-message-author-role="assistant"],[data-turn="assistant"],\'+article)){\n if(e.matches(article)&&!e.matches(\'[data-turn="assistant"]\')&&\n    !e.querySelector(\'[data-message-author-role="assistant"],\'+content))continue;\n add(e);\n}\nif(!roots.length){\n for(const e of document.querySelectorAll(\'main \'+content.split(\',\').join(\',main \')+\',main [class*="agent-turn"]\')){\n  if(e.matches(\'[class*="agent-turn"]\')&&!e.querySelector(content)&&!e.innerText.trim())continue;\n  add(e);\n }\n}\nroots.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nconst el=roots.length?roots[roots.length-1]:null;\nconst texts=[];\nconst put=t=>{t=(t||\'\').trim();if(allowed(t)&&!texts.includes(t))texts.push(t);};\nconst read=e=>{\n const clone=e.cloneNode(true);\n for(const x of clone.querySelectorAll(\'button,svg,[role="button"],\'+excluded))x.remove();\n // innerText у detached DOM не учитывает переносы; заменяем разделители.\n for(const x of clone.querySelectorAll(\'br\'))x.replaceWith(document.createTextNode(\'\\n\'));\n for(const x of clone.querySelectorAll(\'p,div,pre,li\'))x.append(document.createTextNode(\'\\n\'));\n return clone.textContent||\'\';\n};\nif(el){\n const blocks=Array.from(el.querySelectorAll(content)).filter(e=>visible(e)&&!skip(e));\n const outer=blocks.filter(e=>!blocks.some(x=>x!==e&&x.contains(e)));\n if(outer.length)put(outer.map(read).join(\'\\n\'));\n const pres=Array.from(el.querySelectorAll(\'pre\')).filter(e=>visible(e)&&!skip(e));\n if(pres.length)put(pres.map(e=>(e.querySelector(\'code\')||e).textContent||\'\').join(\'\\n\'));\n for(const e of pres)put((e.querySelector(\'code\')||e).textContent);\n if(!texts.length)put(read(el));\n}\n// Новая разметка может не содержать main/article/markdown вообще:\n// пользовательский XPath указывает прямо на p/text(). Ищем текстовые\n// узлы с ключом reactions, а не React ID _r_8b_ (он меняется).\nconst fallback=[];\nconst safe=e=>visible(e)&&!skip(e)&&!e.closest(\'aside,nav,header,button,[role="button"]\')&&\n (!lastUser||!!(lastUser.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));\nconst walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nconst seeds=[];\nwhile(walker.nextNode()){\n const node=walker.currentNode;\n if(/"(?:reactions|chapters)"\\s*:/.test(node.nodeValue||\'\')&&safe(node.parentElement))seeds.push(node.parentElement);\n}\n// Подсветка кода может разделить сам ключ на несколько span/text().\nfor(const e of document.querySelectorAll(\'p,pre,code\')){\n if(safe(e)&&/"(?:reactions|chapters)"\\s*:/.test(e.textContent||\'\')&&!seeds.includes(e))seeds.push(e);\n}\nseeds.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nfor(const seed of seeds.reverse()){\n let e=seed;\n for(let depth=0;e&&e!==document.body&&depth<7;depth++,e=e.parentElement){\n  if(!safe(e)||e.querySelector(user+\',form,[contenteditable="true"]\'))break;\n  const t=read(e).trim();\n  // Не захватываем область с полным запросом, меню или всем диалогом.\n  if(promptNorm&&norm(t).includes(promptNorm))break;\n  if(t.length>300000)break;\n  if(/"(?:reactions|chapters)"\\s*:/.test(t)&&allowed(t)&&!fallback.includes(t))fallback.push(t);\n }\n}\n// Резервные кандидаты доступны даже если основные селекторы нашли\n// пустой блок. Полный JSON выбирает Python-парсер, частичный не принимается.\nfor(const t of fallback.slice(0,64))put(t);\nconst stops=Array.from(document.querySelectorAll(\'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],\'+\n \'[data-testid="stop-generating"],button[aria-label]\')).filter(e=>visible(e)&&(\n /stop-button|composer-stop-button|stop-generating/.test(e.getAttribute(\'data-testid\')||\'\')||\n /^(stop( generating| streaming| response)?|остановить( генерацию| ответ)?|прекратить генерацию)$/i.test(e.getAttribute(\'aria-label\')||\'\')));\nconst busy=stops.length>0||!!(el&&Array.from(el.querySelectorAll(\'[data-is-streaming="true"],[data-testid="streaming-cursor"]\')).some(visible));\nconst rx=/oaiusercontent|estuary\\/content|\\/backend-api\\/files|persistent\\.oaistatic|videos\\.openai/;\nconst own=el?Array.from(el.querySelectorAll(\'img\')).filter(i=>!skip(i)):[];\nconst doc=Array.from(document.querySelectorAll(\'img\')).filter(i=>!skip(i)&&rx.test(i.currentSrc||i.src||\'\'));\nconst seen=[];\nfor(const im of own.concat(doc)){\n const u=im.currentSrc||im.src||\'\';\n if(!u||u.startsWith(\'data:\')||seen.some(x=>x.u===u))continue;\n seen.push({u:u,ok:!!(im.complete&&im.naturalWidth>0)});\n}\n// Only explicit UI notices in the current answer, not transcript/prompt/reasoning text.\nconst noticeRE=/^(?:этот контент нельзя показать из соображений безопасности|this content (?:isn[\'’]t|cannot be|can[\'’]t be) (?:shown|displayed)(?: for safety reasons)?|something went wrong while generating the response|a network error occurred|network error|произошла ошибка при создании ответа|ошибка сети)(?:[.\\s]|$)/i;\nconst safetyRE=/^(?:этот контент нельзя показать из соображений безопасности|this content)/i;\nconst notices=[];\nconst noticeWalker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nwhile(noticeWalker.nextNode()){\n const node=noticeWalker.currentNode;\n let t=(node.nodeValue||\'\').trim();\n if(!t||t.length>600||!safe(node.parentElement))continue;\n if(!noticeRE.test(t)&&/^(?:этот контент|this content|something went wrong|a network error)/i.test(t)){\n  let parent=node.parentElement;\n  for(let depth=0;parent&&depth<3;depth++,parent=parent.parentElement){\n   if(!safe(parent)||parent.querySelector(user+\',form,[contenteditable="true"]\'))break;\n   const joined=(parent.textContent||\'\').trim();\n   if(joined.length>600)break;\n   if(noticeRE.test(joined)){t=joined;break;}\n  }\n }\n if(!noticeRE.test(t)||!allowed(t)||priorNotices.includes(t))continue;\n if(!notices.includes(t))notices.push(t);\n}\nconst blocked=notices.find(t=>safetyRE.test(t))||\'\';\nconst technical=notices.find(t=>!safetyRE.test(t))||\'\';\nreturn {blocked:blocked,technical_error:technical,notices:notices,n:roots.length||seeds.length,fallbacks:fallback.length,text:texts[0]||\'\',texts:texts,imgs:seen,busy:busy,\n source:el?(el.getAttribute(\'data-message-author-role\')||el.getAttribute(\'data-testid\')||el.tagName):(fallback.length?\'dom-text/json\':\'none\'),\n expired:' + JS_EXPIRED_RE + ".test(document.body.innerText||'')};\n})()"
+    JS_STATE = '(()=>{\nconst pending="";\nconst prior=[];\nconst priorNotices=[];\nconst norm=t=>(t||\'\').normalize(\'NFC\').replace(/[\\u200B-\\u200D\\uFEFF\\s]+/g,\'\').toLowerCase();\nconst promptNorm=norm(pending);\nconst previous=new Set(prior.map(norm));\nconst allowed=t=>{\n const n=norm(t);\n if(!n||previous.has(n)||Array.from(previous).some(p=>p.length>20&&n.includes(p)))return false;\n if(promptNorm&&(promptNorm.includes(n)||n.includes(promptNorm)))return false;\n return true;\n};\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nconst user=\'[data-message-author-role="user"],[data-turn="user"]\';\nconst excluded=\'[data-testid*="advert"],[data-testid*="sponsor"],[data-testid*="recommend"],\'+\n \'[data-ad],.adsbygoogle,[aria-label="Advertisement"],[aria-label="Реклама"],\'+\n \'[data-testid*="thinking"],[data-testid*="reasoning"],.result-thinking\';\nconst skip=e=>!!e.closest(user+\',\'+excluded+\',form,[contenteditable="true"]\');\nconst article=\'article[data-testid^="conversation-turn"],article[data-turn-id],article[data-turn]\';\nconst content=\'.markdown,.prose,[data-testid="markdown"],[data-testid="message-content"]\';\nconst users=Array.from(document.querySelectorAll(user)).filter(visible);\nconst lastUser=users.length?users[users.length-1]:null;\nconst roots=[];\nconst add=e=>{\n if(!visible(e)||skip(e))return;\n const root=e.closest(article)||e;\n if(skip(root)||root.matches(\'[data-turn="user"]\')||root.querySelector(user))return;\n if(lastUser && !(lastUser.compareDocumentPosition(root)&Node.DOCUMENT_POSITION_FOLLOWING))return;\n if(!roots.includes(root))roots.push(root);\n};\nfor(const e of document.querySelectorAll(\'[data-message-author-role="assistant"],[data-turn="assistant"],\'+article)){\n if(e.matches(article)&&!e.matches(\'[data-turn="assistant"]\')&&\n    !e.querySelector(\'[data-message-author-role="assistant"],\'+content))continue;\n add(e);\n}\nif(!roots.length){\n for(const e of document.querySelectorAll(\'main \'+content.split(\',\').join(\',main \')+\',main [class*="agent-turn"]\')){\n  if(e.matches(\'[class*="agent-turn"]\')&&!e.querySelector(content)&&!e.innerText.trim())continue;\n  add(e);\n }\n}\nroots.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nconst el=roots.length?roots[roots.length-1]:null;\nconst texts=[];\nconst put=t=>{t=(t||\'\').trim();if(allowed(t)&&!texts.includes(t))texts.push(t);};\nconst read=e=>{\n const clone=e.cloneNode(true);\n for(const x of clone.querySelectorAll(\'button,svg,[role="button"],\'+excluded))x.remove();\n for(const x of clone.querySelectorAll(\'br\'))x.replaceWith(document.createTextNode(\'\\n\'));\n for(const x of clone.querySelectorAll(\'p,div,pre,li\'))x.append(document.createTextNode(\'\\n\'));\n return clone.textContent||\'\';\n};\nif(el){\n const blocks=Array.from(el.querySelectorAll(content)).filter(e=>visible(e)&&!skip(e));\n const outer=blocks.filter(e=>!blocks.some(x=>x!==e&&x.contains(e)));\n if(outer.length)put(outer.map(read).join(\'\\n\'));\n const pres=Array.from(el.querySelectorAll(\'pre\')).filter(e=>visible(e)&&!skip(e));\n if(pres.length)put(pres.map(e=>(e.querySelector(\'code\')||e).textContent||\'\').join(\'\\n\'));\n for(const e of pres)put((e.querySelector(\'code\')||e).textContent);\n if(!texts.length)put(read(el));\n}\nconst fallback=[];\nconst safe=e=>visible(e)&&!skip(e)&&!e.closest(\'aside,nav,header,button,[role="button"]\')&&\n (!lastUser||!!(lastUser.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));\nconst walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nconst seeds=[];\nwhile(walker.nextNode()){\n const node=walker.currentNode;\n if(/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(node.nodeValue||\'\')&&safe(node.parentElement))seeds.push(node.parentElement);\n}\nfor(const e of document.querySelectorAll(\'p,pre,code\')){\n if(safe(e)&&/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(e.textContent||\'\')&&!seeds.includes(e))seeds.push(e);\n}\nseeds.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nfor(const seed of seeds.reverse()){\n let e=seed;\n for(let depth=0;e&&e!==document.body&&depth<7;depth++,e=e.parentElement){\n  if(!safe(e)||e.querySelector(user+\',form,[contenteditable="true"]\'))break;\n  const t=read(e).trim();\n  if(promptNorm&&norm(t).includes(promptNorm))break;\n  if(t.length>300000)break;\n  if(/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(t)&&allowed(t)&&!fallback.includes(t))fallback.push(t);\n }\n}\nfor(const t of fallback.slice(0,64))put(t);\nconst stops=Array.from(document.querySelectorAll(\'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],\'+\n \'[data-testid="stop-generating"],button[aria-label]\')).filter(e=>visible(e)&&(\n /stop-button|composer-stop-button|stop-generating/.test(e.getAttribute(\'data-testid\')||\'\')||\n /^(stop( generating| streaming| response)?|остановить( генерацию| ответ)?|прекратить генерацию)$/i.test(e.getAttribute(\'aria-label\')||\'\')));\nconst busy=stops.length>0||!!(el&&Array.from(el.querySelectorAll(\'[data-is-streaming="true"],[data-testid="streaming-cursor"]\')).some(visible));\nconst rx=/oaiusercontent|estuary\\/content|\\/backend-api\\/files|persistent\\.oaistatic|videos\\.openai/;\nconst own=el?Array.from(el.querySelectorAll(\'img\')).filter(i=>!skip(i)):[];\nconst doc=Array.from(document.querySelectorAll(\'img\')).filter(i=>!skip(i)&&rx.test(i.currentSrc||i.src||\'\'));\nconst seen=[];\nfor(const im of own.concat(doc)){\n const u=im.currentSrc||im.src||\'\';\n if(!u||u.startsWith(\'data:\')||seen.some(x=>x.u===u))continue;\n seen.push({u:u,ok:!!(im.complete&&im.naturalWidth>0)});\n}\nconst noticeRE=/^(?:этот контент нельзя показать из соображений безопасности|this content (?:isn[\'’]t|cannot be|can[\'’]t be) (?:shown|displayed)(?: for safety reasons)?|something went wrong while generating the response|a network error occurred|network error|произошла ошибка при создании ответа|ошибка сети)(?:[.\\s]|$)/i;\nconst safetyRE=/^(?:этот контент нельзя показать из соображений безопасности|this content)/i;\nconst notices=[];\nconst noticeWalker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nwhile(noticeWalker.nextNode()){\n const node=noticeWalker.currentNode;\n let t=(node.nodeValue||\'\').trim();\n if(!t||t.length>600||!safe(node.parentElement))continue;\n if(!noticeRE.test(t)&&/^(?:этот контент|this content|something went wrong|a network error)/i.test(t)){\n  let parent=node.parentElement;\n  for(let depth=0;parent&&depth<3;depth++,parent=parent.parentElement){\n   if(!safe(parent)||parent.querySelector(user+\',form,[contenteditable="true"]\'))break;\n   const joined=(parent.textContent||\'\').trim();\n   if(joined.length>600)break;\n   if(noticeRE.test(joined)){t=joined;break;}\n  }\n }\n if(!noticeRE.test(t)||!allowed(t)||priorNotices.includes(t))continue;\n if(!notices.includes(t))notices.push(t);\n}\nconst blocked=notices.find(t=>safetyRE.test(t))||\'\';\nconst technical=notices.find(t=>!safetyRE.test(t))||\'\';\nreturn {blocked:blocked,technical_error:technical,notices:notices,n:roots.length||seeds.length,fallbacks:fallback.length,text:texts[0]||\'\',texts:texts,imgs:seen,busy:busy,\n source:el?(el.getAttribute(\'data-message-author-role\')||el.getAttribute(\'data-testid\')||el.tagName):(fallback.length?\'dom-text/json\':\'none\'),\n expired:' + JS_EXPIRED_RE + ".test(document.body.innerText||'')};\n})()"
 
     def _read_answer_state(self):
         expression = self.JS_STATE.replace('const pending="";', 'const pending=' + json.dumps(getattr(self, '_pending_prompt', ''), ensure_ascii=True) + ';', 1)
@@ -865,6 +882,13 @@ class ChatGPTWeb:
             fh.write(raw)
         self._log(f'сохранено {path} ({len(raw)} байт)')
         return path
+
+    def _status(self, msg: str):
+        # Only fixed, non-sensitive status messages, not page text or credentials.
+        callback = getattr(self, 'status_callback', None)
+        if callback:
+            try: callback('ChatGPT: '+msg)
+            except Exception: pass
 
     def _log(self, msg: str):
         if self.verbose:
