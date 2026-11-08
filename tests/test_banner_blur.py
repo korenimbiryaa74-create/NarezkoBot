@@ -9,112 +9,68 @@ import banner_blur
 import pipeline
 import stream_cutter
 
+try:
+    import cv2, numpy as np
+except ImportError:
+    cv2 = None
+
+FF = shutil.which('ffmpeg') and shutil.which('ffprobe')
+
+
+def make_banner_video(folder):
+    """10 s 640x360 moving background; textured banner at (400,30) from 2.0 to 6.0 s."""
+    rng = np.random.default_rng(7)
+    banner = rng.integers(0, 255, (60, 180, 3), dtype=np.uint8)
+    cv2.putText(banner, 'PROMO', (20, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+    png = Path(folder) / 'banner.png'; cv2.imwrite(str(png), banner)
+    src = Path(folder) / 'in.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=25', '-i', str(png),
+                    '-filter_complex', "[0][1]overlay=400:30:enable='between(t,2,6)'", '-t', '10',
+                    '-c:v', 'libx264', '-g', '25', '-pix_fmt', 'yuv420p', '-y', str(src)], check=True, timeout=60)
+    return src
+
+
 class BannerTests(unittest.TestCase):
-    def test_parse_and_padding(self):
-        self.assertEqual(banner_blur.parse_boxes('{"banners":[]}'),[])
-        self.assertEqual(banner_blur.parse_boxes('{"banners":[[0,0,100,100]]}'),[[0,0,112,112]])
-        self.assertEqual(banner_blur.parse_boxes('{"banners":[[0.5,1.2,100.4,101.6]]}'),[[0,0,113,114]])
-        for raw in ('no','{}','{"banners":[[1,2,0,3]]}','{"banners":[[0,0,1000,1000]]}','{"banners":[[0,0,1001,5]]}','{"banners":[[0,0,3,true]]}'):
-            with self.subTest(raw=raw),self.assertRaises(banner_blur.BannerError):banner_blur.parse_boxes(raw)
-    def test_precise_structure_diagnostics_and_no_raw_text(self):
-        cases=[('', 'пустой'),('secret', 'JSON'),('{"not_banners":"secret"}','отсутствует'),
-               ('{"banners":null}','не является списком'),('{"banners":[[2,2,1,3]]}','конец'),
-               ('{"banners":[[0,0,1000,1000]]}','40%'),('{"banners":[[0,0,1001,1]]}','0–1000'),
-               ('{"banners":[[0,0,"secret",5]]}','числами')]
-        for value,expected in cases:
-            with self.subTest(value=value),self.assertRaises(banner_blur.BannerResponseError) as caught:banner_blur.parse_boxes(value)
-            self.assertIn(expected,str(caught.exception));self.assertNotIn('secret',str(caught.exception))
+    @unittest.skipUnless(cv2 is not None and FF, 'needs OpenCV and ffmpeg')
+    def test_template_detection_with_refined_bounds(self):
+        ff = shutil.which('ffmpeg')
+        with tempfile.TemporaryDirectory() as d:
+            src = make_banner_video(d); samples = Path(d) / 'samples'
+            frame = banner_blur.full_frame_at(src, 4.0, ff)
+            banner_blur.save_template(frame, (400, 30, 180, 60), 'promo', folder=samples)
+            templates = banner_blur.load_templates(samples)
+            events = []
+            found = banner_blur.scan(src, [(0., 10.)], ff, events.append, interval=2, templates=templates)
+            self.assertEqual(len(found), 1, found)
+            self.assertAlmostEqual(found[0]['start'], 2.0, delta=0.4)
+            self.assertTrue(5.9 <= found[0]['end'] <= 6.6, found[0])
+            self.assertEqual(found[0]['name'], 'promo')
+            x0, y0, x1, y1 = found[0]['box']
+            self.assertTrue(x0 <= 625 and y0 <= 83 and x1 >= 906 and y1 >= 250, found[0]['box'])
+            self.assertEqual(banner_blur.scan(src, [(7., 10.)], ff, None, interval=2, templates=templates), [])
 
-    def test_truncated_model_response_is_distinguished(self):
-        class Response:
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps({'message':{'content':'{'},'done_reason':'length'}).encode()
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.return_value=Response()
-            with self.assertRaisesRegex(banner_blur.BannerResponseError,'обрезан'):banner_blur.request_boxes(b'jpeg')
+    @unittest.skipUnless(cv2 is not None and FF, 'needs OpenCV and ffmpeg')
+    def test_no_samples_is_setup_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(banner_blur.BannerSetupError):
+                banner_blur.scan(Path(d) / 'x.mp4', [(0., 1.)], shutil.which('ffmpeg'), None, templates=[])
 
-    def test_truncation_retries_once_in_json_mode(self):
-        class Response:
-            def __init__(self, obj):self.obj=obj
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps(self.obj).encode()
-        responses=[Response({'message':{'content':'{'},'done_reason':'length'}),
-                   Response({'message':{'content':'{"banners":[]}'},'done_reason':'stop'})]
-        events=[]
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.side_effect=responses
-            self.assertEqual(banner_blur.request_boxes(b'jpeg',events.append),[])
-            calls=opener.return_value.open.call_args_list
-            self.assertEqual(len(calls),2)
-            first,second=[json.loads(call.args[0].data) for call in calls]
-            self.assertEqual(first['format'],banner_blur.SCHEMA)
-            self.assertEqual(second['format'],'json')
-            self.assertEqual(second['messages'],first['messages'])
-            self.assertEqual(second['options']['num_predict'],512)
-            self.assertTrue(any('повторяю' in e for e in events))
+    @unittest.skipUnless(cv2 is not None, 'needs OpenCV')
+    def test_flat_or_huge_sample_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                banner_blur.save_template(np.zeros((360, 640, 3), np.uint8), (10, 10, 100, 50), folder=d)
+            noise = np.random.default_rng(1).integers(0, 255, (360, 640, 3), dtype=np.uint8)
+            with self.assertRaises(ValueError):
+                banner_blur.save_template(noise, (0, 0, 600, 300), folder=d)
+            path = banner_blur.save_template(noise, (10, 10, 100, 50), 'Тест', folder=d)
+            self.assertTrue(path.exists() and path.with_suffix('.json').exists())
+            self.assertEqual(banner_blur.template_count(d), 1)
 
-    def test_second_truncation_reports_safe_token_counts(self):
-        class Response:
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps({'message':{'content':'secret {'},'done_reason':'length','prompt_eval_count':3400,'eval_count':1024}).encode()
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.return_value=Response()
-            with self.assertRaises(banner_blur.BannerResponseError) as caught:banner_blur.request_boxes(b'jpeg')
-            self.assertEqual(opener.return_value.open.call_count,2)
-            self.assertIn('3400',str(caught.exception));self.assertIn('1024',str(caught.exception));self.assertIn('символов ответа:',str(caught.exception))
-            self.assertNotIn('secret',str(caught.exception))
-
-    def test_truncation_even_if_json_parseable_is_not_accepted(self):
-        class Response:
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps({'message':{'content':'{"banners":[]}'},'done_reason':'length'}).encode()
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.return_value=Response()
-            with self.assertRaises(banner_blur.BannerResponseError):banner_blur.request_boxes(b'jpeg')
-            self.assertEqual(opener.return_value.open.call_count,2)
-
-    def test_fallback_json_still_requires_valid_boxes(self):
-        class Response:
-            def __init__(self, obj):self.obj=obj
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps(self.obj).encode()
-        responses=[Response({'message':{'content':'{'},'done_reason':'length'}),
-                   Response({'message':{'content':'{"banners":[[0,0,1000,1000]]}'},'done_reason':'stop'})]
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.side_effect=responses
-            with self.assertRaisesRegex(banner_blur.BannerResponseError,'40%'):banner_blur.request_boxes(b'jpeg')
-            self.assertEqual(opener.return_value.open.call_count,2)
-
-    def test_windows_and_offsets(self):
-        sample=[{'start':10.,'end':15.,'box':[0,0,200,200]},{'start':15.,'end':20.,'box':[0,0,200,200]}]
-        self.assertEqual(banner_blur.timed_regions(sample,12,18,1000,500),[(0,0,200,100,[(0,6)])])
-        self.assertEqual(banner_blur.timed_regions(sample,21,25,1000,500),[])
-    def test_model_error_is_not_no_banners(self):
-        from urllib.error import URLError
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.side_effect=URLError('down')
-            with self.assertRaises(banner_blur.BannerError):banner_blur.request_boxes(b'a')
-    def test_ollama_error_diagnostics_do_not_leak_server_content(self):
-        from urllib.error import HTTPError,URLError
-        import io
-        cases=[
-            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"model qwen3-vl:4b-instruct not found: SECRET"}')),banner_blur.BannerSetupError,'не найдена'),
-            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"unknown route SECRET"}')),banner_blur.BannerSetupError,'HTTP 404'),
-            (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"out of memory SECRET"}')),banner_blur.BannerSetupError,'недостаточно памяти'),
-            (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"SECRET"}')),banner_blur.BannerError,'HTTP 500'),
-            (URLError(ConnectionRefusedError('SECRET')),banner_blur.BannerSetupError,'Нет соединения'),
-            (URLError(TimeoutError('SECRET')),banner_blur.BannerError,'180 с'),
-        ]
-        for err,cls,expected in cases:
-            with self.subTest(expected=expected),patch('banner_blur.urllib.request.build_opener') as opener:
-                opener.return_value.open.side_effect=err
-                with self.assertRaises(cls) as caught:banner_blur.request_boxes(b'x')
-                self.assertIn(expected,str(caught.exception));self.assertNotIn('SECRET',str(caught.exception))
+    def test_timed_regions_clip_to_chunk(self):
+        det = [{'start': 1.0, 'end': 3.0, 'box': [0, 0, 500, 500], 'name': 'a', 'score': 1.0}]
+        self.assertEqual(banner_blur.timed_regions(det, 5.0, 8.0, 640, 360), [])
+        self.assertTrue(banner_blur.timed_regions(det, 2.0, 8.0, 640, 360))
 
     def test_permanent_model_setup_error_stops_queue_without_retry(self):
         from service import Service
@@ -143,30 +99,6 @@ class BannerTests(unittest.TestCase):
             svc=Service(root,settings,None,pipeline_factory=lambda *a:Engine())
             svc.store.add('123','name');svc.worker_once()
             self.assertEqual(svc.store.list_jobs()[0]['state'],'failed')
-
-    def test_ollama_protocol_and_bounds(self):
-        class Response:
-            def __enter__(self):return self
-            def __exit__(self,*a):pass
-            def read(self,*a):return json.dumps({'message':{'content':'{"banners":[]}'}}).encode()
-        with patch('banner_blur.urllib.request.build_opener') as opener:
-            opener.return_value.open.return_value=Response()
-            self.assertEqual(banner_blur.request_boxes(b'jpeg data'),[])
-            request=opener.return_value.open.call_args.args[0]
-            data=json.loads(request.data)
-            self.assertEqual(data['model'],'qwen3-vl:4b-instruct');self.assertFalse(data['stream']);self.assertNotIn('think',data)
-            self.assertTrue(data['messages'][0]['images'][0]);self.assertIn('banners',data['format']['properties'])
-
-    @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
-    def test_real_sampling_and_empty_detection(self):
-        with tempfile.TemporaryDirectory() as d:
-            src=Path(d)/'in.mp4'
-            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=10','-t','6','-c:v','libx264','-y',str(src)],check=True,timeout=30)
-            events=[]
-            with patch.object(banner_blur,'request_boxes',return_value=[]) as model:
-                self.assertEqual(banner_blur.scan(src,[(0.,6.)],shutil.which('ffmpeg'),events.append,interval=2),[])
-            self.assertEqual(model.call_count,3);self.assertTrue(all(c.args[0].startswith(b'\xff\xd8') for c in model.call_args_list))
-            self.assertTrue(any('3/3' in e for e in events))
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'needs ffmpeg')
     def test_clip_and_report_with_local_video(self):

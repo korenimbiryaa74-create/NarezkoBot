@@ -26,3 +26,7 @@ recordings/
 # Never commit user test videos or inputs.
 test_input/*
 !test_input/README.md
+
+# User banner samples (made from your own stream frames).
+banners/*
+!banners/README.md

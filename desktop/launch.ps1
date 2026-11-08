@@ -4,5 +4,11 @@ $python = Join-Path $PSScriptRoot '.venv\Scripts\pythonw.exe'
 $app = Join-Path $root 'app.py'
 if (-not (Test-Path -LiteralPath $python) -or -not (Test-Path -LiteralPath $app)) { Write-Host 'Application or Python is missing.'; exit 1 }
 Set-Location -LiteralPath $root
+$console = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+& $console -c 'import cv2' 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Installing OpenCV for banner blur...'
+    & $console -m pip install --disable-pip-version-check -r (Join-Path $PSScriptRoot 'requirements-desktop.txt')
+}
 & $python $app
 exit $LASTEXITCODE

@@ -2,3 +2,5 @@
 requests[socks]>=2.31,<3
 numpy>=2.5,<3
 websocket-client>=1.7,<2
+# Banner blur: template matching on video frames (headless build, no Qt).
+opencv-python-headless>=4.10
