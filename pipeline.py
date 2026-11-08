@@ -337,11 +337,11 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     detected=None
     if (banner_cfg or {}).get('enabled',False):
         sample_interval=int((banner_cfg or {}).get('interval',5))
-        if progress_callback: progress_callback(f'Поиск баннеров локальной моделью: кадр каждые {sample_interval} с; результат нужно проверить')
+        if progress_callback: progress_callback(f'Поиск баннеров по образцам: ключевые кадры, шаг ~{sample_interval} с')
         with report_wait(progress_callback,'Поиск баннеров ещё выполняется'):
             detected=banner_blur.scan(src,[(start,end)],ffmpeg,progress_callback,interval=sample_interval)
         args.timed_banners=detected
-        if progress_callback: progress_callback(f'Поиск баннеров завершён: областей на кадрах {len(detected)}; отсутствие находок не гарантирует отсутствия рекламы')
+        if progress_callback: progress_callback(f'Поиск баннеров завершён: найдено появлений {len(detected)}')
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
@@ -445,13 +445,13 @@ def organize_clips(folder,job,rows,mode):
         scan=meta.get('banner_scan')
         if isinstance(scan,list):
             breport=ready/(stem+' — баннеры.txt')
-            blines=[f"Экспериментальный поиск баннеров: анализ кадра каждые {meta.get('banner_scan_interval',5)} секунд.",
-                    'Время — от начала исходного видео. Границы приблизительные; короткие и движущиеся баннеры могут быть пропущены или закрыты не полностью.',
+            blines=[f"Поиск баннеров по сохранённым образцам (папка banners): ключевые кадры, шаг ~{meta.get('banner_scan_interval',2)} с, границы уточнены.",
+                    'Время — от начала исходного видео. Находятся только баннеры, для которых добавлен образец; новые, короткие и движущиеся баннеры могут быть пропущены или закрыты не полностью.',
                     'Указанные интервалы могут частично совпадать с удалённой тишиной или донатами.',
-                    'Модель может ошибочно размыть другие элементы. Проверьте готовое видео.', '']
+                    'Проверьте готовое видео. Если баннер пропущен — добавьте ещё один образец в настройках.', '']
             if not scan:blines.append('Баннеры не обнаружены. Это не гарантия их отсутствия.')
             for n,d in enumerate(scan,1):
-                blines.append(f"{n:03}. {precise_timestamp(d['start'])} — {precise_timestamp(d['end'])}; область на сетке 0–1000: {d['box']}")
+                blines.append(f"{n:03}. {precise_timestamp(d['start'])} — {precise_timestamp(d['end'])}; "+(f"образец «{d['name']}»; " if d.get('name') else '')+f"область на сетке 0–1000: {d['box']}")
             btext='\n'.join(blines)+'\n'
             if breport.exists() and breport.read_text(encoding='utf-8-sig')!=btext: raise PipelineError(f'Отчёт {breport.name} уже существует и отличается; не перезаписываю')
             reports.append((breport,btext))
