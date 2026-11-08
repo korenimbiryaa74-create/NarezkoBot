@@ -1,12 +1,13 @@
 """Reaction finder using an existing ChatGPT browser profile, without Telegram.
 
-No account rotation or automatic retry on quota, safety, or uncertain delivery.
+Switch profiles only on an explicit upload limit before a possibly sent request.
 The user's login is performed explicitly in a normal browser window.
 """
 from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -16,23 +17,37 @@ import reactions
 class ChatGPTFinder:
     def __init__(self, root, web_factory=None, timeout=1500):
         self.root=Path(root).resolve(); self.timeout=int(timeout)
-        self._lock=threading.RLock(); self._web=None; self._factory=web_factory
+        self._lock=threading.RLock(); self._web=None; self._factory=web_factory; self._account='acc_01'
 
-    def _browser(self):
+    def _accounts(self):
+        base=self.root/'gpt_accounts'
+        names={'acc_01'}
+        if base.is_dir():
+            names.update(p.name for p in base.iterdir() if p.is_dir() and
+                re.fullmatch(r'acc_[0-9]{2}',p.name) and
+                ((p/'profile').is_dir() or (p/'cookies.json').is_file()))
+        return sorted(names)
+
+    def _browser(self, account=None):
+        if account is not None and account != self._account:
+            if self._web:
+                self._web.close(); self._web=None
+            self._account=account
         if self._web is None:
             if self._factory is None:
                 from chatgpt_web import ChatGPTWeb
                 factory=ChatGPTWeb
             else: factory=self._factory
-            account=self.root/'gpt_accounts'/'acc_01'
+            account=self.root/'gpt_accounts'/self._account
             self._web=factory(cookies_path=str(account/'cookies.json'),out_dir=str(self.root/'gpt_uploads'),
                 headless=False,port=9300,profile=str(account/'profile'),timeout=self.timeout,verbose=False,offscreen=False)
         return self._web
 
-    def login(self, timeout=300):
+    def login(self, timeout=300, account='acc_01'):
         """Caller must run in a background thread; user logs in using the window."""
         with self._lock:
-            web=self._browser(); web.offscreen=False; web.start()
+            if account not in [f'acc_{n:02d}' for n in range(1,8)]: raise ValueError('Недопустимый профиль')
+            web=self._browser(account); web.offscreen=False; web.start()
             if web.tab is None:
                 web.tab=web._open_tab('https://chatgpt.com/auth/login')
                 web.tab.call('Network.enable')
@@ -58,14 +73,31 @@ class ChatGPTFinder:
             # A fixed name prevents untrusted title/path characters entering paths.
             path=folder/'transcript.txt'
             path.write_text(document,encoding='utf8')
-            web=self._browser(); web.timeout=int(timeout); web.offscreen=False
-            if log: log('ChatGPT: отправка транскрипта и ожидание ответа')
-            # Do not automatically repeat: delivery may be uncertain.
-            web.status_callback = log
-            try:
-                text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
-            finally:
-                web.status_callback = None
+            # The exception is raised only for a visible upload restriction. Never
+            # replay an uncertain or already-sent request on another account.
+            from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError
+            accounts=self._accounts()
+            accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x != self._account]
+            blocked=[]; signed_out=[]
+            for account in accounts:
+                web=self._browser(account); web.timeout=int(timeout); web.offscreen=False
+                if log: log(f'ChatGPT: профиль {account} — отправка транскрипта и ожидание ответа')
+                web.status_callback=log
+                try:
+                    text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
+                    break
+                except ChatGPTQuotaError:
+                    if getattr(web,'_send_uncertain',False):
+                        raise RuntimeError('ChatGPT: обнаружен лимит, но отправка могла произойти; проверьте чат вручную')
+                    blocked.append(account)
+                    if log: log(f'ChatGPT: у {account} лимит загрузок; запрос не отправлен')
+                except ChatGPTLoginError:
+                    signed_out.append(account)
+                    if log: log(f'ChatGPT: {account} не авторизован — пропускаю профиль')
+                finally:
+                    web.status_callback=None
+            else:
+                raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
             cache.parent.mkdir(parents=True,exist_ok=True)
             full_cycle.atomic_json(str(cache),{'key':key,'text':text})

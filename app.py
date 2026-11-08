@@ -50,6 +50,8 @@ class App:
         ttk.Button(bar,text='Сохранить и запустить',command=self.start).pack(side='left')
         ttk.Button(bar,text='Остановить после текущей операции',command=self.stop).pack(side='left',padx=5)
         ttk.Button(bar,text='Войти в ChatGPT',command=self.login).pack(side='left',padx=5)
+        self.gpt_account=tk.StringVar(value='acc_01')
+        ttk.Combobox(bar,textvariable=self.gpt_account,values=[f'acc_{n:02d}' for n in range(1,8)],state='readonly',width=7).pack(side='left')
         ttk.Button(bar,text='Открыть папку результатов',command=self.open_outputs).pack(side='left',padx=5)
         testbar=ttk.Frame(dashboard); testbar.pack(fill='x',pady=(6,0))
         ttk.Button(testbar,text='Открыть папку тестовых видео',command=self.open_test_input).pack(side='left')
@@ -165,11 +167,12 @@ class App:
         if self.save(): self.service.request_stop();self.status.set('Остановка запрошена')
     def login(self):
         if not self.save():return
-        self.status.set('Откройте окно браузера и войдите в ChatGPT')
+        account=self.gpt_account.get()
+        self.status.set(f'Откройте окно браузера и войдите в ChatGPT ({account})')
         def action():
             try:
-                ok=self.finder.login()
-                self.service.log('ChatGPT: вход выполнен' if ok else 'ChatGPT: время входа истекло')
+                ok=self.finder.login(account=account)
+                self.service.log(f'ChatGPT: {account} — вход выполнен' if ok else f'ChatGPT: {account} — время входа истекло')
             except Exception as exc:self.service.log('ChatGPT: не удалось открыть браузер ('+type(exc).__name__+')')
         threading.Thread(target=action,daemon=True).start()
     def retry(self):
