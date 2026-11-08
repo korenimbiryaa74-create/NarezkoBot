@@ -1,5 +1,7 @@
 import json
 import tempfile
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +34,41 @@ class RecoveryTests(unittest.TestCase):
         with patch('chatgpt_web.time.sleep'), patch.object(web,'_download',side_effect=AssertionError('must not download')):
             text,images=web._wait_answer(until=lambda x:'"reactions"' in x)
         self.assertEqual(text,ANSWER);self.assertEqual(images,[]);self.assertTrue(received)
+    def test_send_steps_are_visible_without_sensitive_prompt(self):
+        web=chatgpt_web.ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),verbose=False)
+        class Tab:
+            def js(self,expr): return [] if expr==web.JS_IMGS else {}
+        web.tab=Tab();events=[];web.status_callback=events.append
+        web.new_chat=lambda **kw:True;web._page_id=lambda:None
+        web._read_answer_state=lambda:{'texts':[],'notices':[]}
+        web._attach=lambda p:True;web._type_prompt=lambda p:True;web._send=lambda:True
+        web._wait_answer=lambda *a:('answer',[]);web.dump_cookies=lambda:None
+        with patch('chatgpt_web.time.sleep'):
+            web._ask_locked('секретный текст', ['file.txt'],lambda text:True)
+        joined=' '.join(events)
+        for word in ('проверяю вход','прикрепляю транскрипт','ввожу запрос','отправка подтверждена'):
+            self.assertIn(word,joined)
+        self.assertNotIn('секретный текст',joined)
+
+    @unittest.skipUnless(shutil.which('chromium'),'requires Chromium')
+    def test_donation_answer_detected_in_fallback_dom(self):
+        from html.parser import HTMLParser
+        page=self.root/'test.html'
+        page.write_text('<main><p>{&quot;donation_cuts&quot;:[{&quot;reaction&quot;:1}]}</p></main>'+
+            '<script>const r='+chatgpt_web.ChatGPTWeb.JS_STATE+'; const p=document.createElement("pre");'+
+            'p.id="result";p.textContent=JSON.stringify(r);document.body.appendChild(p);</script>',encoding='utf8')
+        proc=subprocess.run(['chromium','--headless','--no-sandbox','--disable-gpu','--dump-dom',page.as_uri()],capture_output=True,text=True,timeout=30,check=True)
+        class ResultParser(HTMLParser):
+            def __init__(self):super().__init__();self.reading=False;self.result=''
+            def handle_starttag(self,tag,attrs):
+                if tag=='pre' and dict(attrs).get('id')=='result':self.reading=True
+            def handle_endtag(self,tag):
+                if tag=='pre':self.reading=False
+            def handle_data(self,data):
+                if self.reading:self.result+=data
+        parser=ResultParser();parser.feed(proc.stdout);state=json.loads(parser.result)
+        self.assertIn('donation_cuts',state['text']);self.assertGreater(state['fallbacks'],0)
+
     def test_no_native_file_dialog_if_interception_fails(self):
         web=chatgpt_web.ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),verbose=False)
         class Tab:
