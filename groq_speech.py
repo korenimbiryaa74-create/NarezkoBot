@@ -12,24 +12,39 @@ MODEL = 'whisper-large-v3-turbo'
 class GroqError(RuntimeError):
     pass
 
+class GroqResponseError(GroqError):
+    """Unusable response for one audio chunk, distinct from a service failure."""
+
 
 def parse_segments(data, offset, length):
     rows = data.get('segments') if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        raise GroqError('Некорректный ответ Groq: нет сегментов с таймкодами')
+        raise GroqResponseError('Groq: нет списка сегментов с таймкодами')
     result = []
-    for row in rows:
+    for i, row in enumerate(rows, 1):
+        # Report categories and numbers only; never expose transcript or response body.
+        prefix = f'Groq: сегмент {i}/{len(rows)}'
+        if not isinstance(row, dict): raise GroqResponseError(prefix + ' не является объектом')
+        if not isinstance(row.get('text'), str): raise GroqResponseError(prefix + ': нет текста')
+        text = row['text'].strip()
+        if not text: continue
         try:
-            if not isinstance(row, dict) or not isinstance(row.get('text'), str): raise ValueError()
             if isinstance(row.get('start'), bool) or isinstance(row.get('end'), bool): raise ValueError()
             a, b = float(row['start']), float(row['end'])
-            if not math.isfinite(a) or not math.isfinite(b) or a < 0 or b < a or b > length + 1: raise ValueError()
-            text = row['text'].strip()
-        except (TypeError, ValueError, KeyError):
-            raise GroqError('Некорректные сегменты или таймкоды Groq') from None
-        if text: result.append({'start': offset + a, 'end': offset + b, 'text': text})
+        except (TypeError, ValueError, KeyError, OverflowError):
+            raise GroqResponseError(prefix + ': нет числовых таймкодов') from None
+        if not math.isfinite(a) or not math.isfinite(b):
+            raise GroqResponseError(prefix + ': нечисловые таймкоды')
+        # Whisper sometimes rounds just beyond the audio boundary. Clamp only a
+        # small overhang; never invent or silently discard a meaningful segment.
+        if a < -0.25 or b < a or b > length + 1 or a >= length or b < 0:
+            raise GroqResponseError(prefix + f': таймкоды {a:.2f}–{b:.2f} вне части 0–{length:.2f} с')
+        a=max(0., a); b=min(length, b)
+        if b < a: raise GroqResponseError(prefix + ': неверный порядок таймкодов')
+        result.append({'start': offset + a, 'end': offset + b, 'text': text})
+    if not result and isinstance(data.get('text'), str) and data['text'].strip():
+        raise GroqResponseError('Groq: текст ответа есть, но сегментов с таймкодами нет')
     return result
-
 
 def transcribe_chunk(path, *, start, end, api_key, language='ru', proxy_url=''):
     # Extraction errors are not service outages; allow them to surface normally.
@@ -73,7 +88,7 @@ def transcribe_chunk(path, *, start, end, api_key, language='ru', proxy_url=''):
                     else: reason += ': доступ запрещён; проверьте права модели и доступ сети'
                 raise GroqError(reason)
             try: payload = response.json()
-            except ValueError: raise GroqError('Некорректный JSON от Groq') from None
+            except ValueError: raise GroqResponseError('Некорректный JSON от Groq') from None
             return parse_segments(payload, start, end-start)
         except requests.RequestException:
             # No automatic replay after an uncertain POST: it might already be billable.

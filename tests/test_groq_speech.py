@@ -43,6 +43,32 @@ class GroqTests(unittest.TestCase):
         rows,_=self.run_speech(lambda *a,**kw:[{'start':float('nan'),'end':2,'text':'bad'}])
         self.assertEqual([r['text'] for r in rows],['local']*3)
         self.assertEqual(len(list((self.root/'cache').rglob('*.json'))),3)
+    def test_one_bad_response_only_falls_back_for_that_part(self):
+        def bad_middle(*a,**kw):
+            self.calls.append(('groq',kw['start']))
+            if kw['start']==600:
+                raise groq_speech.GroqResponseError('Groq: сегмент 12/20: нет числовых таймкодов')
+            return [{'start':kw['start']+1,'end':kw['start']+2,'text':'cloud'}]
+        rows,_=self.run_speech(bad_middle)
+        self.assertEqual([r['text'] for r in rows],['cloud','local','cloud'])
+        self.assertEqual(self.calls,[('groq',0),('groq',600),('local',600),('groq',1200)])
+        self.assertIn('следующая — Groq',str(self.events)); self.assertIn('сегмент 12/20',str(self.events))
+        self.run_speech(bad_middle); self.assertEqual(len(self.calls),4)
+    def test_three_bad_responses_stop_using_groq(self):
+        def bad(*a,**kw):
+            self.calls.append(('groq',kw['start']))
+            raise groq_speech.GroqResponseError('Некорректный ответ')
+        rows,_=pipeline.speech_chunks(self.video,self.root/'cache',self.cfg,self.progress,transcriber=self.local,groq_transcriber=bad,duration=2400)
+        self.assertEqual([r['text'] for r in rows],['local']*4)
+        self.assertEqual([x[0] for x in self.calls].count('groq'),3)
+        self.assertIn('три ошибки ответа подряд',str(self.events))
+    def test_timestamp_validation_and_no_text_leaks(self):
+        rows=groq_speech.parse_segments({'segments':[{'start':-0.02,'end':0.5,'text':'one'},{'start':99,'end':100.3,'text':'two'}]},600,100)
+        self.assertEqual([(r['start'],r['end']) for r in rows],[(600,600.5),(699,700)])
+        self.assertEqual(groq_speech.parse_segments({'segments':[{'text':' ', 'start':None}]},0,100),[])
+        for payload in ({'segments':[], 'text':'PRIVATE WORDS'}, {'segments':[{'start':100.5,'end':100.6,'text':'PRIVATE WORDS'}]}, {'segments':[{'start':'PRIVATE WORDS','end':2,'text':'PRIVATE WORDS'}]}):
+            with self.assertRaises(groq_speech.GroqResponseError) as err: groq_speech.parse_segments(payload,0,100)
+            self.assertNotIn('PRIVATE WORDS',str(err.exception))
     def test_corrupt_local_cache_is_recomputed(self):
         self.cfg['groq_enabled']=False; self.run_speech()
         file=next((self.root/'cache').rglob('0000.json')); data=json.loads(file.read_text()); data['segments']=[{'start':99999,'end':99999,'text':'bad'}];file.write_text(json.dumps(data))

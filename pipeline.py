@@ -114,7 +114,7 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
     use_groq=bool(cfg.get('groq_enabled',True) and cfg.get('groq_api_key','').strip())
     if cfg.get('groq_enabled',True) and not use_groq:
         progress('Транскрибация','Ключ Groq не указан — используется локальный Whisper')
-    total=math.ceil(duration/chunk_seconds); result=[]
+    total=math.ceil(duration/chunk_seconds); result=[]; bad_cloud_responses=0
     for i in range(total):
         start=i*chunk_seconds; end=min(duration,start+chunk_seconds)
         def read_cached(key):
@@ -134,12 +134,21 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
                 segments=_valid_speech_segments(fn(str(video),start=start,end=end,api_key=cfg['groq_api_key'].strip(),
                     language=settings['language'],proxy_url=cfg.get('groq_proxy_url','')),start,end)
                 atomic_json(Path(cache_dir)/cloud_key/f'{i:04}.json',{'key':cloud_key,'segments':segments})
-                origin='Groq'
+                origin='Groq'; bad_cloud_responses=0
             except (groq_speech.GroqError,PipelineError) as exc:
-                # The error class never contains response bodies, credentials or URLs.
+                # Data errors may affect only this chunk; service errors disable cloud
+                # for the rest of this job. Do not blindly retry the same paid request.
                 reason=str(exc) if isinstance(exc,groq_speech.GroqError) else 'Некорректные сегменты Groq'
-                progress('Транскрибация',f'{reason}; оставшиеся части — локальный Whisper')
-                use_groq=False
+                if isinstance(exc,(groq_speech.GroqResponseError,PipelineError)):
+                    bad_cloud_responses+=1
+                    if bad_cloud_responses < 3:
+                        progress('Транскрибация',f'{reason}; эта часть — локальный Whisper, следующая — Groq')
+                    else:
+                        progress('Транскрибация',f'{reason}; три ошибки ответа подряд, остаток — локальный Whisper')
+                        use_groq=False
+                else:
+                    progress('Транскрибация',f'{reason}; оставшиеся части — локальный Whisper')
+                    use_groq=False
         if segments is None:
             progress('Транскрибация',f'Часть {i+1}/{total} · локальный Whisper · {timestamp(start)}–{timestamp(end)}')
             fn=transcriber or whisper_cpp.transcribe_file
