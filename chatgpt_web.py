@@ -555,6 +555,8 @@ class ChatGPTWeb:
         name = os.path.basename(path)
         image = os.path.splitext(name)[1].lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
         n_inputs = 0
+        intercepted = False
+        menu_clicked = False
         for attempt in range(20):
             self._check_upload_quota()
             try:
@@ -563,12 +565,20 @@ class ChatGPTWeb:
                 n_inputs = 0
             if n_inputs:
                 break
-            if attempt in (0, 3):
+            if not intercepted:
                 try:
+                    # Never activate a native file dialog unless CDP intercepts it.
                     tab.call('Page.setInterceptFileChooserDialog', enabled=True)
-                    tab.js('(()=>{const b=document.querySelector(\'button[data-testid="composer-plus-btn"],button[aria-label="Add files and more"],button[aria-label="Добавить файлы и другое"]\');if(b)b.click();const item=Array.from(document.querySelectorAll(\'[role="menuitem"]\')).find(e=>/Add photos.*files|Upload.*file|Добавить.*файл|Загрузить.*файл/i.test(e.innerText||\'\'));if(item)item.click();})()')
+                    intercepted = True
+                    tab.js("""(()=>{const b=document.querySelector('button[data-testid="composer-plus-btn"],button[aria-label="Add files and more"],button[aria-label="Добавить файлы и другое"]');if(b)b.click();})()""")
                 except Exception:
-                    pass
+                    self._log('не удалось безопасно перехватить окно выбора файла')
+                    return False
+            elif not menu_clicked:
+                try:
+                    menu_clicked = bool(tab.js("""(()=>{const item=Array.from(document.querySelectorAll('[role="menuitem"]')).find(e=>/Add photos.*files|Upload.*file|Добавить.*файл|Загрузить.*файл/i.test(e.innerText||''));if(!item)return false;item.click();return true;})()"""))
+                except Exception:
+                    return False
             time.sleep(1)
         if not n_inputs:
             self._log('не нашёл input[type=file] — вложение пропущено')
@@ -630,12 +640,8 @@ class ChatGPTWeb:
                 attached = self._attach(path) and attached
                 time.sleep(1.5)
             docs = [p for p in files or [] if os.path.splitext(p)[1].lower() not in ('.png', '.jpg', '.jpeg', '.webp', '.gif')]
-            if docs and (not attached) and (attempt < 2):
-                last = 'файл не прикрепился'
-                self._log(last + ' — открываю чат заново')
-                continue
             if docs and (not attached):
-                raise ChatGPTWebError('транскрипт не прикрепился — запрос без файла НЕ отправлен')
+                raise ChatGPTWebError('транскрипт не прикрепился — запрос без файла НЕ отправлен; проверьте браузер и повторите вручную')
             self._log('файл готов; ввожу критерии поиска')
             if not self._type_prompt(prompt):
                 last = 'текст не вводится в поле'
@@ -684,6 +690,8 @@ class ChatGPTWeb:
         stuck_since = None
         idle_since = None
         t_log = time.time()
+        status_at = 0
+        empty_idle_since = None
         self._log('читатель ответа v26: сообщения + реакции/главы в DOM')
         while time.time() < deadline:
             try:
@@ -699,6 +707,15 @@ class ChatGPTWeb:
             if page and (not (state or {}).get('n')) and (time.time() - started > 20) and (self._page_id() != page):
                 raise ChatGPTWebError('страница перезагрузилась — запрос потерялся')
             if state:
+                if time.time() - status_at >= 15:
+                    status_at = time.time()
+                    callback = getattr(self, 'status_callback', None)
+                    if callback:
+                        try:
+                            callback(f"ChatGPT: ожидание ответа {int(time.time()-started)} с; " +
+                                     ('генерация' if state.get('busy') else 'нет признаков генерации') +
+                                     f", найдено символов: {len(state.get('text') or '')}")
+                        except Exception: pass
                 if state.get('blocked'):
                     self._safety_blocked = True
                     self._answer_unreadable = True
@@ -721,10 +738,18 @@ class ChatGPTWeb:
                         except Exception:
                             pass
                 self.last_answer = cur_text
-                items = [it for it in state.get('imgs') or [] if it.get('u') and it['u'] not in known]
+                # A structured text request must not wait for or download unrelated UI images.
+                items = [] if until is not None else [it for it in state.get('imgs') or [] if it.get('u') and it['u'] not in known]
                 cur_imgs = [it['u'] for it in items]
                 img_ready = all((it.get('ok') for it in items))
                 busy = bool(state.get('busy'))
+                if until is not None and not busy and not cur_text:
+                    empty_idle_since = empty_idle_since or time.time()
+                    if time.time() - empty_idle_since > 300:
+                        self._answer_unreadable = True
+                        raise ChatGPTWebError('ChatGPT не удалось прочитать ответ за 5 минут без признаков генерации; повторной отправки не будет')
+                else:
+                    empty_idle_since = None
                 if cur_imgs and (not img_ready):
                     if stuck_since is None:
                         stuck_since = time.time()
@@ -769,7 +794,7 @@ class ChatGPTWeb:
             self.last_answer = text
             self._answer_unreadable = True
             raise ChatGPTWebError('истекло время ожидания полного ответа ChatGPT; транскрипт остаётся в кэше')
-        if not images:
+        if not images and until is None:
             try:
                 extra = self._read_answer_state()
                 images = [it['u'] for it in extra.get('imgs') or [] if it.get('u') and it['u'] not in known]
