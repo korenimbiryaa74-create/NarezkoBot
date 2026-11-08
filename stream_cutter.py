@@ -583,12 +583,13 @@ class Progress:
 def _exec(cmd: list[str], idx: int, prog: Progress, log_path: str) -> int:
     with open(log_path, 'w', encoding='utf-8', errors='replace') as log:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace')
-        for line in p.stdout:
-            if line.startswith('out_time_ms='):
-                try:
-                    prog.set(idx, int(line.split('=', 1)[1]) / 1000000.0)
-                except ValueError:
-                    pass
+        with p.stdout:
+            for line in p.stdout:
+                if line.startswith('out_time_ms='):
+                    try:
+                        prog.set(idx, int(line.split('=', 1)[1]) / 1000000.0)
+                    except ValueError:
+                        pass
         return p.wait()
 
 def item_duration(item) -> float:
