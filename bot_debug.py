@@ -29,7 +29,7 @@ def redact(value):
     for secret in sorted(_secrets, key=len, reverse=True):
         if secret:
             text = text.replace(secret, '[REDACTED]')
-    text = re.sub(r'(?i)(https?://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
+    text = re.sub(r'(?i)((?:https?|socks4|socks5h?)://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
     # Token-bearing URL query strings must not appear even in requests tracebacks.
     text = re.sub(r'(https?://[^\s?<>"\']+)\?[^\s<>"\']+', r'\1?[REDACTED]', text)
     text = re.sub(r'(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+', r'\1[REDACTED]', text)

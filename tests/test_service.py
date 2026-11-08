@@ -49,3 +49,25 @@ class RecoveryTests(unittest.TestCase):
             rows={r['id']:r for r in s.store.list_jobs()}
             self.assertEqual(rows[a['id']]['state'],'retry')
             self.assertEqual(rows[b['id']]['state'],'failed')
+
+class DiagnosticTests(unittest.TestCase):
+    def test_retry_keeps_and_logs_redacted_transcription_error(self):
+        from transcribe import TranscribeError
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); settings=Settings(root/'config.json'); cfg=settings.load()
+            cfg['twitch']['client_secret']='my-private-secret'
+            cfg['proxy'].update(enabled=True,url='socks5://user:password@example.com:1080')
+            settings.save(cfg)
+            class Engine:
+                def __init__(self,*a):pass
+                def run(self,job,cfg,progress):
+                    progress('Транскрибация','часть 1')
+                    raise TranscribeError('CUDA failure my-private-secret socks5://user:password@example.com:1080')
+            service=Service(root,settings,object(),pipeline_factory=Engine)
+            service.store.add('1','nix'); service.worker_once()
+            row=service.store.list_jobs()[0]; log='\n'.join(s for _,s in service.logs())
+            self.assertEqual(row['state'],'retry')
+            self.assertIn('CUDA failure',row['detail']); self.assertIn('CUDA failure',log)
+            for text in (row['detail'],log):
+                self.assertNotIn('my-private-secret',text)
+                self.assertNotIn('password',text)

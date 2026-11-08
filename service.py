@@ -89,7 +89,7 @@ class Service:
             self.log(f"VOD {job['vod_id']}: готово")
         except Exception as exc:
             # No replay without reconciliation: a web request may have been delivered.
-            detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
+            detail=redact(f'{type(exc).__name__}: {str(exc)[:2000]}')
             # Defensive redact of configured secrets and proxy credentials.
             try:
                 cfg=self.settings.load()
@@ -101,10 +101,10 @@ class Service:
             if safe and job['attempts']<3:
                 delay=60*job['attempts']
                 self.store.finish(job['id'],'retry',detail,retry_after=delay)
-                self.log(f"VOD {job['vod_id']}: повтор через {delay} с ({type(exc).__name__})")
+                self.log(f"VOD {job['vod_id']}: повтор через {delay} с — {detail}")
             else:
                 self.store.finish(job['id'],'failed',detail)
-                self.log(f"VOD {job['vod_id']}: ошибка ({type(exc).__name__})")
+                self.log(f"VOD {job['vod_id']}: ошибка — {detail}")
         return True
     def _worker_loop(self):
         while not self.stop_event.is_set():

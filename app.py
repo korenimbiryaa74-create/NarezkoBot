@@ -66,9 +66,22 @@ class App:
         for name,width,text in [('id',50,'№'),('streamer',100,'Стример'),('vod',100,'VOD'),('state',90,'Статус'),('stage',130,'Этап'),('detail',400,'Подробности')]:
             self.jobs.heading(name,text=text); self.jobs.column(name,width=width,stretch=True)
         self.jobs.pack(fill='both',expand=True,pady=4)
-        ttk.Button(dashboard,text='Повторить выбранное задание с ошибкой',command=self.retry).pack(anchor='w')
-        ttk.Label(dashboard,text='Последние события').pack(anchor='w',pady=(8,0))
+        jobbar=ttk.Frame(dashboard); jobbar.pack(fill='x')
+        ttk.Button(jobbar,text='Повторить выбранное задание с ошибкой',command=self.retry).pack(side='left')
+        ttk.Button(jobbar,text='Скопировать ошибку выбранного задания',command=self.copy_job_detail).pack(side='left',padx=5)
+        eventbar=ttk.Frame(dashboard); eventbar.pack(fill='x',pady=(8,0))
+        ttk.Label(eventbar,text='Последние события (выделение приостанавливает обновление текста)').pack(side='left')
+        ttk.Button(eventbar,text='Скопировать все события',command=self.copy_events).pack(side='right')
         self.events=tk.Text(dashboard,height=5,state='disabled',wrap='word'); self.events.pack(fill='x')
+        self.events.bind('<Control-c>',self.copy_event_selection)
+        self.events.bind('<Control-C>',self.copy_event_selection)
+        self.events.bind('<Control-a>',self.select_events)
+        self.events.bind('<Control-A>',self.select_events)
+        self.event_menu=tk.Menu(self.window,tearoff=False)
+        self.event_menu.add_command(label='Копировать выделенное',command=self.copy_event_selection)
+        self.event_menu.add_command(label='Выделить всё',command=self.select_events)
+        self.event_menu.add_command(label='Копировать все события',command=self.copy_events)
+        self.events.bind('<Button-3>',self.show_event_menu)
         # Settings are organised into independently scrollable tabs rather than an oversized form.
         sub=ttk.Notebook(settings);sub.pack(fill='both',expand=True)
         common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8)
@@ -143,6 +156,36 @@ class App:
         if not messagebox.askyesno('Повтор','Проверьте, что предыдущий запрос ChatGPT не выполняется. Повторить задание?'):return
         try:self.service.store.retry(int(rows[0]))
         except ValueError as exc:messagebox.showerror('Повтор',str(exc))
+    def _clipboard(self,text):
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self.status.set('Скопировано. Проверьте текст на секреты перед отправкой.')
+    def copy_job_detail(self):
+        selected=self.jobs.selection()
+        if not selected:
+            messagebox.showinfo('Копирование','Выберите задание в очереди.'); return
+        job=next((j for j in self.service.store.list_jobs(1000) if str(j['id'])==selected[0]),None)
+        if not job:
+            messagebox.showwarning('Копирование','Задание не найдено.'); return
+        name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
+        text=(f"Задание №{job['id']}: {name}\nСостояние: {job['state']}\n"
+              f"Этап: {job['stage']}\nПодробности: {job['detail'] or 'нет'}")
+        self._clipboard(text)
+    def _events_text(self):
+        return '\n'.join(__import__('datetime').datetime.fromtimestamp(t).strftime('%H:%M:%S')+'  '+m for t,m in self.service.logs())
+    def copy_events(self):
+        self._clipboard(self._events_text())
+    def copy_event_selection(self,event=None):
+        try: text=self.events.get('sel.first','sel.last')
+        except tk.TclError: return 'break'
+        self._clipboard(text); return 'break'
+    def select_events(self,event=None):
+        self.events.tag_add('sel','1.0','end-1c')
+        self.events.focus_set(); return 'break'
+    def show_event_menu(self,event):
+        try: self.event_menu.tk_popup(event.x_root,event.y_root)
+        finally: self.event_menu.grab_release()
+
     def open_test_input(self):
         folder=ROOT/'test_input'; folder.mkdir(exist_ok=True)
         if hasattr(os,'startfile'): os.startfile(str(folder))
@@ -179,7 +222,10 @@ class App:
             for item in selected:
                 if self.jobs.exists(item):self.jobs.selection_add(item)
             text='\n'.join(__import__('datetime').datetime.fromtimestamp(t).strftime('%H:%M:%S')+'  '+m for t,m in self.service.logs()[-30:])
-            self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
+            # Redrawing every three seconds used to clear the user's selection.
+            # Keep it until the selection is cleared, then catch up on new events.
+            if not self.events.tag_ranges('sel') and self.events.get('1.0','end-1c') != text:
+                self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
         except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
         self.window.after(3000,self.refresh)
     def close(self):
