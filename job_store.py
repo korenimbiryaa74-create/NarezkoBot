@@ -28,6 +28,9 @@ class JobStore:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'duration_seconds' not in columns:
                 db.execute('ALTER TABLE jobs ADD COLUMN duration_seconds REAL')
+            for name, kind in (('local_name','TEXT'),('local_size','INTEGER'),('local_mtime_ns','INTEGER')):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
             db.commit()
 
     @contextmanager
@@ -60,6 +63,25 @@ class JobStore:
             if cur.rowcount: self._event(db, row['id'], now, 'Ожидает обработки')
             db.commit()
             return dict(row), bool(cur.rowcount)
+
+    def add_local(self, name, size, mtime_ns):
+        # Store a filename, never a path supplied by a queue row.
+        import uuid
+        name = str(name)
+        if (not name or name in ('.','..') or '/' in name or '\\' in name or
+                Path(name).name != name or int(size) <= 0 or int(mtime_ns) < 0):
+            raise ValueError('Некорректный тестовый файл')
+        now = time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT * FROM jobs WHERE local_name=? AND local_size=? AND local_mtime_ns=? AND state IN ('queued','running','retry') ORDER BY id LIMIT 1", (name,int(size),int(mtime_ns))).fetchone()
+            if row:
+                db.commit(); return dict(row), False
+            vod_id='test-'+uuid.uuid4().hex
+            cur=db.execute("INSERT INTO jobs(vod_id,streamer,title,local_name,local_size,local_mtime_ns,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",(vod_id,'test',name,name,int(size),int(mtime_ns),now,now))
+            row=db.execute('SELECT * FROM jobs WHERE id=?',(cur.lastrowid,)).fetchone()
+            self._event(db,row['id'],now,'Ожидает обработки','Локальный тест: '+name)
+            db.commit(); return dict(row), True
 
     @staticmethod
     def _event(db, job_id, now, stage, detail=''):

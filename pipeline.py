@@ -120,6 +120,8 @@ def render_clip(src, output, row, source_offset, silence_cfg):
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
     args.out=str(output)
+    # Keep the cutter's generated timeline away from the user's input file.
+    args.timeline=str(Path(output).parent/'_work'/(Path(output).stem+'.timeline.json'))
     args.min_cut=float(silence_cfg.get('min_cut',1.5)); args.max_gap=float(silence_cfg.get('max_gap',2.0))
     args.onset_db=float(silence_cfg.get('onset_db',12.0))
     args.blur_regions=[]; args.precise=True; args.fast=False
@@ -143,37 +145,62 @@ class Pipeline:
 
     def run(self, job, cfg, progress=lambda stage,detail='':None):
         vod_id=str(job['vod_id']); login=str(job['streamer'])
-        if not vod_id.isdecimal(): raise PipelineError('Некорректный ID VOD')
-        folder=self.root/'recordings'/f'{safe_name(login)} VOD {vod_id}'
+        local_name=job.get('local_name')
+        if local_name:
+            if not re.fullmatch(r'test-[a-f0-9]{32}',vod_id): raise PipelineError('Некорректный ID теста')
+            if local_name in ('.','..') or '/' in local_name or '\\' in local_name or Path(local_name).name != local_name:
+                raise PipelineError('Некорректное имя тестового файла')
+            folder=self.root/'recordings'/f'Тест {safe_name(Path(local_name).stem)} {vod_id}'
+        else:
+            if not vod_id.isdecimal(): raise PipelineError('Некорректный ID VOD')
+            folder=self.root/'recordings'/f'{safe_name(login)} VOD {vod_id}'
         folder.mkdir(parents=True,exist_ok=True)
         work=folder/'_work'; work.mkdir(exist_ok=True)
         cli=cfg.get('cli_path') or str(self.root/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe')
         threads=int(cfg.get('download_threads',4)); quality=cfg.get('quality','1080p60')
-        src=work/'full-160p.mp4'
-        progress('Скачивание','Загружается запись для транскрибации')
-        expected=job.get('duration_seconds')
-        def check_duration(path):
-            actual=media_duration(path)
-            if expected and actual < float(expected)-max(5.,float(expected)*.005):
-                raise IncompleteVod('Запись короче заявленной Twitch; не обрабатываю неполный VOD')
-            return actual
-        if src.exists():
-            # Preserve old downloads for inspection but do not reuse a known short file.
-            try:
-                duration=check_duration(src)
-            except IncompleteVod:
-                import uuid
-                os.replace(src,work/('full-160p.incomplete-'+uuid.uuid4().hex+'.mp4'))
-                raise
+        def check_local():
+            if local_name:
+                path=self.root/'test_input'/local_name
+                try:
+                    if path.is_symlink() or not path.is_file(): raise PipelineError('Тестовый файл отсутствует или является ссылкой')
+                    stamp=file_stamp(path)
+                except OSError as exc:
+                    raise PipelineError('Не удалось прочитать тестовый файл') from exc
+                if stamp != {'size':job.get('local_size'),'mtime_ns':job.get('local_mtime_ns')}:
+                    raise PipelineError('Тестовый файл изменился после постановки в очередь; добавьте его заново')
+        if local_name:
+            progress('Скачивание','Проверка локального тестового файла: '+local_name)
+            check_local()
+            src=self.root/'test_input'/local_name
+            duration=media_duration(src)
         else:
-            temp=work/'full-160p.downloading.mp4'
-            if temp.exists(): temp.unlink() # only our own explicitly named temporary file
-            self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
-            duration=check_duration(temp) # do not promote a partial VOD into the cache
-            os.replace(temp,src)
+            src=work/'full-160p.mp4'
+            progress('Скачивание','Загружается запись для транскрибации')
+            expected=job.get('duration_seconds')
+            def check_duration(path):
+                actual=media_duration(path)
+                if expected and actual < float(expected)-max(5.,float(expected)*.005):
+                    raise IncompleteVod('Запись короче заявленной Twitch; не обрабатываю неполный VOD')
+                return actual
+            if src.exists():
+                # Preserve old downloads for inspection but do not reuse a known short file.
+                try:
+                    duration=check_duration(src)
+                except IncompleteVod:
+                    import uuid
+                    os.replace(src,work/('full-160p.incomplete-'+uuid.uuid4().hex+'.mp4'))
+                    raise
+            else:
+                temp=work/'full-160p.downloading.mp4'
+                if temp.exists(): temp.unlink() # only our own explicitly named temporary file
+                self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
+                duration=check_duration(temp) # do not promote a partial VOD into the cache
+                os.replace(temp,src)
         segs,duration=self.speech(src,work/'transcripts',cfg.get('speech',{}),progress,duration=duration)
+        check_local()
         progress('Поиск реакций','Анализируется полный транскрипт')
         rows=validate_intervals(self.finder(str(src),segs,duration,login,cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
+        check_local()
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]
         for i,row in enumerate(rows,1):
@@ -186,14 +213,20 @@ class Pipeline:
             if output.exists() or meta.exists() or txt.exists(): raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
             begin,end=full_cycle.download_bounds(row['start'],row['end'])
             raw=work/(f'clip-{i:04}.mp4'); temp=work/(f'clip-{i:04}.download.mp4'); rendered=folder/(stem+'.rendering.mp4')
-            if temp.exists():temp.unlink()
             if rendered.exists():rendered.unlink()
-            if raw.exists():raw.unlink()
-            self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
-            media_duration(temp); os.replace(temp,raw)
+            if local_name:
+                check_local()
+                render_source=src; offset=0
+            else:
+                if temp.exists():temp.unlink()
+                if raw.exists():raw.unlink()
+                self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
+                media_duration(temp); os.replace(temp,raw)
+                render_source=raw; offset=begin
             progress('Рендер',f'Нарезка {i}/{len(rows)}')
-            keeps,actual=self.renderer(raw,rendered,row,begin,cfg.get('silence',{}))
-            mapped,planned=full_cycle.remap_segments(segs,begin,keeps)
+            keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
+            check_local()
+            mapped,planned=full_cycle.remap_segments(segs,offset,keeps)
             if abs(actual-planned)>.5:
                 raise PipelineError('Длительность видео не совпала с монтажной картой; таймкоды не сохранены')
             mapped=full_cycle.clip_segments(mapped,actual)
@@ -201,7 +234,7 @@ class Pipeline:
             os.replace(rendered,output)
             txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+transcribe.to_txt(mapped),encoding='utf-8-sig')
             atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'duration':actual,'transcript':txt.name})
-            if not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
+            if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))
         progress('Готово',f'Найдено реакций: {len(rows)}; сохранено видео: {len(outputs)}')
         return {'folder':str(folder),'outputs':outputs,'reactions':len(rows)}

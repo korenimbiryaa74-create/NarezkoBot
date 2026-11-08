@@ -44,6 +44,20 @@ class Service:
             api=self.api_factory(tw['client_id'],tw['client_secret'],proxy)
             self._monitor=Monitor(self.store,api); self._monitor_key=key
         return self._monitor
+    def queue_test_inputs(self):
+        folder=self.root/'test_input'; folder.mkdir(parents=True,exist_ok=True)
+        extensions={'.mp4','.mkv','.mov','.webm','.m4v','.avi'}
+        added=0; active=0
+        for path in sorted(folder.iterdir(),key=lambda p:p.name.casefold()):
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in extensions: continue
+            st=path.stat()
+            if st.st_size <= 0: continue
+            _,created=self.store.add_local(path.name,st.st_size,st.st_mtime_ns)
+            if created: added+=1
+            else: active+=1
+        if added: self.log(f'Тестовых видео добавлено в очередь: {added}')
+        return added,active
+
     def monitor_once(self):
         cfg=self.settings.load()
         if not cfg['monitor']['enabled']: return

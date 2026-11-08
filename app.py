@@ -50,6 +50,10 @@ class App:
         ttk.Button(bar,text='Остановить после текущей операции',command=self.stop).pack(side='left',padx=5)
         ttk.Button(bar,text='Войти в ChatGPT',command=self.login).pack(side='left',padx=5)
         ttk.Button(bar,text='Открыть папку результатов',command=self.open_outputs).pack(side='left',padx=5)
+        testbar=ttk.Frame(dashboard); testbar.pack(fill='x',pady=(6,0))
+        ttk.Button(testbar,text='Открыть папку тестовых видео',command=self.open_test_input).pack(side='left')
+        ttk.Button(testbar,text='Запустить тест из папки',command=self.start_test).pack(side='left',padx=5)
+        ttk.Button(testbar,text='Продолжить очередь',command=self.resume_queue).pack(side='left',padx=5)
         self.status=tk.StringVar(value='Остановлено')
         ttk.Label(dashboard,textvariable=self.status).pack(anchor='w',pady=(9,4))
         ttk.Label(dashboard,text='Эфиры и ожидание записи').pack(anchor='w')
@@ -139,6 +143,24 @@ class App:
         if not messagebox.askyesno('Повтор','Проверьте, что предыдущий запрос ChatGPT не выполняется. Повторить задание?'):return
         try:self.service.store.retry(int(rows[0]))
         except ValueError as exc:messagebox.showerror('Повтор',str(exc))
+    def open_test_input(self):
+        folder=ROOT/'test_input'; folder.mkdir(exist_ok=True)
+        if hasattr(os,'startfile'): os.startfile(str(folder))
+    def resume_queue(self):
+        if not self.save(): return
+        if self.service.start(): self.status.set('Очередь запущена')
+        else: messagebox.showwarning('Остановка','Дождитесь завершения текущей операции.')
+    def start_test(self):
+        if not self.save(): return
+        try:
+            added,active=self.service.queue_test_inputs()
+            if not added and not active:
+                messagebox.showinfo('Тест','Поместите видео в папку test_input и запустите тест снова.'); return
+            if not self.service.start():
+                messagebox.showwarning('Остановка','Задание в очереди; дождитесь остановки и нажмите «Продолжить очередь».'); return
+            self.status.set(f'Тест: добавлено {added}, уже в очереди {active}')
+        except Exception as exc: messagebox.showerror('Тест',str(exc))
+
     def open_outputs(self):
         folder=ROOT/'recordings';folder.mkdir(exist_ok=True)
         if hasattr(os,'startfile'):os.startfile(str(folder))
@@ -153,7 +175,7 @@ class App:
             self.jobs.delete(*self.jobs.get_children())
             for j in self.service.store.list_jobs(200):
                 labels={'queued':'В очереди','running':'В работе','done':'Готово','failed':'Ошибка','retry':'Повтор'}
-                self.jobs.insert('','end',iid=str(j['id']),values=(j['id'],j['streamer'],j['vod_id'],labels.get(j['state'],j['state']),j['stage'],j['detail']))
+                self.jobs.insert('','end',iid=str(j['id']),values=(j['id'],('Тест: '+j['local_name']) if j.get('local_name') else j['streamer'], 'локально' if j.get('local_name') else j['vod_id'],labels.get(j['state'],j['state']),j['stage'],j['detail']))
             for item in selected:
                 if self.jobs.exists(item):self.jobs.selection_add(item)
             text='\n'.join(__import__('datetime').datetime.fromtimestamp(t).strftime('%H:%M:%S')+'  '+m for t,m in self.service.logs()[-30:])
