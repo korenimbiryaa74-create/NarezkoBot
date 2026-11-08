@@ -155,7 +155,7 @@ try {
     Run-Checked -file $venvPython -arguments @('-m','pip','install','--upgrade','pip')
     Run-Checked -file $venvPython -arguments @('-m','pip','install','-r',(Join-Path $PSScriptRoot 'requirements-desktop.txt'))
 
-    Run-Checked -file $venvPython -arguments @('-c','import tkinter,requests,numpy,websocket')
+    Run-Checked -file $venvPython -arguments @('-c','import tkinter,requests,numpy,websocket,cv2')
 
     # The pinned original GitHub release is verified before unpacking. Never replace an existing tool.
     $tools = Join-Path $root 'desktop\tools\TwitchDownloaderCLI'
@@ -187,10 +187,6 @@ try {
     if (-not (Api-Ready)) { throw 'Не удалось запустить локальный сервер Ollama на 127.0.0.1:11434.' }
     Write-Host 'Загрузка локальной модели Qwen3-8B (~5,2 ГБ)...'
     Run-Checked -file $ollama -arguments @('pull','qwen3:8b')
-    Write-Host 'Загрузка визуальной модели Qwen3-VL 4B Instruct для поиска баннеров...'
-    Run-Checked -file $ollama -arguments @('pull','qwen3-vl:4b-instruct')
-    # Official pre-release build pinned to its release digest. RTX 5060 compatibility
-    # and actual GPU execution still need a real Windows test.
     $whisper = Join-Path $root 'desktop\tools\whisper'
     $whisperCli = Join-Path $whisper 'whisper-cli.exe'
     if (-not (Test-Path -LiteralPath $whisperCli)) {
