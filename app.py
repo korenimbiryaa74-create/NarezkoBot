@@ -93,7 +93,7 @@ class App:
         self._row(common,3,'Интервал проверки, секунды','interval')
         self._toggle(common,4,'Мониторинг включён','monitor_enabled')
         self._toggle(common,5,'Использовать прокси','proxy_enabled')
-        self._row(common,6,'Адрес прокси (http:// или socks5://)','proxy_url',secret=True)
+        self._row(common,6,'Адрес прокси (http:// или socks5://)','proxy_url')
         self._toggle(common,7,'Прокси для Twitch API','proxy_twitch')
         self._toggle(common,8,'Прокси для ChatGPT','proxy_chatgpt')
         ttk.Label(common,text='Загрузка видео работает напрямую. После смены прокси перезапустите приложение.').grid(row=9,column=0,columnspan=2,sticky='w',padx=8,pady=7)
