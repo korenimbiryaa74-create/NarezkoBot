@@ -14,7 +14,7 @@ DEFAULTS={
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
-             'keep_original':False,'remove_donations':True,'banner_blur':{'enabled':False,'interval':5}}}
+             'keep_original':False,'remove_donations':True,'banner_blur':{'enabled':False,'interval':2}}}
 
 def merge(base, override):
     result=copy.deepcopy(base)
