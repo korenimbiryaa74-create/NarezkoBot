@@ -1,5 +1,6 @@
 # Ported from narezkobot/narezka-restored; comments and docstrings omitted for transport.
 from __future__ import annotations
+import banner_blur
 import argparse
 import functools
 from fractions import Fraction
@@ -527,6 +528,13 @@ def apply_speed(args, speed: str | None=None) -> str:
     return speed
 
 def chunk_cmd(ffmpeg: str, src: str, group, out_path: str, args, n_audio: int, hwaccel: str | None, threads: int, fps_flags: list[str], script_path: str) -> list[str]:
+    timed=getattr(args,'timed_banners',None) or []
+    blur_vf=getattr(args,'blur_vf',None)
+    if timed:
+        if len(group)!=1:raise banner_blur.BannerError('Нет точной монтажной карты для размытия баннеров')
+        w,h=args.banner_output_size
+        dynamic=banner_blur.filter_for_chunk(banner_blur.timed_regions(timed,group[0][0],group[0][1],w,h))
+        if dynamic:blur_vf=(blur_vf+',' if blur_vf else '')+dynamic
     head = [ffmpeg, '-hide_banner', '-v', 'warning']
     if hwaccel:
         head += ['-hwaccel', hwaccel]
@@ -539,7 +547,6 @@ def chunk_cmd(ffmpeg: str, src: str, group, out_path: str, args, n_audio: int, h
     else:
         base = group[0][0]
         write_filter_script(group, n_audio, base, script_path)
-        blur_vf = getattr(args, 'blur_vf', None)
         vlabel = '[vout]'
         if blur_vf:
             with open(script_path, 'a', encoding='utf-8') as fh:
@@ -548,9 +555,12 @@ def chunk_cmd(ffmpeg: str, src: str, group, out_path: str, args, n_audio: int, h
         cmd = head + ['-ss', f'{base:.3f}', '-t', f'{group[-1][1]-base:.3f}', '-i', src, '-filter_complex_script', script_path, '-map', vlabel]
         for a in range(n_audio):
             cmd += ['-map', f'[aout{a}]']
-    blur_vf = getattr(args, 'blur_vf', None)
     if blur_vf and len(group) == 1:
-        cmd += ['-vf', blur_vf]
+        if timed:
+            with open(script_path,'w',encoding='utf-8') as fh:fh.write(blur_vf)
+            cmd += ['-filter_script:v', script_path]
+        else:
+            cmd += ['-vf', blur_vf]
     cmd += ['-c:v', *encode_args(args), '-pix_fmt', 'yuv420p']
     if fps_flags:
         cmd += fps_flags
@@ -720,6 +730,9 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
         args.blur_vf = f'{scale_vf},{blur_vf}'
     else:
         args.blur_vf = scale_vf or blur_vf
+    args.banner_output_size=(out_w,scale_h)
+    if getattr(args,'timed_banners',None) and args.fast:
+        raise banner_blur.BannerError('Для блюра требуется точный рендер')
     print(f'\nрендер      : {out}')
     enc_preset = args.nvenc_preset if args.vcodec.endswith('_nvenc') else args.preset
     print(f"энкодер     : {('copy (без перекодирования)' if args.fast else args.vcodec)}" + ('' if args.fast else f"  (скорость {getattr(args, 'speed', '-')}, пресет {enc_preset})"))
@@ -729,6 +742,8 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
             print(f'              x={x} y={y} {w}x{h}')
         if args.fast:
             print('              ВНИМАНИЕ: в быстром режиме (copy) блюр не применяется - нужен точный режим с перекодированием')
+    elif getattr(args,'timed_banners',None):
+        print(f"блюр        : автоматический, найдено областей на кадрах {len(args.timed_banners)}")
     else:
         print('блюр        : нет (области не заданы)')
     if scale_vf and args.fast:
