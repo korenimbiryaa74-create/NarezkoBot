@@ -6,7 +6,7 @@ import time
 from collections import deque
 from job_store import JobStore
 from monitor import Monitor,TwitchClient
-from pipeline import Pipeline, atomic_json, manual_answer_path, job_identity, organize_completed
+from pipeline import Pipeline, atomic_json, manual_answer_path, manual_donation_path, job_identity, organize_completed
 import reactions
 from stream_cutter import InvalidRenderTimeline
 from bot_debug import redact
@@ -70,6 +70,22 @@ class Service:
             raise ValueError('Выберите задание со статусом «Ошибка». Дождитесь завершения или перезапустите приложение.')
         if not isinstance(text,str) or not text.strip() or len(text)>1_000_000:
             raise ValueError('Буфер пуст или ответ слишком большой')
+        # A separately requested donation answer can also be recovered manually.
+        donation=reactions.tc.parse_answer(text).get('donation_cuts')
+        if donation is not None:
+            if not isinstance(donation,list): raise ValueError('Некорректный список donation_cuts')
+            intervals=[]
+            for c in donation:
+                if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or c['reaction']<1 or c.get('confidence')!='high':
+                    raise ValueError('Некорректный интервал donation_cuts')
+                a,b=reactions.reaction_time(c.get('start')),reactions.reaction_time(c.get('end'))
+                if a is None or b is None or b<=a: raise ValueError('Некорректные таймкоды donation_cuts')
+                intervals.append((c['reaction'],a,b))
+            intervals.sort()
+            if any(x[0]==y[0] and y[1]<x[2] for x,y in zip(intervals,intervals[1:])): raise ValueError('Интервалы donation_cuts пересекаются')
+            atomic_json(manual_donation_path(self.root,job_id),{'job':job_identity(job),'text':text})
+            self.log(f"VOD {job['vod_id']}: сохранён ответ ChatGPT о донатах для ручного продолжения")
+            return len(intervals)
         try:
             parsed=reactions.parse_reaction_answer(text)
             intervals=[]
