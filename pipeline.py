@@ -122,6 +122,10 @@ def manual_answer_path(root, job_id):
     if isinstance(job_id,bool) or not isinstance(job_id,int) or job_id <= 0: raise ValueError('Некорректный номер задания')
     return Path(root)/'state'/'manual_reactions'/f'{job_id}.json'
 
+def manual_donation_path(root, job_id):
+    if isinstance(job_id,bool) or not isinstance(job_id,int) or job_id <= 0: raise ValueError('Некорректный номер задания')
+    return Path(root)/'state'/'manual_donations'/f'{job_id}.json'
+
 def validate_intervals(rows,duration,min_seconds=0):
     if not isinstance(rows,list): raise PipelineError('Ответ модели не содержит список реакций')
     clean=[]
@@ -138,6 +142,24 @@ def validate_intervals(rows,duration,min_seconds=0):
     clean.sort(key=lambda x:x['start'])
     if any(b['start']<a['end'] for a,b in zip(clean,clean[1:])):
         raise PipelineError('Модель вернула пересекающиеся интервалы')
+    return clean
+
+def validate_donation_cuts(cuts, rows):
+    if not isinstance(cuts,list): raise PipelineError('Некорректный список донатов')
+    clean=[]
+    for c in cuts:
+        if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or not 1<=c['reaction']<=len(rows): raise PipelineError('Некорректный номер реакции доната')
+        try:
+            if isinstance(c['start'],bool) or isinstance(c['end'],bool): raise ValueError()
+            a,b=float(c['start']),float(c['end']);row=rows[c['reaction']-1]
+            if not math.isfinite(a) or not math.isfinite(b) or a<row['start'] or b>row['end'] or b<=a or b-a>180 or b-a>(row['end']-row['start'])*.5: raise ValueError()
+        except (ValueError,KeyError,TypeError,OverflowError): raise PipelineError('Некорректные границы доната; не выполняю монтаж') from None
+        clean.append({'reaction':c['reaction'],'start':a,'end':b})
+    clean.sort(key=lambda x:(x['reaction'],x['start']))
+    if any(a['reaction']==b['reaction'] and b['start']<a['end'] for a,b in zip(clean,clean[1:])): raise PipelineError('Интервалы донатов пересекаются')
+    for i,row in enumerate(rows,1):
+        if sum(c['end']-c['start'] for c in clean if c['reaction']==i)>(row['end']-row['start'])*.5:
+            raise PipelineError('Суммарно интервалы донатов занимают более половины реакции; проверьте ответ вручную')
     return clean
 
 def media_duration(path):
@@ -262,6 +284,19 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
     if not result: raise PipelineError('В записи не обнаружена речь')
     return result,duration
 
+def subtract_intervals(keeps, cuts):
+    result=[]
+    for a,b in keeps:
+        cursor=a
+        for start,end in cuts:
+            if end<=cursor: continue
+            if start>=b: break
+            if start>cursor: result.append((cursor,min(start,b)))
+            cursor=max(cursor,end)
+            if cursor>=b: break
+        if cursor<b: result.append((cursor,b))
+    return result
+
 def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=None):
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
@@ -292,7 +327,11 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
         res={'src':str(src),'info':info,'streams':stream_cutter.audio_streams(info),'total':total}
         if not res['streams']: raise PipelineError('В видео нет аудиодорожек')
         keeps=[(start,end)]
-    if sum(b-a for a,b in keeps)<.5: raise PipelineError('После удаления тишины не осталось видео')
+    donation_cuts=[(c['start']-source_offset,c['end']-source_offset) for c in row.get('donation_cuts',[])]
+    if donation_cuts:
+        if progress_callback: progress_callback(f'Удаление ответов на донаты: {len(donation_cuts)}')
+        keeps=subtract_intervals(keeps,donation_cuts)
+    if sum(b-a for a,b in keeps)<.5: raise PipelineError('После удаления тишины и донатов не осталось видео')
     res['keep']=keeps
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
@@ -356,6 +395,17 @@ def cut_report(folder,job,i,row,mode):
             lines.extend(['',f'Всего удалено: {len(checked)} пауз, {sum(b-a for a,b in checked):.3f} с.'])
     return '\n'.join(lines)+'\n'
 
+def donation_report(job,row):
+    label='исходного тестового видео' if job.get('local_name') else 'исходной записи Twitch (VOD)'
+    lines=[f'Нарезка: {row["title"]}',f'Таймкоды от начала {label}.',
+           'Интервалы определены ChatGPT по транскрипту и могут содержать ошибки; проверьте склейки.',
+           'Интервалы могут частично пересекаться с удалённой тишиной.', '']
+    cuts=row['donation_cuts']
+    if not cuts: lines.append('Уверенных ответов на донаты не найдено; это не гарантия, что их не было.')
+    for i,c in enumerate(cuts,1):
+        lines.append(f"{i:03}. {precise_timestamp(c['start'])} — {precise_timestamp(c['end'])}  ({c['end']-c['start']:.3f} с)")
+    return '\n'.join(lines)+'\n'
+
 def organize_clips(folder,job,rows,mode):
     folder=Path(folder)
     ready=folder/(READY_SILENCE if mode is True else READY_GENERIC)
@@ -375,14 +425,21 @@ def organize_clips(folder,job,rows,mode):
         text=cut_report(folder,job,i,row,mode)
         if report.exists() and report.read_text(encoding='utf-8-sig')!=text:
             raise PipelineError(f'Отчёт {report.name} уже существует и отличается; не перезаписываю')
-        plans.append((srcs,report,text))
+        reports=[(report,text)]
+        if 'donation_cuts' in row:
+            dreport=ready/(stem+' — удалённые донаты.txt'); dtext=donation_report(job,row)
+            if dreport.exists() and dreport.read_text(encoding='utf-8-sig')!=dtext:
+                raise PipelineError(f'Отчёт {dreport.name} уже существует и отличается; не перезаписываю')
+            reports.append((dreport,dtext))
+        plans.append((srcs,reports))
     ready.mkdir(parents=True,exist_ok=True)
-    for srcs,report,text in plans:
+    for srcs,reports in plans:
         for src,dest in srcs:
             if src != dest:
                 if dest.exists(): raise PipelineError(f'Файл {dest.name} уже существует; не перезаписываю')
                 os.rename(src,dest)
-        if not report.exists():
+        for report,text in reports:
+          if not report.exists():
             # Write completely before publishing; never overwrite a user's report.
             fd,tmp=tempfile.mkstemp(prefix='.report-',dir=ready)
             try:
@@ -392,7 +449,7 @@ def organize_clips(folder,job,rows,mode):
                 else: os.link(tmp,report)  # atomic, exclusive on POSIX
             finally:
                 if os.path.exists(tmp): os.unlink(tmp)
-    return ready,[str(pairs[0][1]) for pairs,_,_ in plans]
+    return ready,[str(pairs[0][1]) for pairs,_ in plans]
 
 def timeline_matches_metadata(folder,stem,meta):
     # Old metadata did not record this switch. Only reuse a timeline whose
@@ -490,6 +547,16 @@ class Pipeline:
                 finder_cfg=dict(cfg,_manual_reactions=manual['text'])
         rows=validate_intervals(self.finder(str(src),segs,duration,login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
         check_local()
+        if cfg.get('remove_donations',False) and rows:
+            if not hasattr(self.finder,'find_donations'): raise PipelineError('Поиск донатов недоступен у текущего поставщика')
+            manual_donation=None
+            if isinstance(job.get('id'),int) and not isinstance(job['id'],bool) and job['id']>0:
+                saved=load_json(manual_donation_path(self.root,job['id']))
+                if isinstance(saved,dict) and saved.get('job')==job_identity(job) and isinstance(saved.get('text'),str): manual_donation=saved['text']
+            cuts=validate_donation_cuts(self.finder.find_donations(segs,rows,progress,manual=manual_donation),rows)
+            for i,row in enumerate(rows,1):
+                row['donation_cuts']=[{'start':c['start'],'end':c['end']} for c in cuts if c['reaction']==i]
+            check_local()
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]
         for i,row in enumerate(rows,1):
