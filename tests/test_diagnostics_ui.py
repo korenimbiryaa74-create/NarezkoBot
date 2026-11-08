@@ -17,6 +17,7 @@ class DiagnosticsUITests(unittest.TestCase):
         self.app=App.__new__(App)
         self.app.window=MagicMock(); self.app.status=MagicMock(); self.app.events=MagicMock();self.app.notifications=MagicMock()
         self.app.jobs=MagicMock(); self.app.streams=MagicMock(); self.app.service=MagicMock()
+        self.app.config={};self.app.service.stream_rows.return_value=[]
     def test_copy_selected_job_detail(self):
         self.app.jobs.selection.return_value=('7',)
         self.app.service.store.list_jobs.return_value=[{'id':7,'local_name':'demo.mp4','streamer':'test','state':'retry','stage':'Ожидает повтора','detail':'TranscribeError: причина'}]
@@ -34,6 +35,19 @@ class DiagnosticsUITests(unittest.TestCase):
         self.app.events.tag_add.assert_called_once_with('sel','1.0','end-1c')
         self.assertEqual(self.app.copy_event_selection(),'break')
         self.app.window.clipboard_append.assert_called_once_with('выделенный текст')
+    def test_refresh_shows_saved_streamers(self):
+        self.app.config={'streamers':['one','two']}
+        self.app.service.stream_rows.return_value=[('one','','Мониторинг остановлен',''),('two','','Мониторинг остановлен','')]
+        self.app.service.store.list_jobs.return_value=[]
+        self.app.service.store.notifications.return_value=[]
+        self.app.service.logs.return_value=[]
+        self.app.jobs.selection.return_value=()
+        self.app.streams.get_children.return_value=()
+        self.app.jobs.get_children.return_value=()
+        self.app.refresh()
+        self.assertEqual(self.app.streams.insert.call_count,2)
+        self.app.service.stream_rows.assert_called_once_with(self.app.config)
+        self.app.status.set.assert_not_called()
     def test_refresh_preserves_selected_event_text(self):
         self.app.service._monitor=None
         self.app.service.store.list_jobs.return_value=[]
@@ -45,6 +59,7 @@ class DiagnosticsUITests(unittest.TestCase):
         self.app.refresh()
         self.app.events.delete.assert_not_called()
         self.app.window.after.assert_called_once()
+        self.app.status.set.assert_not_called()
 
 class ProfileMigrationTests(unittest.TestCase):
     def setUp(self):

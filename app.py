@@ -73,11 +73,14 @@ class App:
         ttk.Button(testbar,text='Продолжить очередь',command=self.resume_queue).pack(side='left',padx=5)
         self.status=tk.StringVar(value='Остановлено')
         ttk.Label(dashboard,textvariable=self.status).pack(anchor='w',pady=(9,4))
-        ttk.Label(dashboard,text='Эфиры и ожидание записи').pack(anchor='w')
-        self.streams=ttk.Treeview(dashboard,columns=('login','id','state','details'),show='headings',height=5)
+        ttk.Label(dashboard,text='Стримеры и ожидаемые записи (сохранённый список)').pack(anchor='w')
+        streamframe=ttk.Frame(dashboard);streamframe.pack(fill='x',pady=4)
+        self.streams=ttk.Treeview(streamframe,columns=('login','id','state','details'),show='headings',height=5)
         for name,width,text in [('login',140,'Стример'),('id',130,'ID эфира'),('state',150,'Состояние'),('details',350,'Ошибка / VOD')]:
             self.streams.heading(name,text=text); self.streams.column(name,width=width,stretch=True)
-        self.streams.pack(fill='x',pady=4)
+        streamscroll=ttk.Scrollbar(streamframe,orient='vertical',command=self.streams.yview)
+        self.streams.configure(yscrollcommand=streamscroll.set)
+        self.streams.pack(side='left',fill='x',expand=True);streamscroll.pack(side='right',fill='y')
         ttk.Label(dashboard,text='Очередь и история обработки').pack(anchor='w',pady=(7,0))
         self.jobs=ttk.Treeview(dashboard,columns=('id','streamer','vod','state','stage','detail'),show='headings',height=9)
         for name,width,text in [('id',50,'№'),('streamer',100,'Стример'),('vod',100,'VOD'),('state',90,'Статус'),('stage',130,'Этап'),('detail',400,'Подробности')]:
@@ -383,11 +386,9 @@ class App:
         if hasattr(os,'startfile'):os.startfile(str(folder))
     def refresh(self):
         try:
-            streams=[]
-            if self.service._monitor: streams=self.service._monitor.status()
+            streams=self.service.stream_rows(self.config)
             self.streams.delete(*self.streams.get_children())
-            labels={'live':'В эфире','waiting_vod':'Ожидает запись','queued':'В очереди'}
-            for s in streams:self.streams.insert('', 'end',values=(s['login'],s['stream_id'],labels.get(s['state'],s['state']),s['last_error'] or s['queued_vod_id'] or ''))
+            for row in streams:self.streams.insert('', 'end',values=row)
             selected=self.jobs.selection()
             self.jobs.delete(*self.jobs.get_children())
             for j in self.service.store.list_jobs(200):
