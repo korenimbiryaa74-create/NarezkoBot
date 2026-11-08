@@ -17,23 +17,38 @@ PROMPT='''Find advertising or promotional overlays that a streamer has placed on
 SCHEMA={'type':'object','properties':{'banners':{'type':'array','maxItems':8,'items':{'type':'array','minItems':4,'maxItems':4,'items':{'type':'integer','minimum':0,'maximum':1000}}}},'required':['banners'],'additionalProperties':False}
 class BannerError(RuntimeError): pass
 class BannerSetupError(BannerError): pass
+class BannerResponseError(BannerError): pass
 
 def parse_boxes(text):
-    try:
-        value=json.loads(text)
-        boxes=value['banners']
-        if not isinstance(boxes,list) or len(boxes)>8: raise ValueError()
-        result=[]
-        for box in boxes:
-            if not isinstance(box,list) or len(box)!=4 or any(isinstance(x,bool) or not isinstance(x,int) or not 0<=x<=1000 for x in box):raise ValueError()
-            x1,y1,x2,y2=box
-            if x2<=x1 or y2<=y1 or (x2-x1)*(y2-y1)>400000:raise ValueError()
-            # Conservative padding for animated edges. Clamped to source frame.
-            px=max(8,round((x2-x1)*.12));py=max(8,round((y2-y1)*.12))
-            result.append([max(0,x1-px),max(0,y1-py),min(1000,x2+px),min(1000,y2+py)])
-        return result
-    except (TypeError,ValueError,KeyError,json.JSONDecodeError):
-        raise BannerError('Модель вернула некорректные области баннеров; рендер остановлен') from None
+    # Never publish response text from frames; only report structural problems.
+    if not isinstance(text,str) or not text.strip():
+        raise BannerResponseError('Модель вернула пустой ответ о баннерах')
+    try: value=json.loads(text)
+    except (ValueError,TypeError):
+        raise BannerResponseError('Модель вернула неразборчивый JSON с областями баннеров') from None
+    if not isinstance(value,dict) or 'banners' not in value:
+        raise BannerResponseError('В ответе модели отсутствует список banners')
+    boxes=value['banners']
+    if not isinstance(boxes,list):raise BannerResponseError('Поле banners в ответе модели не является списком')
+    if len(boxes)>8:raise BannerResponseError(f'Модель вернула слишком много областей: {len(boxes)}, максимум 8')
+    result=[]
+    for i,box in enumerate(boxes,1):
+        if not isinstance(box,list) or len(box)!=4:
+            raise BannerResponseError(f'Область {i}: ожидаются четыре координаты [x1,y1,x2,y2]')
+        if any(isinstance(x,bool) or not isinstance(x,(int,float)) for x in box):
+            raise BannerResponseError(f'Область {i}: координаты должны быть числами')
+        if any(x<0 or x>1000 or (isinstance(x,float) and not math.isfinite(x)) for x in box):
+            raise BannerResponseError(f'Область {i}: координаты вне шкалы 0–1000')
+        # Integral and fractional coordinates use the same 0–1000 grid. Outward
+        # rounding prevents exposing an edge. We never infer a 0–1 scale.
+        x1,y1,x2,y2=box
+        if x2<=x1 or y2<=y1:raise BannerResponseError(f'Область {i}: конец не больше начала')
+        if (x2-x1)*(y2-y1)>400000:
+            raise BannerResponseError(f'Область {i}: занимает более 40% кадра; автоматический блюр остановлен')
+        x1=math.floor(x1);y1=math.floor(y1);x2=math.ceil(x2);y2=math.ceil(y2)
+        px=max(8,round((x2-x1)*.12));py=max(8,round((y2-y1)*.12))
+        result.append([max(0,x1-px),max(0,y1-py),min(1000,x2+px),min(1000,y2+py)])
+    return result
 
 def request_boxes(image):
     req={'model':MODEL,'stream':False,'think':False,'format':SCHEMA,'options':{'temperature':0,'num_ctx':4096},
@@ -73,7 +88,12 @@ def request_boxes(image):
         raise BannerError('Не удалось связаться с локальным Ollama; проверьте, что он запущен') from None
     except (ValueError,KeyError,TypeError):
         raise BannerError('Ollama вернула некорректный ответ модели баннеров; проверьте версию Ollama и модель qwen3-vl:4b') from None
-    return parse_boxes(text)
+    try:
+        return parse_boxes(text)
+    except BannerResponseError as exc:
+        if data.get('done_reason')=='length':
+            raise BannerResponseError('Ответ модели о баннерах обрезан из-за лимита генерации; рендер остановлен') from None
+        raise exc from None
 
 def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
     if not math.isfinite(interval) or interval<=0:raise BannerError('Неверный интервал анализа')
@@ -83,7 +103,7 @@ def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
         t=start
         while t<end-0.0001:
             stop=min(end,t+interval); middle=(t+stop)/2; index+=1
-            if progress and (index==1 or index%10==0 or index==total):progress(f'Поиск баннеров: кадр {index}/{total} · время исходного фрагмента {int(middle//60):02}:{int(middle%60):02}')
+            if progress and (index<=3 or index%10==0 or index==total):progress(f'Поиск баннеров: кадр {index}/{total} · время исходного фрагмента {int(middle//60):02}:{int(middle%60):02}')
             cmd=[ffmpeg,'-hide_banner','-loglevel','error','-ss',f'{middle:.3f}','-i',str(src),'-frames:v','1','-vf','scale=960:-2:force_original_aspect_ratio=decrease','-f','image2pipe','-vcodec','mjpeg','pipe:1']
             try:r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             except (subprocess.SubprocessError,OSError) as exc: raise BannerError('Не удалось извлечь кадр для поиска баннеров') from exc

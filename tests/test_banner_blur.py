@@ -13,8 +13,27 @@ class BannerTests(unittest.TestCase):
     def test_parse_and_padding(self):
         self.assertEqual(banner_blur.parse_boxes('{"banners":[]}'),[])
         self.assertEqual(banner_blur.parse_boxes('{"banners":[[0,0,100,100]]}'),[[0,0,112,112]])
+        self.assertEqual(banner_blur.parse_boxes('{"banners":[[0.5,1.2,100.4,101.6]]}'),[[0,0,113,114]])
         for raw in ('no','{}','{"banners":[[1,2,0,3]]}','{"banners":[[0,0,1000,1000]]}','{"banners":[[0,0,1001,5]]}','{"banners":[[0,0,3,true]]}'):
             with self.subTest(raw=raw),self.assertRaises(banner_blur.BannerError):banner_blur.parse_boxes(raw)
+    def test_precise_structure_diagnostics_and_no_raw_text(self):
+        cases=[('', 'пустой'),('secret', 'JSON'),('{"not_banners":"secret"}','отсутствует'),
+               ('{"banners":null}','не является списком'),('{"banners":[[2,2,1,3]]}','конец'),
+               ('{"banners":[[0,0,1000,1000]]}','40%'),('{"banners":[[0,0,1001,1]]}','0–1000'),
+               ('{"banners":[[0,0,"secret",5]]}','числами')]
+        for value,expected in cases:
+            with self.subTest(value=value),self.assertRaises(banner_blur.BannerResponseError) as caught:banner_blur.parse_boxes(value)
+            self.assertIn(expected,str(caught.exception));self.assertNotIn('secret',str(caught.exception))
+
+    def test_truncated_model_response_is_distinguished(self):
+        class Response:
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+            def read(self,*a):return json.dumps({'message':{'content':'{'},'done_reason':'length'}).encode()
+        with patch('banner_blur.urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value=Response()
+            with self.assertRaisesRegex(banner_blur.BannerResponseError,'обрезан'):banner_blur.request_boxes(b'jpeg')
+
     def test_windows_and_offsets(self):
         sample=[{'start':10.,'end':15.,'box':[0,0,200,200]},{'start':15.,'end':20.,'box':[0,0,200,200]}]
         self.assertEqual(banner_blur.timed_regions(sample,12,18,1000,500),[(0,0,200,100,[(0,6)])])
@@ -55,6 +74,19 @@ class BannerTests(unittest.TestCase):
             saved=svc.store.list_jobs()[0]
             self.assertEqual(saved['state'],'failed');self.assertIn('Модель не найдена',saved['detail'])
             self.assertFalse(any('повтор через' in e for _,e in svc.logs()))
+
+    def test_response_error_stops_without_retry(self):
+        from service import Service
+        from settings import Settings
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);settings=Settings(root/'config.json')
+            class Engine:
+                def run(self,job,cfg,progress):
+                    progress('Рендер','Поиск баннеров')
+                    raise banner_blur.BannerResponseError('Ответ неверен')
+            svc=Service(root,settings,None,pipeline_factory=lambda *a:Engine())
+            svc.store.add('123','name');svc.worker_once()
+            self.assertEqual(svc.store.list_jobs()[0]['state'],'failed')
 
     def test_ollama_protocol_and_bounds(self):
         class Response:

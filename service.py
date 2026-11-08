@@ -10,7 +10,7 @@ from pipeline import Pipeline, atomic_json, manual_answer_path, manual_donation_
 import reactions
 from stream_cutter import InvalidRenderTimeline
 from bot_debug import redact
-from banner_blur import BannerSetupError
+from banner_blur import BannerSetupError, BannerResponseError
 
 class Service:
     def __init__(self,root,settings,finder,api_factory=TwitchClient,pipeline_factory=Pipeline):
@@ -160,7 +160,7 @@ class Service:
                         if secret: detail=detail.replace(secret,'[скрыто]')
                 except (TypeError,KeyError): pass
             current=next((x for x in self.store.list_jobs(1000) if x['id']==job['id']),None)
-            safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов') and not isinstance(exc,(InvalidRenderTimeline,BannerSetupError))
+            safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов') and not isinstance(exc,(InvalidRenderTimeline,BannerSetupError,BannerResponseError))
             if safe and job['attempts']<3:
                 delay=60*job['attempts']
                 self.store.finish(job['id'],'retry',detail,retry_after=delay)
