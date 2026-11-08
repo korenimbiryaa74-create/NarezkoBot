@@ -12,21 +12,35 @@ CLI = ROOT / 'desktop' / 'tools' / 'whisper' / 'whisper-cli.exe'
 MODEL = ROOT / 'desktop' / 'tools' / 'whisper-model' / 'ggml-large-v3-turbo.bin'
 
 
+class InvalidWhisperSegments(transcribe.TranscribeError):
+    """The local recognizer ran, but its output cannot be safely timed."""
+
+
 def parse_segments(data, offset, length):
     rows = data.get('transcription') if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        raise transcribe.TranscribeError('whisper.cpp вернул некорректный JSON')
+        raise InvalidWhisperSegments('whisper.cpp: нет списка сегментов')
     result = []
-    for row in rows:
+    for i, row in enumerate(rows, 1):
+        prefix = f'whisper.cpp: сегмент {i}/{len(rows)}'
+        if not isinstance(row, dict) or not isinstance(row.get('text'), str):
+            raise InvalidWhisperSegments(prefix + ': нет текста')
+        text = row['text'].strip()
+        if not text: continue
         try:
-            text = row['text'].strip()
-            begin, end = float(row['offsets']['from']) / 1000, float(row['offsets']['to']) / 1000
-        except (KeyError, TypeError, ValueError, AttributeError) as e:
-            raise transcribe.TranscribeError('Некорректный сегмент whisper.cpp') from e
-        if not math.isfinite(begin + end) or begin < 0 or end < begin or end > length + 1:
-            raise transcribe.TranscribeError('Некорректные таймкоды whisper.cpp')
-        if text:
-            result.append({'start': round(begin + offset, 3), 'end': round(end + offset, 3), 'text': text})
+            offsets=row['offsets']
+            if isinstance(offsets['from'],bool) or isinstance(offsets['to'],bool): raise ValueError()
+            begin,end=float(offsets['from'])/1000,float(offsets['to'])/1000
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise InvalidWhisperSegments(prefix + ': нет числовых таймкодов') from None
+        if not math.isfinite(begin) or not math.isfinite(end):
+            raise InvalidWhisperSegments(prefix + ': нечисловые таймкоды')
+        if begin < -0.25 or end < begin or end > length + 1 or begin >= length or end < 0:
+            # Numeric diagnostics only: never log the segment text.
+            raise InvalidWhisperSegments(prefix + f': таймкоды {begin:.3g}–{end:.3g} вне части 0–{length:.3g} с')
+        begin=max(0.,begin);end=min(length,end)
+        if end < begin: raise InvalidWhisperSegments(prefix + ': неверный порядок таймкодов')
+        result.append({'start': round(begin + offset, 3), 'end': round(end + offset, 3), 'text': text})
     return result
 
 

@@ -54,6 +54,37 @@ class PipelineTests(unittest.TestCase):
             rows,duration=pipeline.speech_chunks(video,self.root/'cache',{},lambda *a:None,transcriber=fake,duration=1300)
             self.assertEqual(len(rows),3)
         self.assertEqual(calls,[(0,600),(600,1200),(1200,1300)])
+    def test_invalid_local_segment_retries_in_halves_and_caches(self):
+        import whisper_cpp
+        video=self.root/'media.mp4';video.write_bytes(b'x'*2000);calls=[]
+        def fake(*a,**kw):
+            start,end=kw['start'],kw['end'];calls.append((start,end))
+            if end-start==600: raise whisper_cpp.InvalidWhisperSegments('bad timings')
+            return [{'start':start+1,'end':start+2,'text':'part'}]
+        rows,_=pipeline.speech_chunks(video,self.root/'cache',{'groq_enabled':False},lambda *a:None,transcriber=fake,duration=600)
+        self.assertEqual(calls,[(0,600),(0,300),(300,600)]);self.assertEqual([r['start'] for r in rows],[1,301])
+        pipeline.speech_chunks(video,self.root/'cache',{'groq_enabled':False},lambda *a:None,transcriber=fake,duration=600)
+        self.assertEqual(len(calls),3)
+    def test_half_cache_recovers_after_failure_without_reprocessing(self):
+        import whisper_cpp
+        video=self.root/'media.mp4';video.write_bytes(b'x'*2000);calls=[];fail=[True]
+        def fake(*a,**kw):
+            start,end=kw['start'],kw['end'];calls.append((start,end))
+            if end-start==600: raise whisper_cpp.InvalidWhisperSegments('bad')
+            if start==300 and fail[0]: raise whisper_cpp.InvalidWhisperSegments('bad half')
+            return [{'start':start+1,'end':start+2,'text':'part'}]
+        def run():return pipeline.speech_chunks(video,self.root/'cache',{'groq_enabled':False},lambda *a:None,transcriber=fake,duration=600)
+        with self.assertRaises(whisper_cpp.InvalidWhisperSegments):run()
+        self.assertEqual(len(list((self.root/'cache').rglob('0000.json'))),0)
+        fail[0]=False;run()
+        self.assertEqual(calls,[(0,600),(0,300),(300,600),(300,600)])
+    def test_non_timing_local_error_does_not_split(self):
+        import transcribe
+        video=self.root/'media.mp4';video.write_bytes(b'x'*2000);calls=[]
+        def fake(*a,**kw):calls.append(1);raise transcribe.TranscribeError('no model')
+        with self.assertRaises(transcribe.TranscribeError):
+            pipeline.speech_chunks(video,self.root/'cache',{'groq_enabled':False},lambda *a:None,transcriber=fake,duration=600)
+        self.assertEqual(len(calls),1)
     def test_bad_overlap_is_rejected(self):
         with self.assertRaises(pipeline.PipelineError):
             pipeline.validate_intervals([{'start':1,'end':10},{'start':9,'end':11}],100)

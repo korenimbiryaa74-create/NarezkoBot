@@ -152,7 +152,34 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
         if segments is None:
             progress('Транскрибация',f'Часть {i+1}/{total} · локальный Whisper · {timestamp(start)}–{timestamp(end)}')
             fn=transcriber or whisper_cpp.transcribe_file
-            segments=_valid_speech_segments(fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=start,end=end,quiet=True),start,end)
+            def local_range(a,b):
+                rows=fn(str(video),engine='local',model=settings['model'],lang=settings['language'],device=settings['device'],compute=settings['compute'],beam=settings['beam'],start=a,end=b,quiet=True)
+                return _valid_speech_segments(rows,a,b)
+            # A failed long segment can be retried as two independent shorter ranges.
+            # Save each half separately, but promote the full chunk only when both pass.
+            midpoint=(start+end)/2
+            ranges=((start,midpoint),(midpoint,end))
+            def cached_half(j,a,b):
+                obj=load_json(Path(cache_dir)/local_key/f'{i:04}.half-{j}.json')
+                if not isinstance(obj,dict) or obj.get('key')!=local_key or obj.get('start')!=a or obj.get('end')!=b: return None
+                try: return _valid_speech_segments(obj.get('segments'),a,b)
+                except PipelineError: return None
+            halves=[cached_half(j,a,b) for j,(a,b) in enumerate(ranges)]
+            try:
+                segments=None if any(x is not None for x in halves) else local_range(start,end)
+            except whisper_cpp.InvalidWhisperSegments as exc:
+                if end-start < 2: raise
+                progress('Транскрибация',f'{exc}; повторяю эту часть двумя половинами')
+                segments=None
+            if segments is None:
+                segments=[]
+                for j,(a,b) in enumerate(ranges):
+                    part=halves[j]
+                    if part is None:
+                        progress('Транскрибация',f'Часть {i+1}/{total} · локальный Whisper, половина {j+1}/2 · {timestamp(a)}–{timestamp(b)}')
+                        part=local_range(a,b)
+                        atomic_json(Path(cache_dir)/local_key/f'{i:04}.half-{j}.json',{'key':local_key,'start':a,'end':b,'segments':part})
+                    segments.extend(part)
             atomic_json(Path(cache_dir)/local_key/f'{i:04}.json',{'key':local_key,'segments':segments})
             origin='локальный Whisper'
         if 'кэш' in origin: progress('Транскрибация',f'Часть {i+1}/{total} · {origin}')

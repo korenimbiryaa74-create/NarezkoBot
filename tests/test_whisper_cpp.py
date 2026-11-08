@@ -12,6 +12,19 @@ class WhisperCppTests(unittest.TestCase):
     def test_bad_timestamps_rejected(self):
         with self.assertRaises(transcribe.TranscribeError):
             whisper_cpp.parse_segments({'transcription':[{'text':'x','offsets':{'from':0,'to':999999}}]},0,10)
+    def test_clamps_small_overshoot_and_skips_empty_segments(self):
+        data={'transcription':[{'text':' ','offsets':None},{'text':'a','offsets':{'from':-20,'to':500}},{'text':'b','offsets':{'from':9900,'to':10200}}]}
+        rows=whisper_cpp.parse_segments(data,600,10)
+        self.assertEqual([(r['start'],r['end']) for r in rows],[(600.,600.5),(609.9,610.)])
+    def test_bad_timestamps_report_safe_numeric_context(self):
+        data={'transcription':[{'text':'PRIVATE TEXT','offsets':{'from':9000,'to':15000}}]}
+        with self.assertRaises(whisper_cpp.InvalidWhisperSegments) as err: whisper_cpp.parse_segments(data,600,10)
+        self.assertIn('сегмент 1/1',str(err.exception));self.assertIn('9–15',str(err.exception))
+        self.assertNotIn('PRIVATE TEXT',str(err.exception))
+    def test_invalid_text_segment_not_silently_discarded(self):
+        for offsets in ({'from':'nan','to':10},{'from':True,'to':10},{'from':11000,'to':11000},{'from':8000,'to':2000}):
+            with self.assertRaises(whisper_cpp.InvalidWhisperSegments):
+                whisper_cpp.parse_segments({'transcription':[{'text':'abc','offsets':offsets}]},0,10)
     def test_absent_tools_gives_clear_error(self):
         with patch.object(whisper_cpp,'CLI',Path('/does-not-exist')):
             with self.assertRaises(transcribe.TranscribeError): whisper_cpp.transcribe_file('any')
