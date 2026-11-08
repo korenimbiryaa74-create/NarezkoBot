@@ -31,6 +31,14 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('00:00:02',txt); self.assertIn('два',txt)
         self.assertTrue(out.with_suffix('.pipeline.json').exists())
         self.assertEqual(self.stages[-1][0],'Готово')
+    def test_output_flags_adjusted_segment(self):
+        def speech(src,cache,cfg,progress,duration=None):
+            return ([{'start':10.3,'end':11,'text':'one','timing_warning':'end_clipped'}],100.)
+        worker=pipeline.Pipeline(self.root,self.finder,self.download,self.render,speech)
+        with patch.object(pipeline,'media_duration',return_value=100.):
+            result=worker.run({'vod_id':'123','streamer':'name'}, {'quality':'1080p60','min_reaction_minutes':0})
+        txt=Path(result['outputs'][0]).with_suffix('.txt').read_text(encoding='utf-8-sig')
+        self.assertIn('требуют проверки',txt);self.assertIn('one',txt)
     def test_finished_clip_reused_without_redownload(self):
         self.run_it(); self.run_it()
         self.assertEqual(len(self.downloads),2)

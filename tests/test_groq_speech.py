@@ -69,6 +69,22 @@ class GroqTests(unittest.TestCase):
         for payload in ({'segments':[], 'text':'PRIVATE WORDS'}, {'segments':[{'start':100.5,'end':100.6,'text':'PRIVATE WORDS'}]}, {'segments':[{'start':'PRIVATE WORDS','end':2,'text':'PRIVATE WORDS'}]}):
             with self.assertRaises(groq_speech.GroqResponseError) as err: groq_speech.parse_segments(payload,0,100)
             self.assertNotIn('PRIVATE WORDS',str(err.exception))
+    def test_exact_last_groq_overrun_from_log_is_bounded_and_marked(self):
+        rows=groq_speech.parse_segments({'segments':[{'start':595,'end':624.98,'text':'final'}]},7800,600)
+        self.assertEqual(rows,[{'start':8395.,'end':8400.,'text':'final','timing_warning':'end_clipped'}])
+        with self.assertRaises(groq_speech.GroqResponseError):
+            groq_speech.parse_segments({'segments':[{'start':595,'end':624.98,'text':'x'},{'start':599,'end':600,'text':'y'}]},7800,600)
+        with self.assertRaises(groq_speech.GroqResponseError):
+            groq_speech.parse_segments({'segments':[{'start':595,'end':630.51,'text':'x'}]},7800,600)
+    def test_boundary_warning_survives_cache_and_is_visible(self):
+        def adjusted(*args,**kw):
+            self.calls.append(('groq',kw['start']))
+            return [{'start':kw['start']+1,'end':kw['end'],'text':'test','timing_warning':'end_clipped'}]
+        rows,_=self.run_speech(adjusted)
+        self.assertEqual(len([s for s in self.events if 'требуют проверки' in s[1]]),3)
+        self.assertEqual(rows[0]['timing_warning'],'end_clipped')
+        self.events=[];self.run_speech(adjusted)
+        self.assertEqual(len(self.calls),3);self.assertEqual(len([s for s in self.events if 'требуют проверки' in s[1]]),3)
     def test_corrupt_local_cache_is_recomputed(self):
         self.cfg['groq_enabled']=False; self.run_speech()
         file=next((self.root/'cache').rglob('0000.json')); data=json.loads(file.read_text()); data['segments']=[{'start':99999,'end':99999,'text':'bad'}];file.write_text(json.dumps(data))
