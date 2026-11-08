@@ -8,8 +8,8 @@ except ModuleNotFoundError as exc:
     import sys, types
     from unittest.mock import patch
     fake=types.ModuleType('tkinter'); fake.TclError=type('TclError',(Exception,),{})
-    fake.ttk=types.ModuleType('tkinter.ttk'); fake.messagebox=types.ModuleType('tkinter.messagebox')
-    with patch.dict(sys.modules, {'tkinter':fake,'tkinter.ttk':fake.ttk,'tkinter.messagebox':fake.messagebox}):
+    fake.ttk=types.ModuleType('tkinter.ttk'); fake.messagebox=types.ModuleType('tkinter.messagebox'); fake.filedialog=types.ModuleType('tkinter.filedialog')
+    with patch.dict(sys.modules, {'tkinter':fake,'tkinter.ttk':fake.ttk,'tkinter.messagebox':fake.messagebox,'tkinter.filedialog':fake.filedialog}):
         from app import App
 
 class DiagnosticsUITests(unittest.TestCase):
