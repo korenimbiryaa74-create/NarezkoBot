@@ -20,6 +20,7 @@ class App:
         except Exception as exc:
             messagebox.showerror('Настройки',str(exc)); raise
         self.finder=ChatGPTFinder(ROOT); self.service=Service(ROOT,self.settings,self.finder)
+        self.service.recover_interrupted()
         self.variables={}; self._last_job=None
         self._build()
         self._load_controls()
@@ -69,6 +70,8 @@ class App:
         jobbar=ttk.Frame(dashboard); jobbar.pack(fill='x')
         ttk.Button(jobbar,text='Повторить выбранное задание с ошибкой',command=self.retry).pack(side='left')
         ttk.Button(jobbar,text='Скопировать ошибку выбранного задания',command=self.copy_job_detail).pack(side='left',padx=5)
+        recoverybar=ttk.Frame(dashboard);recoverybar.pack(fill='x',pady=(4,0))
+        ttk.Button(recoverybar,text='Вставить ответ ChatGPT',command=self.import_chatgpt_answer).pack(side='left')
         eventbar=ttk.Frame(dashboard); eventbar.pack(fill='x',pady=(8,0))
         ttk.Label(eventbar,text='Последние события (выделение приостанавливает обновление текста)').pack(side='left')
         ttk.Button(eventbar,text='Скопировать все события',command=self.copy_events).pack(side='right')
@@ -171,6 +174,19 @@ class App:
         if not messagebox.askyesno('Повтор','Проверьте, что предыдущий запрос ChatGPT не выполняется. Повторить задание?'):return
         try:self.service.store.retry(int(rows[0]))
         except ValueError as exc:messagebox.showerror('Повтор',str(exc))
+    def import_chatgpt_answer(self):
+        selected=self.jobs.selection()
+        if not selected:
+            messagebox.showinfo('Ответ ChatGPT','Выберите задание со статусом «Ошибка».');return
+        try: text=self.window.clipboard_get()
+        except tk.TclError:
+            messagebox.showerror('Ответ ChatGPT','Буфер обмена пуст. Скопируйте полный ответ из нужного чата.');return
+        if not messagebox.askyesno('Ответ ChatGPT','Это полный ответ именно для выбранного задания? Он будет использован вместо нового запроса к ChatGPT.'):
+            return
+        try:
+            count=self.service.save_manual_reactions(int(selected[0]),text)
+            messagebox.showinfo('Ответ ChatGPT',f'Ответ сохранён; интервалов: {count}. Нажмите «Повторить выбранное задание с ошибкой», затем «Продолжить очередь».')
+        except (ValueError,OSError) as exc: messagebox.showerror('Ответ ChatGPT',str(exc))
     def _clipboard(self,text):
         self.window.clipboard_clear()
         self.window.clipboard_append(text)

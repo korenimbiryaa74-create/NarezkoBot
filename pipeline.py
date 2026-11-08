@@ -49,6 +49,13 @@ def load_json(path):
 def file_stamp(path):
     st=Path(path).stat(); return {'size':st.st_size,'mtime_ns':st.st_mtime_ns}
 
+def job_identity(job):
+    return {k:job.get(k) for k in ('id','vod_id','streamer','local_name','local_size','local_mtime_ns')}
+
+def manual_answer_path(root, job_id):
+    if isinstance(job_id,bool) or not isinstance(job_id,int) or job_id <= 0: raise ValueError('Некорректный номер задания')
+    return Path(root)/'state'/'manual_reactions'/f'{job_id}.json'
+
 def validate_intervals(rows,duration,min_seconds=0):
     if not isinstance(rows,list): raise PipelineError('Ответ модели не содержит список реакций')
     clean=[]
@@ -272,7 +279,12 @@ class Pipeline:
         segs,duration=self.speech(src,work/'transcripts',cfg.get('speech',{}),progress,duration=duration)
         check_local()
         progress('Поиск реакций','Анализируется полный транскрипт')
-        rows=validate_intervals(self.finder(str(src),segs,duration,login,cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
+        finder_cfg=cfg
+        if isinstance(job.get('id'),int) and not isinstance(job['id'],bool) and job['id']>0:
+            manual=load_json(manual_answer_path(self.root,job['id']))
+            if isinstance(manual,dict) and manual.get('job')==job_identity(job) and isinstance(manual.get('text'),str):
+                finder_cfg=dict(cfg,_manual_reactions=manual['text'])
+        rows=validate_intervals(self.finder(str(src),segs,duration,login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
         check_local()
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]

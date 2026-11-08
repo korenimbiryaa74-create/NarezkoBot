@@ -6,7 +6,8 @@ import time
 from collections import deque
 from job_store import JobStore
 from monitor import Monitor,TwitchClient
-from pipeline import Pipeline
+from pipeline import Pipeline, atomic_json, manual_answer_path, job_identity
+import reactions
 from bot_debug import redact
 
 class Service:
@@ -22,10 +23,14 @@ class Service:
         with self._lock: self._logs.append((time.time(),str(text)))
     def logs(self):
         with self._lock: return list(self._logs)
-    def start(self):
-        if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
+    def recover_interrupted(self):
+        if any(t.is_alive() for t in self._threads): return 0
         interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Готово'))
         if interrupted:self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
+        return interrupted
+    def start(self):
+        if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
+        self.recover_interrupted()
         self.stop_event.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
                        threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True)]
@@ -57,6 +62,28 @@ class Service:
             else: active+=1
         if added: self.log(f'Тестовых видео добавлено в очередь: {added}')
         return added,active
+
+    def save_manual_reactions(self, job_id, text):
+        job=next((j for j in self.store.list_jobs(1000) if j['id']==job_id),None)
+        if not job or job['state']!='failed':
+            raise ValueError('Выберите задание со статусом «Ошибка». Дождитесь завершения или перезапустите приложение.')
+        if not isinstance(text,str) or not text.strip() or len(text)>1_000_000:
+            raise ValueError('Буфер пуст или ответ слишком большой')
+        try:
+            parsed=reactions.parse_reaction_answer(text)
+            intervals=[]
+            for row in parsed['reactions']:
+                if not isinstance(row,dict): raise ValueError()
+                a,b=reactions.reaction_time(row.get('start')),reactions.reaction_time(row.get('end'))
+                if a is None or b is None or b<=a: raise ValueError()
+                intervals.append((a,b))
+            intervals.sort()
+            if any(b[0]<a[1] for a,b in zip(intervals,intervals[1:])): raise ValueError()
+        except (ValueError,TypeError,KeyError,reactions.ReactionsError):
+            raise ValueError('В буфере нет полного ответа reactions с корректными непересекающимися интервалами') from None
+        atomic_json(manual_answer_path(self.root,job_id),{'job':job_identity(job),'text':text})
+        self.log(f"VOD {job['vod_id']}: сохранён ответ ChatGPT для ручного продолжения")
+        return len(intervals)
 
     def monitor_once(self):
         cfg=self.settings.load()
@@ -94,7 +121,7 @@ class Service:
             def progress(stage,detail=''):
                 detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
-                if stage=='Транскрибация': self.log(f"VOD {job['vod_id']}: {detail}")
+                if stage in ('Транскрибация','Поиск реакций'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             self.store.finish(job['id'],'done',f"Видео: {len(outcome['outputs'])}; {outcome['folder']}")
             self.log(f"VOD {job['vod_id']}: готово")

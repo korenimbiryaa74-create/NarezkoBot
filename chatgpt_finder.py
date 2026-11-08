@@ -60,7 +60,11 @@ class ChatGPTFinder:
             web=self._browser(); web.timeout=int(timeout); web.offscreen=False
             if log: log('ChatGPT: отправка транскрипта и ожидание ответа')
             # Do not automatically repeat: delivery may be uncertain.
-            text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
+            web.status_callback = log
+            try:
+                text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
+            finally:
+                web.status_callback = None
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
             cache.parent.mkdir(parents=True,exist_ok=True)
             full_cycle.atomic_json(str(cache),{'key':key,'text':text})
@@ -69,8 +73,10 @@ class ChatGPTFinder:
     def __call__(self, video, segs, duration, streamer, cfg, progress):
         settings={'reactions':{'mode':'whole','min_minutes':float(cfg.get('min_reaction_minutes',10)),
                    'bridge_minutes':float(cfg.get('bridge_minutes',5)), 'chatgpt_timeout':self.timeout}}
+        manual=cfg.get('_manual_reactions')
+        if manual is not None: progress('Поиск реакций','Используется сохранённый ответ ChatGPT; повторного запроса не будет')
         result=reactions.find_reactions_whole(video,segs,duration,settings,
-            extra={'chatgpt_doc':self._ask_document},who=streamer,
+            extra={'chatgpt_doc':self._ask_document},who=streamer, manual_answer=manual,
             log=lambda message:progress('Поиск реакций',message))
         return result['reactions']
 
