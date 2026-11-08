@@ -154,8 +154,10 @@ class RenderIntegrationTests(unittest.TestCase):
             import json
             data=json.loads(meta.read_text(encoding='utf8'))
             self.assertGreater(len(data['render_timeline']),20)
-            text=meta.with_name(meta.name.replace('.pipeline.json','.txt')).read_text(encoding='utf-8-sig')
+            text=(meta.parent/'Готовые без тишины'/meta.name.replace('.pipeline.json','.txt')).read_text(encoding='utf-8-sig')
             self.assertIn('phrase0',text); self.assertIn('phrase26',text)
+            report=next((meta.parent/'Готовые без тишины').glob('* — удалённая тишина.txt')).read_text(encoding='utf-8-sig')
+            self.assertIn('Всего удалено:',report); self.assertIn('исходного тестового видео',report)
             self.assertTrue(any('Проверено частей' in m for _,m in service.logs()))
 
     def test_nonzero_vod_source_offset_without_silence(self):

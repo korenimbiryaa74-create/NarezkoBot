@@ -89,8 +89,10 @@ class LocalMediaIntegrationTests(unittest.TestCase):
             row=service.store.list_jobs()[0]
             self.assertEqual(row['state'],'done',row['detail'])
             files=list((root/'recordings').rglob('*.pipeline.json')); self.assertEqual(len(files),1)
-            out=files[0].with_name(files[0].name.replace('.pipeline.json','.mp4'))
+            out=files[0].parent/'Готовые нарезки'/files[0].name.replace('.pipeline.json','.mp4')
             self.assertAlmostEqual(media_duration(out),4,delta=.5)
+            report=next(out.parent.glob('* — удалённая тишина.txt')).read_text(encoding='utf-8-sig')
+            self.assertIn('выключено',report)
             self.assertIn('Тестовая фраза',out.with_suffix('.txt').read_text(encoding='utf-8-sig'))
             self.assertTrue(video.exists())
             self.assertEqual(sorted(x.name for x in folder.iterdir()), ['input.mp4'])

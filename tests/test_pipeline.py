@@ -29,7 +29,7 @@ class PipelineTests(unittest.TestCase):
         out=Path(result['outputs'][0]); self.assertTrue(out.exists())
         txt=out.with_suffix('.txt').read_text(encoding='utf-8-sig')
         self.assertIn('00:00:02',txt); self.assertIn('два',txt)
-        self.assertTrue(out.with_suffix('.pipeline.json').exists())
+        self.assertTrue((out.parent.parent/(out.stem+'.pipeline.json')).exists())
         self.assertEqual(self.stages[-1][0],'Готово')
     def test_output_flags_adjusted_segment(self):
         def speech(src,cache,cfg,progress,duration=None):
