@@ -141,7 +141,7 @@ class RenderIntegrationTests(unittest.TestCase):
             root=Path(d);folder=root/'test_input';folder.mkdir();src=folder/'demo.mp4'
             expr=r'aevalsrc=if(between(mod(t\,4)\,0.70\,1.50)\,0.7*sin(2*PI*1000*t)\,0):s=48000:d=110'
             subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=10','-f','lavfi','-i',expr,'-t','110','-c:v','libx264','-c:a','aac','-y',str(src)],check=True,timeout=60)
-            settings=Settings(root/'config.json');cfg=settings.load();cfg['pipeline']['min_reaction_minutes']=0
+            settings=Settings(root/'config.json');cfg=settings.load();cfg['pipeline']['min_reaction_minutes']=0;cfg['pipeline']['remove_donations']=False
             cfg['pipeline']['silence'].update(enabled=True,min_cut=1.0,max_gap=1.0);settings.save(cfg)
             def speech(src,cache,cfg,progress,duration):
                 return ([{'start':i*4+.8,'end':i*4+1.2,'text':f'phrase{i}'} for i in range(27)],duration)

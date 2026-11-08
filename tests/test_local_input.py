@@ -74,7 +74,7 @@ class LocalMediaIntegrationTests(unittest.TestCase):
             subprocess.run([shutil.which('ffmpeg'),'-v','error','-f','lavfi','-i','testsrc2=size=320x180:rate=10',
                             '-f','lavfi','-i','sine=frequency=440:sample_rate=16000','-t','8',
                             '-c:v','libx264','-c:a','aac','-y',str(video)],check=True,timeout=30)
-            settings=Settings(root/'config.json'); cfg=settings.load(); cfg['pipeline']['min_reaction_minutes']=0
+            settings=Settings(root/'config.json'); cfg=settings.load(); cfg['pipeline']['min_reaction_minutes']=0;cfg['pipeline']['remove_donations']=False
             cfg['pipeline']['silence']['enabled']=False; settings.save(cfg)
             def speech(src,cache,cfg,progress,duration):
                 progress('Транскрибация','Тестовый распознаватель')
@@ -103,7 +103,7 @@ class LocalMediaIntegrationTests(unittest.TestCase):
             expression=r'aevalsrc=if(between(t\,3\,7)\,0\,0.5*sin(2*PI*440*t)):s=16000:d=12'
             subprocess.run([shutil.which('ffmpeg'),'-v','error','-f','lavfi','-i','testsrc2=size=320x180:rate=10',
                 '-f','lavfi','-i',expression,'-t','12','-c:v','libx264','-c:a','aac','-y',str(video)],check=True,timeout=30)
-            settings=Settings(root/'config.json'); cfg=settings.load(); cfg['pipeline']['min_reaction_minutes']=0
+            settings=Settings(root/'config.json'); cfg=settings.load(); cfg['pipeline']['min_reaction_minutes']=0;cfg['pipeline']['remove_donations']=False
             cfg['pipeline']['silence'].update(enabled=True,min_cut=1.0,max_gap=1.0); settings.save(cfg)
             def speech(src,cache,cfg,progress,duration):
                 progress('Транскрибация','Тестовый распознаватель')
