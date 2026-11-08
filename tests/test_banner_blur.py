@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import banner_blur
+import manual_blur
 import pipeline
 import stream_cutter
 
@@ -109,19 +110,39 @@ class BannerTests(unittest.TestCase):
             subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=10','-f','lavfi','-i','sine=frequency=440:duration=6','-t','6','-c:v','libx264','-c:a','aac','-y',str(src)],check=True,timeout=30)
             settings=Settings(root/'config.json');cfg=settings.load()
             cfg['pipeline']['min_reaction_minutes']=0;cfg['pipeline']['silence']['enabled']=False
-            cfg['pipeline']['remove_donations']=False;cfg['pipeline']['banner_blur']['enabled']=True;settings.save(cfg)
+            cfg['pipeline']['remove_donations']=False;cfg['pipeline']['banner_blur'].update(enabled=True,test_streamer='name');settings.save(cfg)
+            manual_blur.save_profile(root,'name',[[0,0,400,400]])
             finder=lambda *a:[{'start':1.,'end':5.,'title':'Тест'}]
             def speech(src,cache,cfg,progress,duration):return ([{'start':1.,'end':2.,'text':'проверка'}],duration)
             svc=Service(root,settings,finder,pipeline_factory=lambda root,finder:pipeline.Pipeline(root,finder,speech=speech))
             svc.queue_test_inputs()
-            found=[{'start':1.,'end':3.,'box':[0,0,400,400]}]
-            with patch.object(banner_blur,'scan',return_value=found),patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
+            with patch.object(banner_blur,'scan',side_effect=AssertionError('automatic scan should not run')),patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
                 svc.worker_once()
             job=svc.store.list_jobs()[0];self.assertEqual(job['state'],'done',job['detail'])
             report=next((root/'recordings').rglob('* — баннеры.txt')).read_text(encoding='utf-8-sig')
-            self.assertIn('00:00:01.000 — 00:00:03.000',report)
-            self.assertIn('могут быть пропущены',report)
+            self.assertIn('00:00:01.000 — 00:00:05.000',report)
+            self.assertIn('Ручной профиль',report)
             self.assertEqual(len(list((root/'recordings').rglob('01 Тест.mp4'))),1)
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'needs ffmpeg')
+    def test_no_blur_profile_completes_and_writes_report(self):
+        from settings import Settings
+        from service import Service
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);folder=root/'test_input';folder.mkdir();src=folder/'test.mp4'
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=10','-f','lavfi','-i','sine=frequency=440:duration=4','-t','4','-c:v','libx264','-c:a','aac','-y',str(src)],check=True,timeout=30)
+            settings=Settings(root/'config.json');cfg=settings.load()
+            cfg['pipeline']['min_reaction_minutes']=0;cfg['pipeline']['silence']['enabled']=False
+            cfg['pipeline']['remove_donations']=False;cfg['pipeline']['banner_blur'].update(enabled=True,test_streamer='someone');settings.save(cfg)
+            manual_blur.save_profile(root,'someone',[])
+            def speech(src,cache,cfg,progress,duration):return ([{'start':1.,'end':2.,'text':'проверка'}],duration)
+            finder=lambda *a:[{'start':0.,'end':3.,'title':'Тест'}]
+            svc=Service(root,settings,finder,pipeline_factory=lambda root,finder:pipeline.Pipeline(root,finder,speech=speech))
+            svc.queue_test_inputs()
+            with patch.object(stream_cutter,'pick_encoder',return_value='libx264'):svc.worker_once()
+            job=svc.store.list_jobs()[0];self.assertEqual(job['state'],'done',job['detail'])
+            report=next((root/'recordings').rglob('* — баннеры.txt')).read_text(encoding='utf-8-sig')
+            self.assertIn('someone',report);self.assertIn('Без блюра',report)
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'needs ffmpeg')
     def test_blur_time_across_removed_interval_and_offset(self):
@@ -135,18 +156,18 @@ class BannerTests(unittest.TestCase):
             im.save(root/'checker.png')
             subprocess.run(['ffmpeg','-v','error','-loop','1','-framerate','10','-i',str(root/'checker.png'),'-f','lavfi','-i','sine=frequency=440:duration=8','-t','8','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-y',str(src)],check=True,timeout=30)
             row={'start':101.,'end':107.,'donation_cuts':[{'start':102.,'end':103.}]}
-            found=[{'start':3.,'end':5.,'box':[0,0,500,500]}]
-            with patch.object(banner_blur,'scan',return_value=found),patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
-                keeps,duration=pipeline.render_clip(src,out,row,100,{'enabled':False},banner_cfg={'enabled':True})
+            profile={'version':1,'mode':'regions','boxes':[[0,0,500,500]]}
+            with patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
+                keeps,duration=pipeline.render_clip(src,out,row,100,{'enabled':False},banner_cfg={'enabled':True,'profile':profile})
             self.assertEqual(keeps,[(1.,2.),(3.,7.)])
             def sd(t):
                 frame=subprocess.run(['ffmpeg','-v','error','-ss',str(t),'-i',str(out),'-frames:v','1','-f','image2pipe','-vcodec','png','pipe:1'],stdout=subprocess.PIPE,check=True,timeout=20).stdout
                 return ImageStat.Stat(Image.open(io.BytesIO(frame)).convert('RGB').crop((8,8,70,40))).stddev[0]
             before,inside,after=sd(.5),sd(1.5),sd(3.5)
-            self.assertLess(inside,before*.6,(before,inside,after));self.assertGreater(after,50)
+            self.assertLess(max(before,inside,after),25,(before,inside,after))
 
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'needs ffmpeg')
-    def test_real_render_blurs_only_during_detected_window(self):
+    def test_real_render_blurs_fixed_regions_for_full_clip(self):
         from PIL import Image, ImageStat
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'_work').mkdir(); src=root/'input.mp4';out=root/'out.mp4'
@@ -155,9 +176,10 @@ class BannerTests(unittest.TestCase):
                 for x in range(160):p[x,y]=((255,255,255) if (x//4+y//4)%2 else (0,0,0))
             image.save(root/'checker.png')
             subprocess.run(['ffmpeg','-v','error','-loop','1','-framerate','10','-i',str(root/'checker.png'),'-f','lavfi','-i','sine=frequency=440:duration=4','-t','4','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-y',str(src)],check=True,timeout=30)
-            found=[{'start':0.,'end':2.,'box':[0,0,500,500]}]
-            with patch.object(banner_blur,'scan',return_value=found),patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
-                keeps,duration=pipeline.render_clip(src,out,{'start':0.,'end':4.},0,{'enabled':False},banner_cfg={'enabled':True})
+            found=[{'start':0.,'end':4.,'box':[0,0,500,500]}]
+            profile={'version':1,'mode':'regions','boxes':[[0,0,500,500]]}
+            with patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
+                keeps,duration=pipeline.render_clip(src,out,{'start':0.,'end':4.},0,{'enabled':False},banner_cfg={'enabled':True,'profile':profile})
             self.assertEqual(keeps.banner_scan,found);self.assertAlmostEqual(duration,4,delta=.3)
             def frame(t):
                 b=subprocess.run(['ffmpeg','-v','error','-ss',str(t),'-i',str(out),'-frames:v','1','-f','image2pipe','-vcodec','png','pipe:1'],stdout=subprocess.PIPE,check=True,timeout=20).stdout
@@ -166,7 +188,7 @@ class BannerTests(unittest.TestCase):
             one=frame(1);three=frame(3)
             first=ImageStat.Stat(one.crop((8,8,70,40))).stddev[0]
             later=ImageStat.Stat(three.crop((8,8,70,40))).stddev[0]
-            self.assertLess(first,later*.6,(first,later))
+            self.assertLess(max(first,later),25,(first,later))
             self.assertGreater(ImageStat.Stat(one.crop((96,8,152,40))).stddev[0],50)
 
 if __name__=='__main__':unittest.main()

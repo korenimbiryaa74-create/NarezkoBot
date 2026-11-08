@@ -11,7 +11,7 @@ from service import Service
 from chatgpt_finder import ChatGPTFinder
 import banner_blur
 import stream_cutter
-from banner_picker import BannerPicker
+import manual_blur
 
 ROOT=Path(__file__).resolve().parent
 
@@ -119,16 +119,15 @@ class App:
         self._row(processing,8,'Максимальная высота видео','height')
         self._toggle(processing,9,'Сохранять исходные фрагменты','keep_original')
         self._toggle(processing,10,'Вырезать ответы на донаты (ChatGPT)','remove_donations')
-        self._toggle(processing,11,'Размывать рекламные баннеры (по сохранённым образцам)','banner_blur')
-        self._row(processing,12,'Проверять баннеры каждые, сек','banner_interval')
+        self._toggle(processing,11,'Размывать области по профилю стримера','banner_blur')
+        self._row(processing,12,'Ник стримера для тестового видео','banner_test_streamer')
         bbar=ttk.Frame(processing);bbar.grid(row=13,column=0,columnspan=2,sticky='w',padx=8,pady=(4,0))
-        ttk.Button(bbar,text='Добавить образец из видео…',command=self.banner_from_video).pack(side='left')
-        ttk.Button(bbar,text='Из скриншота…',command=self.banner_from_image).pack(side='left',padx=5)
-        ttk.Button(bbar,text='Папка образцов',command=self.open_banners).pack(side='left')
-        ttk.Button(bbar,text='Проверить на видео…',command=self.banner_check).pack(side='left',padx=5)
-        self.banner_info=tk.StringVar();self.update_banner_count()
-        ttk.Label(processing,textvariable=self.banner_info).grid(row=14,column=0,columnspan=2,sticky='w',padx=8)
-        ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.\nTwitchDownloaderCLI: desktop/tools/TwitchDownloaderCLI/TwitchDownloaderCLI.exe (автоматически).').grid(row=15,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        ttk.Button(bbar,text='Настроить блюр стримера…',command=self.configure_streamer_blur).pack(side='left')
+        ttk.Button(bbar,text='Без блюра для стримера…',command=self.streamer_without_blur).pack(side='left',padx=5)
+        ttk.Button(bbar,text='Настроить по локальному видео…',command=self.blur_from_local).pack(side='left')
+        self.banner_info=tk.StringVar(value='Области действуют на протяжении всей нарезки. Для каждого стримера настройте профиль или укажите «Без блюра».')
+        ttk.Label(processing,textvariable=self.banner_info,wraplength=900).grid(row=14,column=0,columnspan=2,sticky='w',padx=8)
+        ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.\nTwitchDownloaderCLI находится автоматически.').grid(row=15,column=0,columnspan=2,sticky='w',padx=8,pady=8)
         self._toggle(speech,0,'Использовать Groq; при ошибке — локальный Whisper','groq_enabled')
         self._row(speech,1,'Groq API key','groq_api_key',secret=True)
         ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)
@@ -143,7 +142,7 @@ class App:
           'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],'proxy_groq':c['proxy']['groq'],
           'groq_enabled':p['speech']['groq_enabled'],'groq_api_key':p['speech']['groq_api_key'],
           'quality':p['quality'],'threads':p['download_threads'],'min_reaction':p['min_reaction_minutes'],'bridge':p['bridge_minutes'],
-          'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original'],'remove_donations':p['remove_donations'],'banner_blur':p['banner_blur']['enabled'],'banner_interval':p['banner_blur']['interval']}
+          'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original'],'remove_donations':p['remove_donations'],'banner_blur':p['banner_blur']['enabled'],'banner_test_streamer':p['banner_blur'].get('test_streamer','')}
         for key,value in values.items(): v[key].set(value)
     def save(self):
         try:
@@ -153,12 +152,10 @@ class App:
             c['monitor']={'enabled':v['monitor_enabled'].get(),'interval':v['interval'].get()}
             c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get(),'groq':v['proxy_groq'].get()}
             p=c['pipeline'];p.update(quality=v['quality'].get().strip(),download_threads=v['threads'].get(),min_reaction_minutes=v['min_reaction'].get(),bridge_minutes=v['bridge'].get(),keep_original=v['keep_original'].get(),remove_donations=v['remove_donations'].get())
-            p['banner_blur'].update(enabled=v['banner_blur'].get(),interval=v['banner_interval'].get())
+            p['banner_blur'].update(enabled=v['banner_blur'].get(),test_streamer=v['banner_test_streamer'].get().strip())
             p['speech'].update(groq_enabled=v['groq_enabled'].get(),groq_api_key=v['groq_api_key'].get().strip())
             p['silence'].update(enabled=v['silence'].get(),min_cut=v['min_cut'].get(),max_gap=v['max_gap'].get(),onset_db=v['onset'].get(),max_height=v['height'].get())
             self.config=self.settings.save(c);self.service.settings_changed();self.status.set('Настройки сохранены')
-            if p['banner_blur']['enabled'] and not banner_blur.template_count():
-                messagebox.showwarning('Баннеры','Блюр баннеров включён, но образцов нет. Добавьте образец кнопкой «Добавить образец из видео…».')
             return True
         except Exception as exc:
             messagebox.showerror('Ошибка настроек',str(exc));return False
@@ -286,46 +283,54 @@ class App:
             self.status.set(f'Тест: добавлено {added}, уже в очереди {active}')
         except Exception as exc: messagebox.showerror('Тест',str(exc))
 
-    def update_banner_count(self):
-        n=banner_blur.template_count()
-        self.banner_info.set(f'Образцов баннеров: {n}. Один раз выделите каждый баннер на кадре стрима; поиск идёт по ключевым кадрам и уточняет границы.' if n else 'Образцов баннеров нет: добавьте их из кадра стрима (видео) — каждый баннер один раз.')
-    def _banner_video(self,title):
-        path=filedialog.askopenfilename(title=title,filetypes=[('Видео','*.mp4 *.mkv *.ts *.flv *.mov *.webm'),('Все файлы','*.*')])
-        if not path: return None
-        try:
-            ffmpeg,_probe=stream_cutter.require_tools();banner_blur._cv()
-            return path,ffmpeg
-        except Exception as exc: messagebox.showerror('Баннеры',str(exc));return None
-    def banner_from_video(self):
-        got=self._banner_video('Видео с баннером')
-        if not got: return
-        try: duration=banner_blur.video_info(got[0],got[1])[2]
-        except Exception as exc: messagebox.showerror('Баннеры',str(exc));return
-        BannerPicker(self.window,video=got[0],ffmpeg=got[1],duration=duration,on_saved=self.update_banner_count)
-    def banner_from_image(self):
-        path=filedialog.askopenfilename(title='Скриншот кадра целиком (без рамок окна)',filetypes=[('Изображения','*.png *.jpg *.jpeg *.bmp *.webp'),('Все файлы','*.*')])
-        if not path: return
-        try: image=banner_blur.read_image(path)
-        except Exception as exc: messagebox.showerror('Баннеры',str(exc));return
-        BannerPicker(self.window,image=image,on_saved=self.update_banner_count)
-    def open_banners(self):
-        folder=banner_blur.TEMPLATE_DIR;folder.mkdir(parents=True,exist_ok=True)
-        if hasattr(os,'startfile'):os.startfile(str(folder))
-    def banner_check(self):
-        if not banner_blur.template_count(): messagebox.showwarning('Баннеры','Сначала добавьте хотя бы один образец');return
-        got=self._banner_video('Видео для проверки поиска баннеров')
-        if not got: return
-        out=ROOT/'recordings'/('проверка баннеров — '+Path(got[0]).stem);state={}
+    def _blur_login(self):
+        from tkinter import simpledialog
+        name=simpledialog.askstring('Блюр стримера','Введите никнейм Twitch:',parent=self.window)
+        if name is None:return None
+        try:return manual_blur.normalize_login(name)
+        except ValueError:messagebox.showerror('Блюр','Введите корректный логин Twitch: латинские буквы, цифры или _.');return None
+    def _blur_saved(self):
+        self.banner_info.set('Профиль сохранён. Области действуют на протяжении всей нарезки; проверьте готовое видео.')
+    def streamer_without_blur(self):
+        name=self._blur_login()
+        if not name:return
+        if not messagebox.askyesno('Без блюра',f'Сохранить профиль {name} без блюра? Старые области этого профиля будут заменены.') :return
+        try:manual_blur.save_profile(ROOT,name,[]);self._blur_saved()
+        except Exception as exc:messagebox.showerror('Блюр',str(exc))
+    def configure_streamer_blur(self):
+        name=self._blur_login()
+        if not name or not self.save():return
+        tw=self.config['twitch'];proxy=self.config['proxy'];p=self.config['pipeline']
+        cli=ROOT/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe'
+        try:ffmpeg,_=stream_cutter.require_tools()
+        except Exception as exc:messagebox.showerror('Блюр',str(exc));return
+        state={};self.status.set(f'Получаю кадр последней записи {name}…')
         def work():
-            try: state['found']=banner_blur.check_video(got[0],got[1],out,interval=float(self.variables['banner_interval'].get() or 2))
-            except Exception as exc: state['error']=str(exc)
+            try:state['data']=manual_blur.latest_frame(name,tw['client_id'],tw['client_secret'],proxy['url'] if proxy['enabled'] and proxy['twitch_api'] else '',str(cli),ffmpeg,threads=p['download_threads'])
+            except Exception as exc:state['error']=str(exc)
         def poll():
-            if thread.is_alive(): self.window.after(500,poll);return
-            if 'error' in state: messagebox.showerror('Баннеры',state['error']);return
-            self.status.set(f"Проверка баннеров: найдено {len(state['found'])}")
-            if hasattr(os,'startfile'):os.startfile(str(out))
-        thread=threading.Thread(target=work,daemon=True);thread.start()
-        self.status.set('Проверка баннеров на видео…');self.window.after(500,poll)
+            if thread.is_alive():self.window.after(400,poll);return
+            if 'error' in state:
+                self.status.set('Не удалось получить кадр');messagebox.showerror('Блюр',state['error']);return
+            image,vod,t=state['data'];self.status.set(f'Кадр VOD {vod}: {t} с')
+            try:
+                from manual_blur_picker import ManualBlurPicker
+                ManualBlurPicker(self.window,ROOT,name,image,self._blur_saved)
+            except Exception as exc:messagebox.showerror('Блюр',str(exc))
+        thread=threading.Thread(target=work,daemon=True);thread.start();self.window.after(400,poll)
+    def blur_from_local(self):
+        from tkinter import simpledialog
+        from manual_blur_picker import ManualBlurPicker
+        name=self._blur_login()
+        if not name:return
+        path=filedialog.askopenfilename(title='Выберите локальное видео',filetypes=[('Видео','*.mp4 *.mkv *.ts *.flv *.mov *.webm *.avi'),('Все файлы','*.*')])
+        if not path:return
+        seconds=simpledialog.askfloat('Кадр','Время кадра в секундах:',initialvalue=0,minvalue=0,parent=self.window)
+        if seconds is None:return
+        try:
+            ffmpeg,_=stream_cutter.require_tools();image=banner_blur.full_frame_at(path,seconds,ffmpeg)
+            ManualBlurPicker(self.window,ROOT,name,image,self._blur_saved)
+        except Exception as exc:messagebox.showerror('Блюр',str(exc))
     def open_outputs(self):
         folder=ROOT/'recordings';folder.mkdir(exist_ok=True)
         if hasattr(os,'startfile'):os.startfile(str(folder))
