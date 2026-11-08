@@ -556,11 +556,10 @@ def chunk_cmd(ffmpeg: str, src: str, group, out_path: str, args, n_audio: int, h
         for a in range(n_audio):
             cmd += ['-map', f'[aout{a}]']
     if blur_vf and len(group) == 1:
-        if timed:
-            with open(script_path,'w',encoding='utf-8') as fh:fh.write(blur_vf)
-            cmd += ['-filter_script:v', script_path]
-        else:
-            cmd += ['-vf', blur_vf]
+        # -filter_script was removed in newer FFmpeg. Our manual streamer
+        # profiles have at most 16 fixed areas, so this graph stays short
+        # enough for a Windows command line and works on old and new FFmpeg.
+        cmd += ['-vf', blur_vf]
     cmd += ['-c:v', *encode_args(args), '-pix_fmt', 'yuv420p']
     if fps_flags:
         cmd += fps_flags

@@ -73,6 +73,23 @@ class BannerTests(unittest.TestCase):
         self.assertEqual(banner_blur.timed_regions(det, 5.0, 8.0, 640, 360), [])
         self.assertTrue(banner_blur.timed_regions(det, 2.0, 8.0, 640, 360))
 
+    def test_fixed_profile_command_does_not_use_removed_filter_script_option(self):
+        from types import SimpleNamespace
+        args=SimpleNamespace(timed_banners=[
+            {'start':0.,'end':5.,'box':[0,0,300,300]},
+            {'start':0.,'end':5.,'box':[600,100,950,400]}],
+            banner_output_size=(640,360), blur_vf=None,
+            vcodec='libx264', preset='ultrafast', crf=23,
+            acodec='aac',audio_bitrate='128k')
+        with tempfile.TemporaryDirectory() as d:
+            script=Path(d)/'русский путь'/'filter.txt'
+            cmd=stream_cutter.chunk_cmd('ffmpeg','input.mp4',[(0.,5.)],'out.mp4',args,1,None,1,[],str(script))
+        self.assertNotIn('-filter_script:v',cmd)
+        self.assertIn('-vf',cmd)
+        graph=cmd[cmd.index('-vf')+1]
+        self.assertEqual(graph.count('boxblur='),2)
+        self.assertFalse(script.exists())
+
     def test_permanent_model_setup_error_stops_queue_without_retry(self):
         from service import Service
         from settings import Settings
@@ -176,8 +193,8 @@ class BannerTests(unittest.TestCase):
                 for x in range(160):p[x,y]=((255,255,255) if (x//4+y//4)%2 else (0,0,0))
             image.save(root/'checker.png')
             subprocess.run(['ffmpeg','-v','error','-loop','1','-framerate','10','-i',str(root/'checker.png'),'-f','lavfi','-i','sine=frequency=440:duration=4','-t','4','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-y',str(src)],check=True,timeout=30)
-            found=[{'start':0.,'end':4.,'box':[0,0,500,500]}]
-            profile={'version':1,'mode':'regions','boxes':[[0,0,500,500]]}
+            found=[{'start':0.,'end':4.,'box':[0,0,500,500]}, {'start':0.,'end':4.,'box':[600,500,1000,1000]}]
+            profile={'version':1,'mode':'regions','boxes':[[0,0,500,500],[600,500,1000,1000]]}
             with patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
                 keeps,duration=pipeline.render_clip(src,out,{'start':0.,'end':4.},0,{'enabled':False},banner_cfg={'enabled':True,'profile':profile})
             self.assertEqual(keeps.banner_scan,found);self.assertAlmostEqual(duration,4,delta=.3)
@@ -189,6 +206,7 @@ class BannerTests(unittest.TestCase):
             first=ImageStat.Stat(one.crop((8,8,70,40))).stddev[0]
             later=ImageStat.Stat(three.crop((8,8,70,40))).stddev[0]
             self.assertLess(max(first,later),25,(first,later))
+            self.assertLess(ImageStat.Stat(one.crop((105,55,150,88))).stddev[0],25)
             self.assertGreater(ImageStat.Stat(one.crop((96,8,152,40))).stddev[0],50)
 
 if __name__=='__main__':unittest.main()
