@@ -112,7 +112,7 @@ class App:
         self._row(processing,7,'Порог над шумом, дБ','onset')
         self._row(processing,8,'Максимальная высота видео','height')
         self._toggle(processing,9,'Сохранять исходные фрагменты','keep_original')
-        ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.').grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск реакций: ChatGPT.\nПапка результатов создаётся в проекте автоматически.\nTwitchDownloaderCLI: desktop/tools/TwitchDownloaderCLI/TwitchDownloaderCLI.exe (автоматически).').grid(row=10,column=0,columnspan=2,sticky='w',padx=8,pady=8)
         self._toggle(speech,0,'Использовать Groq; при ошибке — локальный Whisper','groq_enabled')
         self._row(speech,1,'Groq API key','groq_api_key',secret=True)
         ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)

@@ -121,7 +121,7 @@ class Service:
             def progress(stage,detail=''):
                 detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
-                if stage in ('Транскрибация','Поиск реакций'): self.log(f"VOD {job['vod_id']}: {detail}")
+                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             self.store.finish(job['id'],'done',f"Видео: {len(outcome['outputs'])}; {outcome['folder']}")
             self.log(f"VOD {job['vod_id']}: готово")

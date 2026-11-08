@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import full_cycle
@@ -47,6 +49,22 @@ def load_json(path):
     try:
         with open(path,encoding='utf8') as f: return json.load(f)
     except (OSError,ValueError): return None
+
+@contextmanager
+def report_wait(callback, description, interval=20):
+    """Report elapsed waiting time, not a fabricated percentage."""
+    if callback is None:
+        yield
+        return
+    stop=threading.Event(); started=time.monotonic()
+    def report():
+        while not stop.wait(interval):
+            try: callback(f'{description} · ожидание {timestamp(time.monotonic()-started)}')
+            except Exception: return
+    thread=threading.Thread(target=report,daemon=True);thread.start()
+    try: yield
+    finally:
+        stop.set();thread.join()
 
 def file_stamp(path):
     st=Path(path).stat(); return {'size':st.st_size,'mtime_ns':st.st_mtime_ns}
@@ -128,7 +146,7 @@ def media_duration(path):
     return duration
 
 def default_download(vod_id, quality, output, begin=None, end=None, cli=None, threads=4):
-    if not cli or not Path(cli).is_file(): raise PipelineError('Не найден TwitchDownloaderCLI')
+    if not cli or not Path(cli).is_file(): raise PipelineError('Не найден TwitchDownloaderCLI в desktop/tools/TwitchDownloaderCLI. Запустите INSTALL.bat или проверьте установку.')
     output=Path(output)
     if output.exists(): raise PipelineError('Временный файл уже существует; не перезаписываю')
     command=[str(cli),'videodownload','--id',str(vod_id),'-q',quality,'-t',str(threads),'--collision','Rename','-o',str(output)]
@@ -136,7 +154,7 @@ def default_download(vod_id, quality, output, begin=None, end=None, cli=None, th
     # Download does not implicitly inherit proxies; service-specific proxy support must be explicit.
     env={k:v for k,v in os.environ.items() if not k.lower().endswith('_proxy')}
     env['NO_PROXY']='*'; env['no_proxy']='*'
-    result=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace')
+    result=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     if result.returncode or not output.is_file(): raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')')
 
 def _valid_speech_segments(segments, start, end):
@@ -240,7 +258,7 @@ def speech_chunks(video, cache_dir, cfg, progress, *, transcriber=None, duration
     if not result: raise PipelineError('В записи не обнаружена речь')
     return result,duration
 
-def render_clip(src, output, row, source_offset, silence_cfg):
+def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=None):
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
     args.out=str(output)
@@ -253,13 +271,27 @@ def render_clip(src, output, row, source_offset, silence_cfg):
     args.maxrate=silence_cfg.get('maxrate','12M') or None
     stream_cutter.apply_speed(args,silence_cfg.get('speed','turbo'))
     args.vcodec=stream_cutter.pick_encoder(ffmpeg,args.vcodec)
-    res=stream_cutter.analyse(str(src),args,ffmpeg,ffprobe)
     start=float(row['start'])-source_offset; end=float(row['end'])-source_offset
-    if float(res['total'])+.3<end: raise PipelineError('Скачанный фрагмент короче найденного интервала')
-    keeps=full_cycle.trim_keeps(res['keep'] if silence_cfg.get('enabled',True) else [(0.,float(res['total']))],start,end)
+    if progress_callback: progress_callback('Проверка видео и подготовка нарезки')
+    info=stream_cutter.probe(str(src),ffprobe)
+    total=float(stream_cutter.duration_of(info))
+    if not math.isfinite(total) or total <= 0: raise PipelineError('Некорректная длительность видео')
+    if start < 0 or end <= start or total+.3<end: raise PipelineError('Скачанный фрагмент короче найденного интервала')
+    end=min(end,total)
+    if silence_cfg.get('enabled',True):
+        if progress_callback: progress_callback(f'Анализ тишины в выбранном фрагменте {timestamp(start)}–{timestamp(end)}')
+        with report_wait(progress_callback,'Анализ тишины ещё выполняется'):
+            res=stream_cutter.analyse(str(src),args,ffmpeg,ffprobe,start=start,end=end)
+        keeps=full_cycle.trim_keeps(res['keep'],start,end)
+    else:
+        if progress_callback: progress_callback('Удаление тишины выключено; анализ аудио пропущен')
+        res={'src':str(src),'info':info,'streams':stream_cutter.audio_streams(info),'total':total}
+        if not res['streams']: raise PipelineError('В видео нет аудиодорожек')
+        keeps=[(start,end)]
     if sum(b-a for a,b in keeps)<.5: raise PipelineError('После удаления тишины не осталось видео')
     res['keep']=keeps
-    stream_cutter.render_file(res,args,ffmpeg,ffprobe)
+    if progress_callback: progress_callback('Запуск рендера')
+    stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
     return keeps,duration
 
@@ -317,7 +349,8 @@ class Pipeline:
             else:
                 temp=work/'full-160p.downloading.mp4'
                 if temp.exists(): temp.unlink() # only our own explicitly named temporary file
-                self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
+                with report_wait(lambda text:progress('Скачивание',text),'Загрузка VOD через TwitchDownloader ещё выполняется'):
+                    self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
                 duration=check_duration(temp) # do not promote a partial VOD into the cache
                 os.replace(temp,src)
         cache=test_transcript_cache(self.root,src,job,progress,check_local) if local_name else work/'transcripts'
@@ -351,11 +384,17 @@ class Pipeline:
             else:
                 if temp.exists():temp.unlink()
                 if raw.exists():raw.unlink()
-                self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
+                progress('Скачивание',f'Нарезка {i}/{len(rows)}: загрузка фрагмента {timestamp(begin)}–{timestamp(end)} через TwitchDownloader')
+                with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader ещё выполняется'):
+                    self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
                 media_duration(temp); os.replace(temp,raw)
                 render_source=raw; offset=begin
             progress('Рендер',f'Нарезка {i}/{len(rows)}')
-            keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
+            if self.renderer is render_clip:
+                def render_progress(detail): progress('Рендер',f'Нарезка {i}/{len(rows)} · {detail}')
+                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress)
+            else:
+                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
             check_local()
             mapped,planned=full_cycle.remap_segments(segs,offset,keeps)
             if abs(actual-planned)>.5:
