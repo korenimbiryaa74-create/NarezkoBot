@@ -50,8 +50,8 @@ def parse_boxes(text):
         result.append([max(0,x1-px),max(0,y1-py),min(1000,x2+px),min(1000,y2+py)])
     return result
 
-def request_boxes(image):
-    req={'model':MODEL,'stream':False,'think':False,'format':SCHEMA,'options':{'temperature':0,'num_ctx':4096},
+def request_boxes(image, progress=None, *, _retry=False):
+    req={'model':MODEL,'stream':False,'think':False,'format':SCHEMA,'options':{'temperature':0,'num_ctx':8192 if _retry else 4096,'num_predict':1024 if _retry else 512},
          'messages':[{'role':'user','content':PROMPT,'images':[base64.b64encode(image).decode('ascii')]}]}
     payload=json.dumps(req).encode('utf-8')
     request=urllib.request.Request('http://127.0.0.1:11434/api/chat',data=payload,headers={'Content-Type':'application/json'},method='POST')
@@ -92,7 +92,17 @@ def request_boxes(image):
         return parse_boxes(text)
     except BannerResponseError as exc:
         if data.get('done_reason')=='length':
-            raise BannerResponseError('Ответ модели о баннерах обрезан из-за лимита генерации; рендер остановлен') from None
+            if not _retry:
+                if progress:progress('Ответ модели обрезан; повторяю этот кадр с увеличенным контекстом и лимитом ответа')
+                return request_boxes(image,progress,_retry=True)
+            # Numeric counts help distinguish context pressure from runaway output,
+            # without logging model text or anything from the frame.
+            counts=[]
+            for field,label in (('prompt_eval_count','вход'),('eval_count','ответ')):
+                v=data.get(field)
+                if type(v) is int and 0<=v<=10000000:counts.append(f'{label}: {v} токенов')
+            details=f" ({', '.join(counts)})" if counts else ''
+            raise BannerResponseError('Ответ модели о баннерах снова обрезан после повтора с увеличенным контекстом и лимитом ответа'+details+'; рендер остановлен') from None
         raise exc from None
 
 def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
@@ -108,7 +118,7 @@ def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
             try:r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=True,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             except (subprocess.SubprocessError,OSError) as exc: raise BannerError('Не удалось извлечь кадр для поиска баннеров') from exc
             if not r.stdout:raise BannerError('Не удалось извлечь кадр для поиска баннеров')
-            boxes=request_boxes(r.stdout)
+            boxes=request_boxes(r.stdout,progress)
             for box in boxes:results.append({'start':t,'end':stop,'box':box})
             t=stop
     return results
