@@ -71,6 +71,8 @@ class App:
         ttk.Button(jobbar,text='Повторить выбранное задание с ошибкой',command=self.retry).pack(side='left')
         ttk.Button(jobbar,text='Скопировать ошибку выбранного задания',command=self.copy_job_detail).pack(side='left',padx=5)
         recoverybar=ttk.Frame(dashboard);recoverybar.pack(fill='x',pady=(4,0))
+        ttk.Button(recoverybar,text='Очистить историю',command=self.clear_history).pack(side='left',padx=(0,5))
+        ttk.Button(recoverybar,text='Очистить очередь',command=self.clear_queue).pack(side='left',padx=(0,5))
         ttk.Button(recoverybar,text='Вставить ответ ChatGPT',command=self.import_chatgpt_answer).pack(side='left')
         eventbar=ttk.Frame(dashboard); eventbar.pack(fill='x',pady=(8,0))
         ttk.Label(eventbar,text='Последние события (выделение приостанавливает обновление текста)').pack(side='left')
@@ -174,6 +176,24 @@ class App:
         if not messagebox.askyesno('Повтор','Проверьте, что предыдущий запрос ChatGPT не выполняется. Повторить задание?'):return
         try:self.service.store.retry(int(rows[0]))
         except ValueError as exc:messagebox.showerror('Повтор',str(exc))
+    def clear_history(self):
+        if not messagebox.askyesno('Очистить историю','Скрыть завершённые задания и задания с ошибкой? Ожидающие и текущие задания, кэш, результаты и мониторинг сохранятся.'):
+            return
+        try:
+            count=self.service.store.clear_history()
+            self.service.log(f'История очищена: скрыто заданий {count}')
+            self.status.set(f'История очищена: {count}')
+        except Exception as exc: messagebox.showerror('История','Не удалось очистить историю: '+type(exc).__name__)
+
+    def clear_queue(self):
+        if not messagebox.askyesno('Очистить очередь','Отменить ожидающие задания и задания, ожидающие повтора? Текущее задание продолжится. Мониторинг может добавить новые задания. Кэш и результаты сохранятся.'):
+            return
+        try:
+            count=self.service.store.clear_queue()
+            self.service.log(f'Очередь очищена: отменено заданий {count}')
+            self.status.set(f'Очередь очищена: {count}')
+        except Exception as exc: messagebox.showerror('Очередь','Не удалось очистить очередь: '+type(exc).__name__)
+
     def import_chatgpt_answer(self):
         selected=self.jobs.selection()
         if not selected:
