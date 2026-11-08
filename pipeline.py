@@ -19,6 +19,7 @@ from pathlib import Path
 
 import full_cycle
 import banner_blur
+import manual_blur
 import stream_cutter
 import transcribe
 import whisper_cpp
@@ -336,12 +337,10 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     res['keep']=keeps
     detected=None
     if (banner_cfg or {}).get('enabled',False):
-        sample_interval=int((banner_cfg or {}).get('interval',5))
-        if progress_callback: progress_callback(f'Поиск баннеров по образцам: ключевые кадры, шаг ~{sample_interval} с')
-        with report_wait(progress_callback,'Поиск баннеров ещё выполняется'):
-            detected=banner_blur.scan(src,[(start,end)],ffmpeg,progress_callback,interval=sample_interval)
+        profile=manual_blur.validate_profile((banner_cfg or {}).get('profile'))
+        detected=[{'start':start,'end':end,'box':box} for box in profile['boxes']]
         args.timed_banners=detected
-        if progress_callback: progress_callback(f'Поиск баннеров завершён: найдено появлений {len(detected)}')
+        if progress_callback:progress_callback(f"Блюр по профилю {banner_cfg.get('login','')}: областей {len(detected)}; действует на всём видео")
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
@@ -445,11 +444,17 @@ def organize_clips(folder,job,rows,mode):
         scan=meta.get('banner_scan')
         if isinstance(scan,list):
             breport=ready/(stem+' — баннеры.txt')
-            blines=[f"Поиск баннеров по сохранённым образцам (папка banners): ключевые кадры, шаг ~{meta.get('banner_scan_interval',2)} с, границы уточнены.",
-                    'Время — от начала исходного видео. Находятся только баннеры, для которых добавлен образец; новые, короткие и движущиеся баннеры могут быть пропущены или закрыты не полностью.',
-                    'Указанные интервалы могут частично совпадать с удалённой тишиной или донатами.',
-                    'Проверьте готовое видео. Если баннер пропущен — добавьте ещё один образец в настройках.', '']
-            if not scan:blines.append('Баннеры не обнаружены. Это не гарантия их отсутствия.')
+            if meta.get('banner_mode')=='manual':
+                blines=[f"Ручной профиль блюра: {meta.get('banner_login','')}",
+                        'Области размываются на протяжении всей нарезки, даже когда баннера нет.',
+                        'Времена от начала исходного видео; координаты на сетке 0–1000.',
+                        'Проверьте итог: положение баннера может измениться.', '']
+                if not scan:blines.append('Для стримера выбрано «Без блюра».')
+            else:
+                blines=[f"Поиск баннеров по сохранённым образцам (папка banners): ключевые кадры, шаг ~{meta.get('banner_scan_interval',2)} с, границы уточнены.",
+                        'Время — от начала исходного видео. Новые, короткие и движущиеся баннеры могут быть пропущены или закрыты не полностью.',
+                        'Проверьте готовое видео.', '']
+                if not scan:blines.append('Баннеры не обнаружены. Это не гарантия их отсутствия.')
             for n,d in enumerate(scan,1):
                 blines.append(f"{n:03}. {precise_timestamp(d['start'])} — {precise_timestamp(d['end'])}; "+(f"образец «{d['name']}»; " if d.get('name') else '')+f"область на сетке 0–1000: {d['box']}")
             btext='\n'.join(blines)+'\n'
@@ -515,6 +520,13 @@ class Pipeline:
 
     def run(self, job, cfg, progress=lambda stage,detail='':None):
         vod_id=str(job['vod_id']); login=str(job['streamer']); local_name=job.get('local_name')
+        banner_cfg=dict(cfg.get('banner_blur',{}))
+        if banner_cfg.get('enabled',False):
+            blur_login=banner_cfg.get('test_streamer','') if local_name else login
+            if not blur_login:
+                raise banner_blur.BannerSetupError('Для тестового видео укажите ник стримера в настройках блюра')
+            banner_cfg['login']=manual_blur.normalize_login(blur_login)
+            banner_cfg['profile']=manual_blur.load_profile(self.root,blur_login)
         folder=job_output_folder(self.root,job)
         folder.mkdir(parents=True,exist_ok=True)
         work=folder/'_work'; work.mkdir(exist_ok=True)
@@ -588,7 +600,7 @@ class Pipeline:
             stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
             old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
             hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
-            if cfg.get('banner_blur',{}).get('enabled',False):hash_data['banner_blur']=cfg['banner_blur']
+            if banner_cfg.get('enabled',False):hash_data['banner_blur']=banner_cfg
             config_hash=hashlib.sha256(json.dumps(hash_data,sort_keys=True).encode()).hexdigest()
             previous=load_json(meta)
             if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
@@ -611,7 +623,7 @@ class Pipeline:
             progress('Рендер',f'Нарезка {i}/{len(rows)}')
             if self.renderer is render_clip:
                 def render_progress(detail): progress('Рендер',f'Нарезка {i}/{len(rows)} · {detail}')
-                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress,banner_cfg=cfg.get('banner_blur',{}))
+                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress,banner_cfg=banner_cfg)
             else:
                 keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
             check_local()
@@ -627,7 +639,7 @@ class Pipeline:
             banner_scan=getattr(keeps,'banner_scan',None)
             if banner_scan is not None:
                 banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
-            atomic_json(meta,{'banner_scan':banner_scan,'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
+            atomic_json(meta,{'banner_scan':banner_scan,'banner_mode':('manual' if banner_scan is not None else None),'banner_login':banner_cfg.get('login',''),'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
             if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')

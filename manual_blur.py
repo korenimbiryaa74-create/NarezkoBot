@@ -1,0 +1,92 @@
+"""Per-streamer fixed blur rectangles and a local frame from latest Twitch VOD."""
+from __future__ import annotations
+import json
+import math
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from monitor import normalize_login, parse_twitch_duration, TwitchClient
+from banner_blur import BannerSetupError, full_frame_at
+
+
+def profile_path(root, login):
+    return Path(root) / 'state' / 'blur_profiles' / (normalize_login(login) + '.json')
+
+
+def validate_profile(value):
+    if not isinstance(value, dict) or value.get('version') != 1 or value.get('mode') not in ('regions','none'):
+        raise BannerSetupError('Повреждён профиль блюра; настройте области заново')
+    boxes=value.get('boxes')
+    if not isinstance(boxes,list) or len(boxes)>16 or (value['mode']=='none' and boxes) or (value['mode']=='regions' and not boxes):
+        raise BannerSetupError('Некорректный список областей блюра')
+    for box in boxes:
+        if (not isinstance(box,list) or len(box)!=4 or any(type(x) is not int or not 0<=x<=1000 for x in box)
+            or box[2]<=box[0] or box[3]<=box[1] or box[2]-box[0]<4 or box[3]-box[1]<4):
+            raise BannerSetupError('Некорректные координаты области блюра')
+    return {'version':1,'mode':value['mode'],'boxes':[list(b) for b in boxes]}
+
+
+def display_box(x0,y0,x1,y1,width,height):
+    if width<=0 or height<=0:raise ValueError('Некорректный размер кадра')
+    x0=max(0,min(width,x0));x1=max(0,min(width,x1))
+    y0=max(0,min(height,y0));y1=max(0,min(height,y1))
+    x0,x1=sorted((x0,x1));y0,y1=sorted((y0,y1))
+    return [math.floor(x0*1000/width),math.floor(y0*1000/height),
+            math.ceil(x1*1000/width),math.ceil(y1*1000/height)]
+
+
+def load_profile(root,login):
+    path=profile_path(root,login)
+    if not path.exists():
+        raise BannerSetupError(f'Для {normalize_login(login)} не настроен блюр. Откройте «Настроить блюр стримера» или выберите «Без блюра».')
+    try:
+        with path.open(encoding='utf-8-sig') as f: value=json.load(f)
+        return validate_profile(value)
+    except (OSError,ValueError,TypeError):
+        raise BannerSetupError('Не удалось прочитать профиль блюра; исходный файл не изменён') from None
+
+
+def save_profile(root,login,boxes):
+    boxes=[list(b) for b in boxes]
+    value=validate_profile({'version':1,'mode':'regions' if boxes else 'none','boxes':boxes})
+    path=profile_path(root,login);path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix='.blur-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf8') as f:
+            json.dump(value,f,ensure_ascii=False,indent=2);f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    return value
+
+
+def latest_frame(login,client_id,secret,proxy,cli,ffmpeg,quality='160p30',threads=4):
+    """Fetch a short VOD excerpt to preserve the actual frame aspect ratio."""
+    login=normalize_login(login)
+    api=TwitchClient(client_id,secret,proxy)
+    try:
+        users=api.get('users',{'login':login})
+        if not users or not users[0].get('id'):raise BannerSetupError(f'Стример {login} не найден на Twitch')
+        videos=api.videos(str(users[0]['id']))
+        archives=[v for v in videos if isinstance(v,dict) and v.get('id') and v.get('duration')]
+        if not archives:raise BannerSetupError(f'У {login} нет доступной сохранённой записи Twitch (VOD)')
+        v=archives[0];vod=str(v['id']);duration=parse_twitch_duration(v['duration'])
+        if not vod.isdecimal():raise BannerSetupError('Twitch вернул некорректный ID записи')
+        if not Path(cli).is_file():raise BannerSetupError('Не найден TwitchDownloaderCLI. Запустите INSTALL.bat')
+        start=max(0,int(duration/2)-2);end=min(duration,start+8)
+        def stamp(t):return f'{t//3600:02}:{t%3600//60:02}:{t%60:02}'
+        with tempfile.TemporaryDirectory(prefix='narezko-frame-') as d:
+            output=Path(d)/'sample.mp4'
+            command=[str(cli),'videodownload','--id',vod,'-q',str(quality),'-t',str(int(threads)),
+                     '--collision','Rename','-o',str(output),'-b',stamp(start),'-e',stamp(end)]
+            env={k:v for k,v in os.environ.items() if not k.lower().endswith('_proxy')};env['NO_PROXY']='*';env['no_proxy']='*'
+            try:r=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=180,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            except (OSError,subprocess.SubprocessError):raise BannerSetupError('Не удалось скачать короткий фрагмент VOD для кадра') from None
+            if r.returncode or not output.is_file():raise BannerSetupError('Не удалось скачать короткий фрагмент VOD. Проверьте доступность записи и загрузчик')
+            image=full_frame_at(output,0,ffmpeg)
+            return image,vod,start
+    except BannerSetupError:raise
+    except Exception as exc:raise BannerSetupError('Не удалось получить последний VOD Twitch ('+type(exc).__name__+'). Проверьте доступ, Twitch ID и секрет.') from None
+    finally:
+        api.session.close()

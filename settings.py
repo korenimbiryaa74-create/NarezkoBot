@@ -14,7 +14,7 @@ DEFAULTS={
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
-             'keep_original':False,'remove_donations':True,'banner_blur':{'enabled':False,'interval':2}}}
+             'keep_original':False,'remove_donations':True,'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
 
 def merge(base, override):
     result=copy.deepcopy(base)
@@ -39,6 +39,9 @@ def validate(config):
     if not isinstance(q['banner_blur'],dict) or not isinstance(q['banner_blur'].get('enabled'),bool): raise ValueError('Некорректная настройка блюра баннеров')
     q['banner_blur']['interval']=int(q['banner_blur']['interval'])
     if not 1<=q['banner_blur']['interval']<=60: raise ValueError('Интервал поиска баннеров: от 1 до 60 секунд')
+    test_login=q['banner_blur'].get('test_streamer','')
+    if not isinstance(test_login,str): raise ValueError('Некорректный ник для теста блюра')
+    q['banner_blur']['test_streamer']=normalize_login(test_login) if test_login.strip() else ''
     silence=q['silence']
     for key in ('min_cut','max_gap','onset_db'):
         silence[key]=float(silence[key])
