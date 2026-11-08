@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import full_cycle
+import banner_blur
 import stream_cutter
 import transcribe
 import whisper_cpp
@@ -297,7 +298,7 @@ def subtract_intervals(keeps, cuts):
         if cursor<b: result.append((cursor,b))
     return result
 
-def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=None):
+def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=None, banner_cfg=None):
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
     args.out=str(output)
@@ -333,10 +334,20 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
         keeps=subtract_intervals(keeps,donation_cuts)
     if sum(b-a for a,b in keeps)<.5: raise PipelineError('После удаления тишины и донатов не осталось видео')
     res['keep']=keeps
+    detected=None
+    if (banner_cfg or {}).get('enabled',False):
+        sample_interval=int((banner_cfg or {}).get('interval',5))
+        if progress_callback: progress_callback(f'Поиск баннеров локальной моделью: кадр каждые {sample_interval} с; результат нужно проверить')
+        with report_wait(progress_callback,'Поиск баннеров ещё выполняется'):
+            detected=banner_blur.scan(src,[(start,end)],ffmpeg,progress_callback,interval=sample_interval)
+        args.timed_banners=detected
+        if progress_callback: progress_callback(f'Поиск баннеров завершён: областей на кадрах {len(detected)}; отсутствие находок не гарантирует отсутствия рекламы')
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
-    return RenderedKeeps(keeps,res.get('render_timeline')),duration
+    result=RenderedKeeps(keeps,res.get('render_timeline'))
+    result.banner_scan=detected
+    return result,duration
 
 READY_SILENCE = 'Готовые без тишины'
 READY_GENERIC = 'Готовые нарезки'
@@ -431,6 +442,19 @@ def organize_clips(folder,job,rows,mode):
             if dreport.exists() and dreport.read_text(encoding='utf-8-sig')!=dtext:
                 raise PipelineError(f'Отчёт {dreport.name} уже существует и отличается; не перезаписываю')
             reports.append((dreport,dtext))
+        scan=meta.get('banner_scan')
+        if isinstance(scan,list):
+            breport=ready/(stem+' — баннеры.txt')
+            blines=[f"Экспериментальный поиск баннеров: анализ кадра каждые {meta.get('banner_scan_interval',5)} секунд.",
+                    'Время — от начала исходного видео. Границы приблизительные; короткие и движущиеся баннеры могут быть пропущены или закрыты не полностью.',
+                    'Указанные интервалы могут частично совпадать с удалённой тишиной или донатами.',
+                    'Модель может ошибочно размыть другие элементы. Проверьте готовое видео.', '']
+            if not scan:blines.append('Баннеры не обнаружены. Это не гарантия их отсутствия.')
+            for n,d in enumerate(scan,1):
+                blines.append(f"{n:03}. {precise_timestamp(d['start'])} — {precise_timestamp(d['end'])}; область на сетке 0–1000: {d['box']}")
+            btext='\n'.join(blines)+'\n'
+            if breport.exists() and breport.read_text(encoding='utf-8-sig')!=btext: raise PipelineError(f'Отчёт {breport.name} уже существует и отличается; не перезаписываю')
+            reports.append((breport,btext))
         plans.append((srcs,reports))
     ready.mkdir(parents=True,exist_ok=True)
     for srcs,reports in plans:
@@ -563,7 +587,9 @@ class Pipeline:
             progress('Нарезка',f'{i}/{len(rows)} · {timestamp(row["start"])}–{timestamp(row["end"])}')
             stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
             old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
-            config_hash=hashlib.sha256(json.dumps({'row':row,'quality':quality,'silence':cfg.get('silence',{})},sort_keys=True).encode()).hexdigest()
+            hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
+            if cfg.get('banner_blur',{}).get('enabled',False):hash_data['banner_blur']=cfg['banner_blur']
+            config_hash=hashlib.sha256(json.dumps(hash_data,sort_keys=True).encode()).hexdigest()
             previous=load_json(meta)
             if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
                 media_duration(old_output); outputs.append(str(old_output)); continue
@@ -585,7 +611,7 @@ class Pipeline:
             progress('Рендер',f'Нарезка {i}/{len(rows)}')
             if self.renderer is render_clip:
                 def render_progress(detail): progress('Рендер',f'Нарезка {i}/{len(rows)} · {detail}')
-                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress)
+                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress,banner_cfg=cfg.get('banner_blur',{}))
             else:
                 keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
             check_local()
@@ -598,7 +624,10 @@ class Pipeline:
             os.replace(rendered,output)
             warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
             txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
-            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
+            banner_scan=getattr(keeps,'banner_scan',None)
+            if banner_scan is not None:
+                banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
+            atomic_json(meta,{'banner_scan':banner_scan,'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
             if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
