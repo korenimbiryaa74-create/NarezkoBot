@@ -27,6 +27,10 @@ from job_store import JobStore
 class PipelineError(RuntimeError): pass
 class IncompleteVod(PipelineError): pass
 
+class RenderedKeeps(list):
+    def __init__(self, keeps, timeline):
+        super().__init__(keeps); self.rendered_timeline=timeline
+
 def safe_name(value):
     value=re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(value)).strip(' .')
     if not value or value.upper() in {'CON','PRN','AUX','NUL','COM1','LPT1'}: value='stream'
@@ -266,7 +270,7 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     args.timeline=str(Path(output).parent/'_work'/(Path(output).stem+'.timeline.json'))
     args.min_cut=float(silence_cfg.get('min_cut',1.5)); args.max_gap=float(silence_cfg.get('max_gap',2.0))
     args.onset_db=float(silence_cfg.get('onset_db',12.0))
-    args.blur_regions=[]; args.precise=True; args.fast=False
+    args.blur_regions=[]; args.precise=True; args.fast=False; args.map_timeline=True
     args.scale_height=int(silence_cfg.get('max_height',1080) or 0)
     args.maxrate=silence_cfg.get('maxrate','12M') or None
     stream_cutter.apply_speed(args,silence_cfg.get('speed','turbo'))
@@ -293,7 +297,7 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
-    return keeps,duration
+    return RenderedKeeps(keeps,res.get('render_timeline')),duration
 
 class Pipeline:
     def __init__(self, root, finder, download=default_download, renderer=render_clip, speech=speech_chunks):
@@ -396,15 +400,16 @@ class Pipeline:
             else:
                 keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
             check_local()
-            mapped,planned=full_cycle.remap_segments(segs,offset,keeps)
+            progress('Проверка нарезки',f'Нарезка {i}/{len(rows)} · проверка таймкодов')
+            mapped,planned=full_cycle.remap_segments(segs,offset,keeps,rendered_timeline=getattr(keeps,'rendered_timeline',None))
             if abs(actual-planned)>.5:
-                raise PipelineError('Длительность видео не совпала с монтажной картой; таймкоды не сохранены')
+                raise PipelineError(f'Длительность видео {actual:.2f} с не совпала с монтажной картой {planned:.2f} с; таймкоды не сохранены')
             mapped=full_cycle.clip_segments(mapped,actual)
             # A partial render is never presented as completed.
             os.replace(rendered,output)
             warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
             txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
-            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'duration':actual,'transcript':txt.name})
+            atomic_json(meta,{'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name})
             if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
             outputs.append(str(output))
         progress('Готово',f'Найдено реакций: {len(rows)}; сохранено видео: {len(outputs)}')

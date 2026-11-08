@@ -24,18 +24,25 @@ def trim_keeps(keeps, start, end):
     return out
 
 
-def remap_segments(segments, source_offset, keeps):
+def remap_segments(segments, source_offset, keeps, rendered_timeline=None):
     """Project absolute VOD speech timestamps to concatenated kept audio.
 
     One speech segment spanning several keeps retains its text only once.
     Word positions are not invented: coarse ASR segments remain coarse.
     """
     timeline=[];cursor=0.
-    for a,b in keeps:
-        if b <= a:
-            raise ValueError('Пустой участок монтажной карты')
-        timeline.append((float(a)+source_offset,float(b)+source_offset,cursor))
-        cursor+=b-a
+    if rendered_timeline is None:
+        rendered_timeline=[]
+        for a,b in keeps:
+            rendered_timeline.append((a,b,cursor))
+            cursor+=b-a
+    cursor=0.
+    for a,b,out_start in rendered_timeline:
+        a,b,out_start=float(a),float(b),float(out_start)
+        if not math.isfinite(a+b+out_start) or b<=a or out_start<0 or out_start < cursor-.25:
+            raise ValueError('Некорректная монтажная карта')
+        timeline.append((a+source_offset,b+source_offset,out_start))
+        cursor=out_start+b-a
     result=[]
     for segment in segments:
         a,b=float(segment['start']),float(segment['end'])
