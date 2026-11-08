@@ -11,7 +11,7 @@ import subprocess
 import urllib.request
 from urllib.error import URLError, HTTPError
 
-MODEL='qwen3-vl:4b'
+MODEL='qwen3-vl:4b-instruct'
 INTERVAL=5.0
 PROMPT='''Find advertising or promotional overlays that a streamer has placed on top of the video: sponsor banners, promotional codes, gambling ads, or promotional stickers, including animated ad characters. Return one bounding box tightly surrounding EACH entire visible overlay, including its characters and text. Do not include the streamer webcam, the chat, subtitles, video player controls, game interface or content of the video itself. If there is no clear promotional overlay, return an empty list. Coordinates are integers [x1,y1,x2,y2] on a 0–1000 grid relative to the full image; origin top left. Return only JSON: {"banners":[[x1,y1,x2,y2]]}.'''
 SCHEMA={'type':'object','properties':{'banners':{'type':'array','maxItems':8,'items':{'type':'array','minItems':4,'maxItems':4,'items':{'type':'integer','minimum':0,'maximum':1000}}}},'required':['banners'],'additionalProperties':False}
@@ -51,7 +51,7 @@ def parse_boxes(text):
     return result
 
 def request_boxes(image, progress=None, *, _retry=False):
-    req={'model':MODEL,'stream':False,'think':False,'format':'json' if _retry else SCHEMA,'options':{'temperature':0,'num_ctx':4096,'num_predict':512},
+    req={'model':MODEL,'stream':False,'format':'json' if _retry else SCHEMA,'options':{'temperature':0,'num_ctx':4096,'num_predict':512},
          'messages':[{'role':'user','content':PROMPT,'images':[base64.b64encode(image).decode('ascii')]}]}
     payload=json.dumps(req).encode('utf-8')
     request=urllib.request.Request('http://127.0.0.1:11434/api/chat',data=payload,headers={'Content-Type':'application/json'},method='POST')
@@ -69,13 +69,13 @@ def request_boxes(image, progress=None, *, _retry=False):
             reason=str(data.get('error','')).lower() if isinstance(data,dict) else ''
         except (OSError,ValueError,TypeError): reason=''
         if exc.code==404 and 'model' in reason and ('not found' in reason or 'not available' in reason):
-            raise BannerSetupError('Модель qwen3-vl:4b не найдена в Ollama. После обновления проекта запустите INSTALL.bat для загрузки модели') from None
+            raise BannerSetupError('Модель qwen3-vl:4b-instruct не найдена в Ollama. Выполните в командной строке: ollama pull qwen3-vl:4b-instruct') from None
         if exc.code==404:
-            raise BannerSetupError('Ollama вернула HTTP 404. Проверьте версию Ollama и наличие модели qwen3-vl:4b') from None
+            raise BannerSetupError('Ollama вернула HTTP 404. Проверьте версию Ollama и наличие модели qwen3-vl:4b-instruct') from None
         if exc.code==500 and ('out of memory' in reason or 'requires more system memory' in reason or 'not enough memory' in reason):
             raise BannerSetupError('Ollama: недостаточно памяти для модели баннеров. Закройте тяжёлые программы и проверьте свободную ОЗУ и видеопамять') from None
         kind=BannerSetupError if 400<=exc.code<500 else BannerError
-        raise kind(f'Ollama вернула HTTP {exc.code} при запуске модели баннеров; проверьте Ollama и модель qwen3-vl:4b') from None
+        raise kind(f'Ollama вернула HTTP {exc.code} при запуске модели баннеров; проверьте Ollama и модель qwen3-vl:4b-instruct') from None
     except URLError as exc:
         if isinstance(exc.reason,ConnectionRefusedError) or getattr(exc.reason,'winerror',None)==10061:
             raise BannerSetupError('Нет соединения с локальным Ollama (порт 11434). Запустите Ollama и повторите задание') from None
@@ -87,7 +87,7 @@ def request_boxes(image, progress=None, *, _retry=False):
     except OSError:
         raise BannerError('Не удалось связаться с локальным Ollama; проверьте, что он запущен') from None
     except (ValueError,KeyError,TypeError):
-        raise BannerError('Ollama вернула некорректный ответ модели баннеров; проверьте версию Ollama и модель qwen3-vl:4b') from None
+        raise BannerError('Ollama вернула некорректный ответ модели баннеров; проверьте версию Ollama и модель qwen3-vl:4b-instruct') from None
     if data.get('done_reason')=='length':
         if not _retry:
             if progress:progress('Ответ модели обрезан; повторяю этот кадр в альтернативном режиме JSON')

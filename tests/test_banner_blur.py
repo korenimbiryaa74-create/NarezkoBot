@@ -103,7 +103,7 @@ class BannerTests(unittest.TestCase):
         from urllib.error import HTTPError,URLError
         import io
         cases=[
-            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"model qwen3-vl:4b not found: SECRET"}')),banner_blur.BannerSetupError,'не найдена'),
+            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"model qwen3-vl:4b-instruct not found: SECRET"}')),banner_blur.BannerSetupError,'не найдена'),
             (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"unknown route SECRET"}')),banner_blur.BannerSetupError,'HTTP 404'),
             (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"out of memory SECRET"}')),banner_blur.BannerSetupError,'недостаточно памяти'),
             (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"SECRET"}')),banner_blur.BannerError,'HTTP 500'),
@@ -154,7 +154,7 @@ class BannerTests(unittest.TestCase):
             self.assertEqual(banner_blur.request_boxes(b'jpeg data'),[])
             request=opener.return_value.open.call_args.args[0]
             data=json.loads(request.data)
-            self.assertEqual(data['model'],'qwen3-vl:4b');self.assertFalse(data['stream'])
+            self.assertEqual(data['model'],'qwen3-vl:4b-instruct');self.assertFalse(data['stream']);self.assertNotIn('think',data)
             self.assertTrue(data['messages'][0]['images'][0]);self.assertIn('banners',data['format']['properties'])
 
     @unittest.skipUnless(shutil.which('ffmpeg'),'needs ffmpeg')
