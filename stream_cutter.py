@@ -31,10 +31,10 @@ class CutterError(Exception):
     pass
 
 def run(cmd: list[str], capture: bool=True, timeout: int | None=None):
-    return subprocess.run(cmd, stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, text=True, encoding='utf-8', errors='replace', timeout=timeout)
+    return subprocess.run(cmd, stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 def run_bytes(cmd: list[str], timeout: int | None=None):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 def require_tools() -> tuple[str, str]:
     ffmpeg = shutil.which('ffmpeg')
@@ -127,8 +127,12 @@ def pick_mic_stream(info: dict, forced: str | None) -> int:
         return mono[0]
     return 0
 
-def decode_pcm(path: str, stream_idx: int, ffmpeg: str) -> bytes:
-    cmd = [ffmpeg, '-v', 'error', '-i', path, '-map', f'0:a:{stream_idx}', '-vn', '-ac', '1', '-ar', str(ANALYSIS_RATE), '-c:a', 'pcm_s16le', '-f', 's16le', '-']
+def decode_pcm(path: str, stream_idx: int, ffmpeg: str, start: float=0, end: float | None=None) -> bytes:
+    cmd = [ffmpeg, '-v', 'error']
+    if start > 0: cmd += ['-ss', f'{start:.6f}']
+    cmd += ['-i', path]
+    if end is not None: cmd += ['-t', f'{end-start:.6f}']
+    cmd += ['-map', f'0:a:{stream_idx}', '-vn', '-ac', '1', '-ar', str(ANALYSIS_RATE), '-c:a', 'pcm_s16le', '-f', 's16le', '-']
     p = run_bytes(cmd)
     if p.returncode != 0:
         raise CutterError(f"audio decode failed: {p.stderr.decode('utf-8', 'replace').strip()}")
@@ -537,7 +541,7 @@ def chunk_cmd(ffmpeg: str, src: str, group, out_path: str, args, n_audio: int, h
             with open(script_path, 'a', encoding='utf-8') as fh:
                 fh.write(f';\n[vout]{blur_vf}[vfinal]')
             vlabel = '[vfinal]'
-        cmd = head + ['-ss', f'{base:.3f}', '-i', src, '-filter_complex_script', script_path, '-map', vlabel]
+        cmd = head + ['-ss', f'{base:.3f}', '-t', f'{group[-1][1]-base:.3f}', '-i', src, '-filter_complex_script', script_path, '-map', vlabel]
         for a in range(n_audio):
             cmd += ['-map', f'[aout{a}]']
     blur_vf = getattr(args, 'blur_vf', None)
@@ -582,7 +586,7 @@ class Progress:
 
 def _exec(cmd: list[str], idx: int, prog: Progress, log_path: str) -> int:
     with open(log_path, 'w', encoding='utf-8', errors='replace') as log:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace')
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         with p.stdout:
             for line in p.stdout:
                 if line.startswith('out_time_ms='):
@@ -597,7 +601,7 @@ def item_duration(item) -> float:
         return float(item[1] - item[0])
     return sum((e - s for s, e in item))
 
-def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, hwaccel: str | None, jobs_n: int) -> list[str]:
+def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, hwaccel: str | None, jobs_n: int, progress_callback=None) -> list[str]:
     results: dict[int, str] = {}
     failures: list[str] = []
 
@@ -612,15 +616,15 @@ def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, 
     stop = threading.Event()
 
     def printer():
-        while not stop.is_set():
-            time.sleep(10)
-            if stop.is_set():
-                break
+        while not stop.wait(10):
             done_s, done_n = prog.snapshot()
             pct = min(100.0, done_s / prog.total * 100.0)
             el = time.time() - prog.t0
             eta = el / pct * (100 - pct) if pct > 1 else 0
             print(f'\r  прогресс: {pct:5.1f}%  кусков {done_n}/{prog.n}  прошло {hhmmss(el)}  осталось ~{hhmmss(eta)}   ', end='', flush=True)
+            if progress_callback:
+                try: progress_callback(f'Рендер: {pct:.1f}% · частей готово {done_n}/{prog.n} · прошло {hhmmss(el)}')
+                except Exception: pass  # Progress reporting must not stop encoding.
     t = threading.Thread(target=printer, daemon=True)
     t.start()
     with ThreadPoolExecutor(max_workers=jobs_n) as ex:
@@ -654,7 +658,7 @@ def concat_parts(ffmpeg: str, parts: list[str], out: str) -> None:
     if run(cmd).returncode != 0:
         raise CutterError('финальная склейка не удалась')
 
-def render_file(res: dict, args, ffmpeg: str, ffprobe: str) -> str:
+def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=None) -> str:
     src, keep = (res['src'], res['keep'])
     out = args.out or os.path.splitext(src)[0] + '_cut' + os.path.splitext(src)[1]
     n_audio = len(res['streams'])
@@ -715,7 +719,7 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str) -> str:
             def builder(item, out_path, script, hw):
                 return copy_cmd(ffmpeg, src, item, out_path, n_audio)
             print(f'заданий     : {len(jobs)}  процессов: {min(jobs_n, len(jobs))}  (копирование)')
-            parts = run_jobs(ffmpeg, jobs, builder, prog, tmpdir, None, jobs_n)
+            parts = run_jobs(ffmpeg, jobs, builder, prog, tmpdir, None, jobs_n, progress_callback)
         else:
             groups = build_chunks(keep, args.piece, args.gap_split, args.span_limit)
             jobs_n = max(1, min(jobs_n, len(groups)))
@@ -729,8 +733,9 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str) -> str:
             if fps_flags:
                 print(f"fps         : {' '.join(fps_flags)}")
             print('старт ...', flush=True)
-            parts = run_jobs(ffmpeg, groups, builder, prog, tmpdir, hwaccel, jobs_n)
+            parts = run_jobs(ffmpeg, groups, builder, prog, tmpdir, hwaccel, jobs_n, progress_callback)
         print('склейка ...', flush=True)
+        if progress_callback: progress_callback('Склейка частей')
         concat_parts(ffmpeg, parts, out)
     print(f'готово      : {out}')
     print(f'              длительность {fmt(duration_of(probe(out, ffprobe)))}')
@@ -791,16 +796,21 @@ def parse_args(argv=None):
         args.blur_regions = list(BLUR_REGIONS)
     return args
 
-def analyse(src: str, args, ffmpeg: str, ffprobe: str) -> dict:
+def analyse(src: str, args, ffmpeg: str, ffprobe: str, start: float=0, end: float | None=None) -> dict:
     info = probe(src, ffprobe)
     streams = audio_streams(info)
     if not streams:
         raise CutterError('нет аудиодорожек - нечего анализировать')
     mic = pick_mic_stream(info, args.audio_track)
     track = mic if mic >= 0 else 0
-    total = duration_of(info)
-    if total <= 0:
+    source_total = duration_of(info)
+    if source_total <= 0:
         raise CutterError('не удалось определить длительность')
+    start = float(start)
+    end = source_total if end is None else min(float(end), source_total)
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        raise CutterError('некорректный интервал анализа')
+    total = end-start
     print(f'источник    : {src}')
     print(f'длительность: {fmt(total)}')
     print(f'аудиодорожки: {len(streams)}')
@@ -809,7 +819,7 @@ def analyse(src: str, args, ffmpeg: str, ffprobe: str) -> dict:
     print(f'микрофон    : 0:a:{track}' + ('  (общий микс - стримера от звука видео не отделить)' if mic < 0 else ''))
     t0 = time.time()
     print('декодирую аудио ...', flush=True)
-    buf = decode_pcm(src, track, ffmpeg)
+    buf = decode_pcm(src, track, ffmpeg, start, end)
     print('анализирую ...', flush=True)
     levels, backend = frame_levels(buf)
     del buf
@@ -843,12 +853,16 @@ def analyse(src: str, args, ffmpeg: str, ffprobe: str) -> dict:
             print(f'  {fmt(s)} -> {fmt(e)}   {e - s:7.2f} с')
         if len(cuts) > 40:
             print(f'  ... и ещё {len(cuts) - 40}')
-    timeline = {'source': src, 'duration': total, 'mic_track': track, 'mixed_audio': mic < 0, 'noise_floor_db': round(floor, 2), 'voice_threshold_db': round(on_db, 2), 'silence_threshold_db': round(off_db, 2), 'params': {'min_cut': args.min_cut, 'max_gap': args.max_gap, 'pad_before': args.pad_before, 'pad_after': args.pad_after, 'min_speech': args.min_speech}, 'cuts': [{'start': round(s, 3), 'end': round(e, 3), 'dur': round(e - s, 3)} for s, e in cuts], 'keeps': [{'start': round(s, 3), 'end': round(e, 3), 'dur': round(e - s, 3)} for s, e in keep]}
+    # The plan was computed relative to the selected range; renderer needs
+    # coordinates in the original source, including on nonzero Twitch offsets.
+    keep = [(a+start,b+start) for a,b in keep]
+    cuts = [(a+start,b+start) for a,b in cuts]
+    timeline = {'source': src, 'duration': source_total, 'analysis_start': start, 'analysis_end': end, 'mic_track': track, 'mixed_audio': mic < 0, 'noise_floor_db': round(floor, 2), 'voice_threshold_db': round(on_db, 2), 'silence_threshold_db': round(off_db, 2), 'params': {'min_cut': args.min_cut, 'max_gap': args.max_gap, 'pad_before': args.pad_before, 'pad_after': args.pad_after, 'min_speech': args.min_speech}, 'cuts': [{'start': round(s, 3), 'end': round(e, 3), 'dur': round(e - s, 3)} for s, e in cuts], 'keeps': [{'start': round(s, 3), 'end': round(e, 3), 'dur': round(e - s, 3)} for s, e in keep]}
     tl_path = args.timeline or os.path.splitext(src)[0] + '_cuts.json'
     with open(tl_path, 'w', encoding='utf-8') as fh:
         json.dump(timeline, fh, indent=2)
     print(f'таймлайн    : {tl_path}')
-    return {'src': src, 'info': info, 'streams': streams, 'total': total, 'track': track, 'mic': mic, 'floor': floor, 'keep': keep, 'cuts': cuts, 'kept': kept, 'removed': removed, 'timeline': tl_path, 'levels': levels, 'on_db': on_db, 'off_db': off_db}
+    return {'src': src, 'info': info, 'streams': streams, 'total': source_total, 'track': track, 'mic': mic, 'floor': floor, 'keep': keep, 'cuts': cuts, 'kept': kept, 'removed': removed, 'timeline': tl_path, 'levels': levels, 'on_db': on_db, 'off_db': off_db}
 
 def main(argv=None) -> int:
     args = parse_args(argv)
