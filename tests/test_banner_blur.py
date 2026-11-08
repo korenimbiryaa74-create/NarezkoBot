@@ -24,6 +24,38 @@ class BannerTests(unittest.TestCase):
         with patch('banner_blur.urllib.request.build_opener') as opener:
             opener.return_value.open.side_effect=URLError('down')
             with self.assertRaises(banner_blur.BannerError):banner_blur.request_boxes(b'a')
+    def test_ollama_error_diagnostics_do_not_leak_server_content(self):
+        from urllib.error import HTTPError,URLError
+        import io
+        cases=[
+            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"model qwen3-vl:4b not found: SECRET"}')),banner_blur.BannerSetupError,'не найдена'),
+            (HTTPError('http://localhost',404,'',{},io.BytesIO(b'{"error":"unknown route SECRET"}')),banner_blur.BannerSetupError,'HTTP 404'),
+            (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"out of memory SECRET"}')),banner_blur.BannerSetupError,'недостаточно памяти'),
+            (HTTPError('http://localhost',500,'',{},io.BytesIO(b'{"error":"SECRET"}')),banner_blur.BannerError,'HTTP 500'),
+            (URLError(ConnectionRefusedError('SECRET')),banner_blur.BannerSetupError,'Нет соединения'),
+            (URLError(TimeoutError('SECRET')),banner_blur.BannerError,'180 с'),
+        ]
+        for err,cls,expected in cases:
+            with self.subTest(expected=expected),patch('banner_blur.urllib.request.build_opener') as opener:
+                opener.return_value.open.side_effect=err
+                with self.assertRaises(cls) as caught:banner_blur.request_boxes(b'x')
+                self.assertIn(expected,str(caught.exception));self.assertNotIn('SECRET',str(caught.exception))
+
+    def test_permanent_model_setup_error_stops_queue_without_retry(self):
+        from service import Service
+        from settings import Settings
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);settings=Settings(root/'config.json');settings.load()
+            class Engine:
+                def run(self,job,cfg,progress):
+                    progress('Рендер','Поиск баннеров')
+                    raise banner_blur.BannerSetupError('Модель не найдена')
+            svc=Service(root,settings,None,pipeline_factory=lambda *a:Engine())
+            job,_=svc.store.add('123','name');svc.worker_once()
+            saved=svc.store.list_jobs()[0]
+            self.assertEqual(saved['state'],'failed');self.assertIn('Модель не найдена',saved['detail'])
+            self.assertFalse(any('повтор через' in e for _,e in svc.logs()))
+
     def test_ollama_protocol_and_bounds(self):
         class Response:
             def __enter__(self):return self

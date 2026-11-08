@@ -9,13 +9,14 @@ import json
 import math
 import subprocess
 import urllib.request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 MODEL='qwen3-vl:4b'
 INTERVAL=5.0
 PROMPT='''Find advertising or promotional overlays that a streamer has placed on top of the video: sponsor banners, promotional codes, gambling ads, or promotional stickers, including animated ad characters. Return one bounding box tightly surrounding EACH entire visible overlay, including its characters and text. Do not include the streamer webcam, the chat, subtitles, video player controls, game interface or content of the video itself. If there is no clear promotional overlay, return an empty list. Coordinates are integers [x1,y1,x2,y2] on a 0–1000 grid relative to the full image; origin top left. Return only JSON: {"banners":[[x1,y1,x2,y2]]}.'''
 SCHEMA={'type':'object','properties':{'banners':{'type':'array','maxItems':8,'items':{'type':'array','minItems':4,'maxItems':4,'items':{'type':'integer','minimum':0,'maximum':1000}}}},'required':['banners'],'additionalProperties':False}
 class BannerError(RuntimeError): pass
+class BannerSetupError(BannerError): pass
 
 def parse_boxes(text):
     try:
@@ -45,8 +46,33 @@ def request_boxes(image):
             raw=response.read(1024*1024+1)
         if len(raw)>1024*1024:raise ValueError('oversize')
         data=json.loads(raw);text=data['message']['content']
-    except (URLError,OSError,TimeoutError,ValueError,KeyError,TypeError) as exc:
-        raise BannerError('Не удалось получить ответ локальной модели баннеров. Проверьте Ollama и модель qwen3-vl:4b') from exc
+    except HTTPError as exc:
+        # Ollama error text is untrusted: match known conditions but do not log it.
+        try:
+            raw_error=exc.read(8192)
+            data=json.loads(raw_error)
+            reason=str(data.get('error','')).lower() if isinstance(data,dict) else ''
+        except (OSError,ValueError,TypeError): reason=''
+        if exc.code==404 and 'model' in reason and ('not found' in reason or 'not available' in reason):
+            raise BannerSetupError('Модель qwen3-vl:4b не найдена в Ollama. После обновления проекта запустите INSTALL.bat для загрузки модели') from None
+        if exc.code==404:
+            raise BannerSetupError('Ollama вернула HTTP 404. Проверьте версию Ollama и наличие модели qwen3-vl:4b') from None
+        if exc.code==500 and ('out of memory' in reason or 'requires more system memory' in reason or 'not enough memory' in reason):
+            raise BannerSetupError('Ollama: недостаточно памяти для модели баннеров. Закройте тяжёлые программы и проверьте свободную ОЗУ и видеопамять') from None
+        kind=BannerSetupError if 400<=exc.code<500 else BannerError
+        raise kind(f'Ollama вернула HTTP {exc.code} при запуске модели баннеров; проверьте Ollama и модель qwen3-vl:4b') from None
+    except URLError as exc:
+        if isinstance(exc.reason,ConnectionRefusedError) or getattr(exc.reason,'winerror',None)==10061:
+            raise BannerSetupError('Нет соединения с локальным Ollama (порт 11434). Запустите Ollama и повторите задание') from None
+        if isinstance(exc.reason,TimeoutError):
+            raise BannerError('Ollama не ответила за 180 с при поиске баннеров') from None
+        raise BannerError('Не удалось связаться с локальным Ollama; проверьте, что он запущен') from None
+    except TimeoutError:
+        raise BannerError('Ollama не ответила за 180 с при поиске баннеров') from None
+    except OSError:
+        raise BannerError('Не удалось связаться с локальным Ollama; проверьте, что он запущен') from None
+    except (ValueError,KeyError,TypeError):
+        raise BannerError('Ollama вернула некорректный ответ модели баннеров; проверьте версию Ollama и модель qwen3-vl:4b') from None
     return parse_boxes(text)
 
 def scan(src, keeps, ffmpeg, progress=None, interval=INTERVAL):
