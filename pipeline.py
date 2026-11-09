@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import full_cycle
+import publication_guard
 import banner_blur
 import manual_blur
 import stream_cutter
@@ -444,6 +445,15 @@ def organize_clips(folder,job,rows,mode):
         if report.exists() and report.read_text(encoding='utf-8-sig')!=text:
             raise PipelineError(f'Отчёт {report.name} уже существует и отличается; не перезаписываю')
         reports=[(report,text)]
+        # A warning is kept alongside the clip even when YouTube is disabled.
+        transcript=srcs[1][0].read_text(encoding='utf-8-sig')
+        _, warning=publication_guard.assess(row,transcript,stem)
+        if warning:
+            preport=ready/(stem+' — проверка публикации.txt')
+            ptext=warning+'\nНазвания передач могут не попасть в транскрипт. Проверка человеком обязательна.\n'
+            if preport.exists() and preport.read_text(encoding='utf-8-sig')!=ptext:
+                raise PipelineError(f'Отчёт {preport.name} уже существует и отличается; не перезаписываю')
+            reports.append((preport,ptext))
         if 'donation_cuts' in row:
             dreport=ready/(stem+' — удалённые донаты.txt'); dtext=donation_report(job,row)
             if dreport.exists() and dreport.read_text(encoding='utf-8-sig')!=dtext:
