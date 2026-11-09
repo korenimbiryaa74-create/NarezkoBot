@@ -6,7 +6,7 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from settings import Settings, import_legacy_groq_key
 from service import Service
 from chatgpt_finder import ChatGPTFinder
@@ -75,6 +75,7 @@ class App:
         ttk.Button(testbar,text='Запустить тест из папки',command=self.start_test).pack(side='left',padx=5)
         ttk.Button(testbar,text='Продолжить очередь',command=self.resume_queue).pack(side='left',padx=5)
         ttk.Button(testbar,text='Тест превью',command=self.test_preview).pack(side='left',padx=5)
+        ttk.Button(testbar,text='Тест по ссылке',command=lambda:self.test_preview(manual=True)).pack(side='left',padx=5)
         previewbar=ttk.Frame(dashboard);previewbar.pack(fill='x')
         ttk.Button(previewbar,text='Отменить тест превью',command=self.cancel_preview).pack(side='right')
         self.preview_status=tk.StringVar(value='')
@@ -301,9 +302,16 @@ class App:
     def youtube_retry(self):
         selected=self.youtube_rows.selection()
         if not selected:messagebox.showinfo('YouTube','Выберите загрузку, требующую проверки.');return
-        text=('Проверьте YouTube Studio на выбранном канале. Если видео или черновик уже создан, удалите его или не повторяйте загрузку. '
-              'Если окно браузера этого профиля осталось открытым, дождитесь завершения загрузки и закройте его после проверки. '
-              'Вы подтверждаете, что такого видео и черновика на канале нет и повтор не создаст дубль?')
+        row=next((r for r in self.service.youtube_queue.list_uploads() if str(r['id'])==selected[0]),None)
+        if not row or row['state']!='needs_review':messagebox.showerror('YouTube','Эта загрузка не ожидает проверки.');return
+        from publication_guard import BLOCK, REVIEW
+        if row['detail'].startswith(BLOCK):messagebox.showerror('YouTube',row['detail']);return
+        if row['detail'].startswith(REVIEW):
+            text=('Вы проверили исходный ролик и права, убедились, что эта нарезка не относится к запрещённым передачам, '
+                  'и разрешаете её загрузить на YouTube? Решение остаётся за вами. Если источник неизвестен — нажмите «Нет».')
+        else:
+            text=('Проверьте YouTube Studio на выбранном канале. Если видео или черновик уже создан, удалите его или не повторяйте загрузку. '
+                  'Вы подтверждаете, что видео и черновика на канале нет и повтор не создаст дубль?')
         if not messagebox.askyesno('YouTube: проверка перед повтором',text):return
         try:
             self.service.youtube_queue.retry_reviewed(int(selected[0]))
@@ -565,18 +573,24 @@ class App:
         try:self.service.store.clear_notifications()
         except Exception as exc:messagebox.showerror('Уведомления','Не удалось очистить уведомления: '+type(exc).__name__)
 
-    def test_preview(self):
+    def test_preview(self,manual=False):
         import reaction_previews
         if self._preview_running:
             messagebox.showinfo('Тест превью','Генерация уже идёт. Дождитесь её завершения.');return
         path=filedialog.askopenfilename(title='Выберите готовую нарезку бота',filetypes=[('Нарезка MP4','*.mp4')])
         if not path:return
+        source_url=None
+        if manual:
+            source_url=simpledialog.askstring('Источник превью','Вставьте ссылку на исходное YouTube-видео:')
+            if not source_url:return
+            try:reaction_previews.youtube_video_id(source_url)
+            except reaction_previews.PreviewError as exc:messagebox.showerror('Источник превью',str(exc));return
         login=self.variables['preview_test_streamer'].get().strip().lower()
         self._preview_running=True;self._preview_cancel=threading.Event();self._preview_close_requested=False
         self.preview_status.set('Превью: подготовка…')
         def work():
             try:
-                result=reaction_previews.generate_saved_clip(ROOT,path,login,cancel=self._preview_cancel,status=lambda msg:self._preview_events.put(('status',msg)))
+                result=reaction_previews.generate_saved_clip(ROOT,path,login,cancel=self._preview_cancel,status=lambda msg:self._preview_events.put(('status',msg)),source_url=source_url)
                 self._preview_events.put(('done',result))
             except Exception as exc:self._preview_events.put(('error',str(exc)))
         threading.Thread(target=work,daemon=True).start()
@@ -625,7 +639,7 @@ class App:
             self.refresh_youtube_profiles()
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
-            ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Не подтверждено','cancelled':'Отменено'}
+            ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
             # Keep cancelled rows in storage for deduplication, but hide them from the queue.
             all_uploads=[r for r in self.service.youtube_queue.list_uploads() if r['state']!='cancelled']
             # Unresolved records must remain visible even when older than 200 rows.
