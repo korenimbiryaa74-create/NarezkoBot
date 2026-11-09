@@ -59,11 +59,11 @@ def attach(self, path: str) -> bool:
         return False
     if hasattr(tab,'clear_file_chooser'): tab.clear_file_chooser()
     opened=False; menu_clicked=False; backend=None; nid=None
-    self._status('ожидаю загрузку кнопки и меню прикрепления (до 20 с)')
+    self._status('ожидаю загрузку кнопки и меню прикрепления (до 90 с)')
     # Bounded attempts also work in tests with a mocked clock/sleep. Do not click
     # plus or the upload item twice: delayed events may still be in flight.
-    deadline=time.monotonic()+self._remaining(20)
-    for attempt in range(40):
+    deadline=time.monotonic()+self._remaining(90)
+    for attempt in range(180):
         if time.monotonic()>=deadline or self._remaining(1)<=0:break
         self._check_upload_quota()
         if not opened:
@@ -98,7 +98,7 @@ def attach(self, path: str) -> bool:
                 nid=tab.node_id('input[data-twl-file="1"]') if n else None
             except Exception:nid=None
             if nid:break
-        if attempt in (15,30):self._status('интерфейс загрузки ещё подготавливается; запрос не отправлен')
+        if attempt in (30,60,120):self._status('интерфейс загрузки ещё подготавливается; запрос не отправлен')
         time.sleep(max(0,min(.5,deadline-time.monotonic())))
     self._check_upload_quota()
     if backend:
@@ -108,7 +108,7 @@ def attach(self, path: str) -> bool:
         self._status('найдено поле загрузки страницы; использую запасной путь')
         tab.call('DOM.setFileInputFiles',files=[os.path.abspath(path)],nodeId=nid)
     else:
-        self._status('не удалось найти однозначное поле загрузки за 20 с; запрос не отправлен')
+        self._status('не удалось найти однозначное поле загрузки за 90 с; запрос не отправлен')
         return False
     if self._wait_attached(name,image):
         self._status('прикрепление файла подтверждено')

@@ -83,6 +83,98 @@ class AttachRetryTests(unittest.TestCase):
         with patch('chatgpt_attach.time.sleep'):self.assertFalse(self.web._attach('test.txt'))
         self.assertEqual(self.web.tab.clicks,1);self.assertNotIn('DOM.setFileInputFiles',self.web.tab.calls)
 
+    def test_attachment_can_complete_after_old_45_second_limit(self):
+        clock=[0.0]
+        class Fake:
+            def js(self,expr):
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                return {'named':clock[0]>=75, 'busy':False}
+        self.web.tab=Fake()
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+            self.assertTrue(ChatGPTWeb._wait_attached(self.web,'transcript.txt',False))
+        self.assertGreaterEqual(clock[0],75)
+        self.assertTrue(any('ещё не отправлен' in e for e in self.events))
+
+    def test_attachment_wait_respects_global_deadline_and_never_assumes_ready(self):
+        clock=[0.0]; self.web._request_deadline=70
+        class Fake:
+            def js(self,expr):
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                return {'named':True, 'busy':True}
+        self.web.tab=Fake()
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+            self.assertFalse(ChatGPTWeb._wait_attached(self.web,'transcript.txt',False))
+        self.assertEqual(clock[0],70)
+
+    def test_late_menu_load_has_more_than_20_seconds(self):
+        clock=[0.0]
+        class Fake:
+            def __init__(self):self.writes=0
+            def call(self,method,**kw):
+                if method=='DOM.setFileInputFiles':self.writes+=1
+                return {}
+            def js(self,expr):
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                if expr==chatgpt_attach.JS_OPEN_ATTACH:return clock[0]>=30
+                if expr==chatgpt_attach.JS_CLICK_UPLOAD:return False
+                if 'data-twl-file' in expr:return 1 if clock[0]>=30 else 0
+            def node_id(self,selector):return 5
+        self.web.tab=Fake()
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_attach.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_attach.time.sleep',side_effect=sleep):
+            self.assertTrue(self.web._attach('test.txt'))
+        self.assertGreaterEqual(clock[0],30);self.assertEqual(self.web.tab.writes,1)
+
+    def test_never_reattaches_if_send_is_not_ready(self):
+        class Fake:
+            def js(self,expr):return [] if expr==self_web.JS_IMGS else {}
+        self_web=self.web;self.web.tab=Fake();calls=[]
+        self.web.new_chat=lambda **kw:True;self.web._page_id=lambda:1
+        self.web._read_answer_state=lambda:{'texts':[],'notices':[]}
+        self.web._attach=lambda p:calls.append(p) or True
+        self.web._type_prompt=lambda p:True;self.web._send=lambda:False
+        with patch('chatgpt_web.time.sleep'),self.assertRaises(ChatGPTWebError):
+            self.web._ask_locked('prompt',['transcript.txt'])
+        self.assertEqual(calls,['transcript.txt'])
+
+    def test_never_clicks_send_twice_when_delivery_uncertain(self):
+        clock=[0.0]
+        class Fake:
+            def __init__(self):self.clicks=0
+            def call(self,*a,**kw):return {}
+            def js(self,expr):
+                if expr==self_web.JS_SEND_STATE:return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':'prompt','key':'a','hit':False,'users':0,'assistants':0}
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                self.clicks+=1;return True
+        self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt'
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+            with self.assertRaises(ChatGPTWebError):self.web._send(wait_upload=35)
+        self.assertEqual(self.web.tab.clicks,1)
+        self.assertTrue(self.web._send_uncertain)
+
+    @unittest.skipUnless(shutil.which('chromium'),'requires Chromium')
+    def test_dom_recognizes_numbered_transcript_and_upload_progress(self):
+        from html.parser import HTMLParser
+        with tempfile.TemporaryDirectory() as d:
+            page=Path(d)/'composer.html'
+            expr=chatgpt_attach.JS_ATTACHED % json.dumps('transcript.txt')
+            page.write_text('<form><div><span>transcript(2).txt</span><div id="progress" role="progressbar">upload</div></div><textarea id="prompt-textarea"></textarea></form>'+                '<script>const a='+expr+';document.getElementById("progress").remove();const b='+expr+';'+                'const p=document.createElement("pre");p.id="out";p.textContent=JSON.stringify([a,b]);document.body.appendChild(p);</script>',encoding='utf8')
+            result=subprocess.run(['chromium','--headless','--no-sandbox','--disable-gpu','--dump-dom',page.as_uri()],capture_output=True,text=True,timeout=30,check=True)
+            class Parser(HTMLParser):
+                def __init__(self):super().__init__();self.inside=False;self.data=''
+                def handle_starttag(self,t,a):
+                    if t=='pre' and dict(a).get('id')=='out':self.inside=True
+                def handle_endtag(self,t):
+                    if t=='pre':self.inside=False
+                def handle_data(self,d):
+                    if self.inside:self.data+=d
+            parser=Parser();parser.feed(result.stdout);first,second=json.loads(parser.data)
+            self.assertTrue(first['named']);self.assertTrue(first['busy'])
+            self.assertTrue(second['named']);self.assertFalse(second['busy'])
+
     @unittest.skipUnless(shutil.which('chromium'),'requires Chromium')
     def test_real_dom_menu_then_unique_fallback_input(self):
         from html.parser import HTMLParser
