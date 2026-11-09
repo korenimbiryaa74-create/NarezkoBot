@@ -184,6 +184,7 @@ class App:
         ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
         ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
         ttk.Button(yr,text='Отменить выбранную загрузку',command=self.youtube_cancel).pack(side='left',padx=5)
+        ttk.Button(youtube,text='Очистить очередь загрузок YouTube',command=self.youtube_clear_queue).grid(row=12,column=0,columnspan=2,sticky='w',padx=8,pady=4)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
@@ -316,6 +317,18 @@ class App:
             self.service.youtube_queue.cancel_reviewed_or_queued(row['id'])
             self.service.log('YouTube: отменена запись №'+str(row['id'])+' после проверки пользователем')
         except ValueError as exc:messagebox.showerror('YouTube',str(exc))
+
+    def youtube_clear_queue(self):
+        text=('Отменить все ожидающие и требующие проверки загрузки YouTube для ВСЕХ профилей, включая тестовый? '
+              'Загрузка, которая уже идёт, продолжится; новые нарезки могут снова попасть в очередь. '
+              'Видео и черновики в YouTube Studio не удаляются, включая возможные незавершённые загрузки. '
+              'При необходимости проверьте их вручную.')
+        if not messagebox.askyesno('YouTube: очистить очередь',text):return
+        try:
+            count=self.service.youtube_queue.clear_pending_uploads()
+            self.service.log(f'YouTube: очередь очищена, отменено загрузок {count}')
+            messagebox.showinfo('YouTube',f'Отменено загрузок: {count}. Текущая загрузка продолжится.')
+        except Exception as exc:messagebox.showerror('YouTube','Не удалось очистить очередь: '+type(exc).__name__)
 
     def youtube_confirm_existing(self):
         from tkinter import simpledialog
@@ -565,7 +578,8 @@ class App:
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
             ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
-            all_uploads=self.service.youtube_queue.list_uploads()
+            # Keep cancelled rows in storage for deduplication, but hide them from the queue.
+            all_uploads=[r for r in self.service.youtube_queue.list_uploads() if r['state']!='cancelled']
             # Unresolved records must remain visible even when older than 200 rows.
             recent=all_uploads[-200:]
             recent_ids={r['id'] for r in recent}
