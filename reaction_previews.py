@@ -13,9 +13,11 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 class PreviewError(RuntimeError): pass
 
+GENERIC=set('муж жена мужем женой мужа жену супруг супруги семья семейный семейные семьями семейных развод разводе партнеры партнерами эксперимент отношения жизни история женщина мужчина люди конфликт выезд полиция полицейские вызов'.split())
 STOP=set('это этот эта эти что как где кто когда какой такая такой очень просто после перед будет были можно надо который ролик видео реакция смотрит смотрю стример стрим стриме каша nix nikel test они она его еще если так уже вот там тут они для вас есть или ещё все нет всё это тот the and for with that this from you your on in is to of a'.split())
 def words(s):
     return [x for x in re.findall(r'[a-zа-яё0-9]+',str(s).lower().replace('ё','е')) if len(x)>2 and x not in STOP]
@@ -60,8 +62,10 @@ def find_candidates(row,segs,runner=None,cancel=None):
         c['shared_words']=sorted(hits)
         c['transcript_words']=sorted(cw & set(transcript_words))
     result=sorted(collected.values(),key=lambda c:(-c['score'],c['id']))
-    if len(result[0]['shared_words'])<2 and len(result[0]['transcript_words'])<3:
-        raise PreviewError('Слишком мало совпадений с названием или транскриптом; оригинал не определён')
+    distinct_title=[w for w in result[0]['shared_words'] if w not in GENERIC]
+    distinct_transcript=[w for w in result[0]['transcript_words'] if w not in GENERIC]
+    if len(distinct_title)<2 and len(distinct_transcript)<3:
+        raise PreviewError('Слишком мало характерных совпадений; оригинал не определён. Можно указать ссылку вручную.')
     return result,qs
 
 def download_thumbnail(video_id, session=None):
@@ -89,6 +93,21 @@ def download_thumbnail(video_id, session=None):
     finally:
         if own:session.close()
     raise PreviewError('Не удалось загрузить изображение найденного видео')
+
+def youtube_video_id(url):
+    try:
+        parsed=urlparse(str(url).strip())
+        if parsed.scheme!='https' or parsed.username is not None or parsed.password is not None or parsed.port not in (None,443):raise ValueError()
+        host=(parsed.hostname or '').lower()
+        if host in ('youtube.com','www.youtube.com','m.youtube.com') and parsed.path=='/watch':
+            values=parse_qs(parsed.query,keep_blank_values=True).get('v',[])
+            if len(values)!=1:raise ValueError()
+            video_id=values[0]
+        elif host=='youtu.be' and re.fullmatch(r'/[A-Za-z0-9_-]{11}',parsed.path):video_id=parsed.path[1:]
+        else:raise ValueError()
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}',video_id):raise ValueError()
+        return video_id
+    except (ValueError,TypeError):raise PreviewError('Нужна корректная ссылка на YouTube-видео (https://www.youtube.com/watch?v=... или youtu.be/...)') from None
 
 def font(size):
     from PIL import ImageFont
@@ -152,7 +171,7 @@ def choose_style(root,login):
     return files[0]
 
 
-def generate(root,login,row,segs,output,cancel=None,status=None):
+def generate(root,login,row,segs,output,cancel=None,status=None,source_url=None):
     if row.get('type')!='reaction':raise PreviewError('Превью пока только для реакций')
     label=row.get('preview_text') or ''
     if not isinstance(label,str) or not label.strip():raise PreviewError('Нет надписи для превью в ответе ChatGPT; проверьте ответ вручную')
@@ -162,16 +181,21 @@ def generate(root,login,row,segs,output,cancel=None,status=None):
     warnings=['ИИ может изменить лицо, оригинальную картинку и буквы. Обязательно проверьте результат.']
     if len(label)>32 or len(label.split())>4:
         warnings.append('Надпись длиннее 4 слов или 32 символов: проверьте и сократите вручную')
-    candidates,queries_used=find_candidates(row,segs,cancel=cancel) if cancel else find_candidates(row,segs)
+    if source_url:
+        source={'id':youtube_video_id(source_url),'title':'Ссылка указана пользователем','channel':''}
+        candidates=[source];queries_used=[]
+    else:
+        candidates,queries_used=find_candidates(row,segs,cancel=cancel) if cancel else find_candidates(row,segs)
+        source=candidates[0]
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
-    source=candidates[0];image,url=download_thumbnail(source['id'])
+    image,url=download_thumbnail(source['id'])
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
     preview_local.generate_reaction(root,cutout,style,image,label,output,progress=status or (lambda _:None),cancel=cancel)
     return {'status':'требует проверки','source_url':'https://www.youtube.com/watch?v='+source['id'],
             'image_url':url,'source_title':source['title'],'source_channel':source['channel'],
             'search_queries':queries_used,'candidates':candidates[:6],
             'cutout':cutout.name,'style_reference':style.name,'preview_text':label,'warnings':warnings,
-            'generator':'FLUX 3 Image Klein (локально)', 'text_unverified':True}
+            'generator':'FLUX 3 Image Klein (локально)', 'text_unverified':True, 'source_manually_selected':bool(source_url)}
 
 
 def _cached_label(root, row):
@@ -245,7 +269,7 @@ def prepare_saved_clip(root, video, test_login=''):
     return {'video':video,'login':login,'row':local_row,'segs':segs,'target':target,'report':target.with_suffix('.json')}
 
 
-def generate_saved_clip(root, video, test_login='', cancel=None, status=None):
+def generate_saved_clip(root, video, test_login='', cancel=None, status=None, source_url=None):
     """Generate an on-demand preview without retranscription or ChatGPT."""
     status=status or (lambda _:None)
     data=prepare_saved_clip(root,video,test_login); target=data['target'];report=data['report']
@@ -259,8 +283,10 @@ def generate_saved_clip(root, video, test_login='', cancel=None, status=None):
         return {'path':str(target),'preview_text':label,'existing':True}
     if report.exists():raise PreviewError('Найден отчёт без превью; не перезаписываю существующий файл')
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
-    status('Ищу исходное видео и собираю превью; надпись взята из сохранённого ответа')
-    info=generate(root,data['login'],data['row'],data['segs'],target,cancel=cancel,status=status)
+    status('Собираю превью по указанной ссылке' if source_url else 'Ищу исходное видео и собираю превью; надпись взята из сохранённого ответа')
+    kwargs={'cancel':cancel,'status':status}
+    if source_url:kwargs['source_url']=source_url
+    info=generate(root,data['login'],data['row'],data['segs'],target,**kwargs)
     fd,tmp=tempfile.mkstemp(prefix='.preview-report-',suffix='.json',dir=report.parent)
     try:
         with os.fdopen(fd,'w',encoding='utf8') as f:json.dump(info,f,ensure_ascii=False,indent=2);f.flush();os.fsync(f.fileno())

@@ -242,3 +242,25 @@ class LocalModelGraphTests(unittest.TestCase):
             with Image.open(output) as im:self.assertEqual(im.size,(1280,720))
 
 if __name__=='__main__':unittest.main()
+
+class SourceOverrideTests(unittest.TestCase):
+    def test_generic_false_match_rejected(self):
+        class Run:
+            returncode=0
+            stdout=json.dumps({'entries':[{'id':'5PIZvgBGzLU','title':'Жена была уверена: муж никуда не денется'}]},ensure_ascii=False).encode()
+        row={'start':0,'end':10,'title':'МУЖ И ЖЕНА МЕНЯЮТСЯ ПАРТНЁРАМИ ЭКСПЕРИМЕНТ НА ГРАНИ РАЗВОДА'}
+        with self.assertRaises(rp.PreviewError):
+            rp.find_candidates(row,[{'start':1,'text':'жена муж была никуда'}],lambda *a,**kw:Run())
+    def test_link_validation(self):
+        self.assertEqual(rp.youtube_video_id('https://www.youtube.com/watch?v=Lx_9n0PXg58'),'Lx_9n0PXg58')
+        self.assertEqual(rp.youtube_video_id('https://youtu.be/Lx_9n0PXg58?t=20'),'Lx_9n0PXg58')
+        for url in ('http://youtube.com/watch?v=Lx_9n0PXg58','https://youtube.com.evil.test/watch?v=Lx_9n0PXg58','https://youtube.com/watch?v=Lx_9n0PXg58&v=5PIZvgBGzLU'):
+            with self.assertRaises(rp.PreviewError):rp.youtube_video_id(url)
+    def test_manual_source_skips_search(self):
+        with (patch.object(pl,'check_install'),patch.object(rp,'choose_cutout',return_value=Path('x.png')),
+              patch.object(rp,'choose_style',return_value=Path('style.jpg')),
+              patch.object(rp,'find_candidates') as search,
+              patch.object(rp,'download_thumbnail',return_value=(object(),'https://example.com')) as download,
+              patch.object(pl,'generate_reaction')):
+            info=rp.generate('/unused','name',{'type':'reaction','preview_text':'ТЕПЛЫЙ ПРИЕМ'},[],Path('/unused/x.jpg'),source_url='https://www.youtube.com/watch?v=Lx_9n0PXg58')
+        search.assert_not_called();download.assert_called_once_with('Lx_9n0PXg58');self.assertTrue(info['source_manually_selected'])
