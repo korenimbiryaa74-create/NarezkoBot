@@ -293,6 +293,7 @@ class App:
         selected=self.youtube_rows.selection()
         if not selected:messagebox.showinfo('YouTube','Выберите загрузку, требующую проверки.');return
         text=('Проверьте YouTube Studio на выбранном канале. Если видео или черновик уже создан, удалите его или не повторяйте загрузку. '
+              'Если окно браузера этого профиля осталось открытым, дождитесь завершения загрузки и закройте его после проверки. '
               'Вы подтверждаете, что такого видео и черновика на канале нет и повтор не создаст дубль?')
         if not messagebox.askyesno('YouTube: проверка перед повтором',text):return
         try:
@@ -308,7 +309,8 @@ class App:
         row=next((r for r in self.service.youtube_queue.list_uploads() if str(r['id'])==selected[0]),None)
         if not row or row['state']!='needs_review':messagebox.showerror('YouTube','Эта загрузка не ожидает проверки.');return
         text=('В YouTube Studio проверьте именно канал '+row['channel_id']+', видео «'+row['title']+'», '
-              'завершение загрузки и обработки SD, публичный доступ или точную отложенную дату и время. Вы подтверждаете, что видео сохранено и настройки верны?')
+              'завершение загрузки и обработки SD, публичный доступ или точную отложенную дату и время. '
+              'После проверки закройте оставшееся открытым окно браузера этого профиля. Вы подтверждаете, что видео сохранено и настройки верны?')
         if not messagebox.askyesno('YouTube: подтверждение',text):return
         value=simpledialog.askstring('YouTube','Вставьте полную ссылку на подтверждённое видео:',parent=self.window)
         if value is None:return
