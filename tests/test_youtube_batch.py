@@ -88,6 +88,25 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','needs_review','queued'])
         self.assertFalse(Browser.last.keep_open)
 
+    def test_monitor_errors_do_not_stop_later_ready_clips(self):
+        self.queue.mark_submitted(self.first['id'],CHANNEL,'a'*11)
+        self.queue.clear_pending_uploads();self.first=None
+        calls=[];attempts=[]
+        def status(tab,channel,video,scheduled):
+            attempts.append(video)
+            if len(attempts)==12:
+                self.store.add('456','test');job=self.store.claim();self.store.finish(job['id'],'done')
+                self.queue.enqueue(job['id'],'test',[self.files[1]],now=1100)
+            if len(attempts)<=12:raise OSError('monitor unavailable')
+            return 'ready'
+        def submit(tab,browser,row,progress=None):
+            calls.append(row['job_id']);browser.keep_open=True;return 'b'*11
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',side_effect=status):
+            self.batch()
+        self.assertEqual(len(calls),1)
+        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','cancelled','cancelled','confirmed'])
+        self.assertGreaterEqual(len(attempts),14)
+
     def test_new_upload_tab_is_foregrounded_without_closing_old_tab(self):
         calls=[]
         class OldTab:

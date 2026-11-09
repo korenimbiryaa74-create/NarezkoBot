@@ -66,7 +66,7 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.retry_reviewed(second['id'])
         self.assertEqual(self.queue.claim()['id'],second['id'])
 
-    def test_uncertain_profile_blocks_other_jobs_not_other_profiles(self):
+    def test_uncertain_video_does_not_block_unrelated_jobs(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')
         self.queue.bind('b', CHANNEL_B, audience='not_kids')
         self.queue.enqueue(1,'a',self.files[:1])
@@ -78,8 +78,23 @@ class YouTubeQueueTests(unittest.TestCase):
         self.assertEqual(other['profile'],'b')
         self.queue.confirm(other['id'],CHANNEL_B,'b'*11)
         self.queue.mark_uncertain(first['id'],'check studio')
-        self.assertIsNone(self.queue.claim())
+        next_job=self.queue.claim()
+        self.assertEqual(next_job['job_id'],2)
         self.queue.confirm_reviewed(first['id'],'a'*11)
+
+    def test_submitted_from_previous_run_does_not_block_new_jobs(self):
+        self.queue.bind('a',CHANNEL_A,audience='not_kids')
+        self.queue.enqueue(1,'a',self.files[:1])
+        first=self.queue.claim();self.queue.mark_submitted(first['id'],CHANNEL_A,'a'*11)
+        self.assertEqual(self.queue.detach_previous_submitted(),1)
+        self.assertEqual(self.queue.submitted_uploads('a'),[])
+        old=self.queue.list_uploads()[0]
+        self.assertEqual(old['state'],'uploading')
+        self.assertEqual(old['tracking'],0)
+        self.assertEqual(old['video_id'],'a'*11)
+        # It is not confirmed or deleted, and the same job cannot duplicate it.
+        self.assertEqual(self.queue.enqueue(1,'a',self.files[:1]),0)
+        self.queue.enqueue(2,'a',self.files[1:2])
         self.assertEqual(self.queue.claim()['job_id'],2)
 
     def test_wait_reason_and_explicit_cancel(self):

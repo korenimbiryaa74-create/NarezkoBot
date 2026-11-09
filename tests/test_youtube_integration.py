@@ -102,6 +102,17 @@ class ServiceIntegrationTests(unittest.TestCase):
         svc.youtube_queue.cancel_reviewed_or_queued(row['id'])
         self.assertEqual(svc.youtube_queue.waiting_reason(),'')
 
+    def test_service_restart_detaches_old_tracking_without_reupload(self):
+        svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
+        old=svc.youtube_queue.claim(finished_only=True)
+        svc.youtube_queue.mark_submitted(old['id'],CHANNEL,'a'*11)
+        svc.recover_interrupted()
+        self.assertEqual(svc.youtube_queue.submitted_uploads(),[])
+        self.assertEqual(svc.youtube_queue.list_uploads()[0]['video_id'],'a'*11)
+        next_clip=svc.youtube_queue.claim(finished_only=True)
+        self.assertEqual(next_clip['clip_index'],2)
+        self.assertTrue(any('статус после перезапуска не подтверждён' in m for _,m in svc.logs()))
+
     def test_batch_failure_does_not_reopen_browser_in_a_loop(self):
         svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
         calls=[]
