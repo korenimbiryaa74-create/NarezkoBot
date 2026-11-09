@@ -33,3 +33,6 @@ banners/*
 
 # Local YouTube browser sessions contain private account credentials.
 youtube_accounts/
+
+# Local generated thumbnails and ComfyUI logs.
+preview_test/

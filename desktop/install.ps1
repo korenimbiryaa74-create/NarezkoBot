@@ -211,6 +211,8 @@ try {
     Write-Host 'Скачивание модели Whisper large-v3-turbo (~1,62 ГБ)...'
     Download-Verified 'https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo.bin' $model '1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69'
     Run-Checked -file $whisperCli -arguments @('--version')
+    . (Join-Path $PSScriptRoot 'install_preview.ps1')
+    Install-LocalPreview
     Write-Host 'Зависимости подготовлены. Сборка экспериментальная; Windows и GPU пока не проверены.' -ForegroundColor Yellow
     exit 0
 } catch {
