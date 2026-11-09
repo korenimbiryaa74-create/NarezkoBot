@@ -62,8 +62,34 @@ def local_json(url, *, method='GET'):
 class CDP:
     def __init__(self, websocket_url):
         import websocket
+        self.websocket_url=websocket_url
         self.ws=websocket.create_connection(websocket_url,timeout=30,suppress_origin=True)
         self.seq=0
+    def reconnect(self):
+        import websocket
+        self.close()
+        self.ws=websocket.create_connection(self.websocket_url,timeout=30,suppress_origin=True)
+        self.seq=0
+    @staticmethod
+    def is_disconnect(exc):
+        import websocket
+        error=getattr(websocket,'WebSocketException',None)
+        return isinstance(exc,(OSError,EOFError,TimeoutError)) or (error is not None and isinstance(exc,error))
+    def read_js(self, expression):
+        # Only callers with read-only expressions may use this. Never replay clicks,
+        # keystrokes, file selection, or publication after a lost connection.
+        try:return self.js(expression)
+        except Exception as exc:
+            if not self.is_disconnect(exc):raise
+            self.reconnect()
+            return self.js(expression)
+    def reload_monitor(self):
+        # This is only used on the read-only content-list tab.
+        try:self.call('Page.reload',ignoreCache=True)
+        except Exception as exc:
+            if not self.is_disconnect(exc):raise
+            self.reconnect()
+            self.call('Page.reload',ignoreCache=True)
     def call(self, method, **params):
         # Do not reconnect or replay a possibly delivered action.
         self.seq+=1
@@ -95,7 +121,7 @@ class CDP:
 class Browser:
     def __init__(self, root, profile):
         self.profile=Path(root)/'youtube_accounts'/profile_key(profile)/'profile'
-        self.proc=None; self.tab=None; self.monitor_tab=None; self.port=None; self.keep_open=False
+        self.proc=None; self.tab=None; self.monitor_tab=None; self.port=None; self.keep_open=False; self.upload_tabs=[]
     def __enter__(self):
         self.profile.mkdir(parents=True,exist_ok=True)
         # Reserve a random local port; Chrome refuses an already used port.
@@ -140,7 +166,26 @@ class Browser:
             time.sleep(.5)
         raise StudioError('Не удалось подключиться к странице проверки обработки')
 
+    def open_upload_tab(self,channel_id):
+        # Each submitted upload stays open while its file is transferred.
+        result=self.tab.call('Target.createTarget',url=f'https://studio.youtube.com/channel/{channel_id}?hl=en',background=True)
+        target=result.get('targetId')
+        if not target:raise StudioError('Не удалось открыть вкладку следующей загрузки')
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            try:
+                pages=local_json(f'http://127.0.0.1:{self.port}/json/list')
+                page=next((p for p in pages if p.get('id')==target and p.get('webSocketDebuggerUrl')),None)
+                if page:
+                    tab=CDP(page['webSocketDebuggerUrl']);tab.call('Runtime.enable');tab.call('DOM.enable')
+                    self.upload_tabs.append(tab);return tab
+            except (OSError,ValueError,KeyError):pass
+            time.sleep(.5)
+        raise StudioError('Не удалось подключиться к вкладке загрузки')
+
     def __exit__(self,*args):
+        for tab in self.upload_tabs:tab.close()
+        self.upload_tabs=[]
         if self.monitor_tab:self.monitor_tab.close();self.monitor_tab=None
         if self.tab:self.tab.close();self.tab=None
         if self.proc:
@@ -291,7 +336,10 @@ _RECEIPT_STATE = r"""(()=>{
   const dialogs=[...document.querySelectorAll('ytcp-dialog,ytcp-confirm-dialog,tp-yt-paper-dialog,[role="dialog"]')];
   const warning=dialogs.some(e=>visible(e)&&!e.matches('ytcp-uploads-dialog')&&
     /(?:проверка видео ещ[её] продолжается|проверки видео ещ[её] продолжаются|your video is still being checked|video.{0,30}still.{0,20}(?:being checked|checking)|checks?.{0,25}still.{0,20}(?:running|in progress))/i.test(e.innerText||''));
-  return {links,warning};
+  const processing=dialogs.some(e=>visible(e)&&!e.matches('ytcp-uploads-dialog')&&
+    /(?:обработка видео|video processing)/i.test(e.innerText||'')&&
+    /(?:после того как завершится обработка видео|будет опубликовано|after.{0,100}processing|will be published)/i.test(e.innerText||''));
+  return {links,warning,processing};
 })()"""
 
 _CONFIRM_CHECKS_WARNING = r"""(()=>{
@@ -336,7 +384,7 @@ def monitor_status(tab,channel_id,video_id,scheduled):
         : lines.some(x=>/^(?:public|для всех|открытый доступ)$/.test(x)) && lines.some(x=>/^(?:published|опубликовано)$/.test(x));
       return {url:location.href,state:good?'ready':'unknown'};
     })()""".replace('__ID__',json.dumps(video_id)).replace('__SCHEDULED__','true' if scheduled else 'false')
-    result=tab.js(script) or {}
+    result=(tab.read_js(script) if hasattr(tab,'read_js') else tab.js(script)) or {}
     if channel_from_url(result.get('url',''))!=channel_id:
         return 'unknown'
     return result.get('state','unknown')
@@ -348,7 +396,7 @@ def wait_for_receipt(tab, progress=None, timeout=7200, *, browser=None, channel_
     next_report=time.monotonic()+60; refresh_at=time.monotonic()+60
     monitor=None; video_id=candidate_id; monitor_errors=0
     while time.monotonic()<deadline:
-        state=tab.js(_RECEIPT_STATE) or {}
+        state=(tab.read_js(_RECEIPT_STATE) if hasattr(tab,'read_js') else tab.js(_RECEIPT_STATE)) or {}
         if state.get('links') is not None:
             ids={video_from_url(x) for x in state['links']};ids.discard(None)
             if len(ids)>1:raise StudioError('В Studio несколько ссылок на видео; проверьте загрузку')
@@ -379,7 +427,9 @@ def wait_for_receipt(tab, progress=None, timeout=7200, *, browser=None, channel_
                 if progress:progress('YouTube показал обработанное видео с нужным доступом')
                 return video_id
             if time.monotonic()>=refresh_at:
-                monitor.call('Page.reload',ignoreCache=True);refresh_at=time.monotonic()+60
+                if hasattr(monitor,'reload_monitor'):monitor.reload_monitor()
+                else:monitor.call('Page.reload',ignoreCache=True)
+                refresh_at=time.monotonic()+60
         elif video_id and browser is None:
             # Unit test / backwards-compatible utility; real uploads always pass browser.
             return video_id
@@ -388,6 +438,30 @@ def wait_for_receipt(tab, progress=None, timeout=7200, *, browser=None, channel_
             next_report=time.monotonic()+60
         time.sleep(2)
     raise StudioError('Не подтверждены загрузка, обработка и доступ; браузер оставлен открытым, проверьте Studio перед повтором')
+
+
+def wait_for_submission(tab, candidate_id=None, progress=None, timeout=300):
+    """Require Studio's post-publication dialog and exact video ID, not SD completion."""
+    deadline=time.monotonic()+timeout;attempted=False;video_id=candidate_id
+    while time.monotonic()<deadline:
+        state=tab.js(_RECEIPT_STATE) or {}
+        if state.get('warning'):
+            if not attempted:
+                attempted=True;result=tab.js(_CONFIRM_CHECKS_WARNING)
+                if result!='clicked':raise StudioError('Не удалось однозначно подтвердить предупреждение; проверьте Studio')
+                if progress:progress('Подтверждена публикация до завершения проверки')
+            time.sleep(1);continue
+        if state.get('links') is not None:
+            ids={video_from_url(x) for x in state['links']};ids.discard(None)
+            if len(ids)>1:raise StudioError('В Studio несколько ссылок на видео')
+            if ids:
+                found=ids.pop()
+                if video_id and video_id!=found:raise StudioError('ID видео в подтверждении не совпал')
+                video_id=found
+            if video_id:return video_id
+        if state.get('processing') and video_id:return video_id
+        time.sleep(1)
+    raise StudioError('Studio не подтвердила отправку; проверьте видео перед повтором')
 
 
 class YouTubeStudio:
@@ -399,6 +473,93 @@ class YouTubeStudio:
                 if not ready_event.wait(timeout):
                     raise StudioError('Время входа истекло; повторите подключение')
                 return channel_ready(tab,timeout=30)
+    def submit(self,tab,browser,row,progress=None):
+        expected=row['channel_id']; channel_ready(tab,expected)
+        click(tab,'ytcp-header .ytcpAppHeaderCreateIcon')
+        click(tab,'tp-yt-paper-item[test-id="upload"]')
+        wait(tab,"!!document.querySelector('ytcp-uploads-dialog input[type=file]')",30,'Не найден выбор видео')
+        channel_ready(tab,expected,timeout=5)
+        # Selecting the file creates a draft; queue must already say uploading.
+        browser.keep_open=True  # a draft/upload may be created even if the next action fails
+        attach_file(tab,row['file_path'])
+        if progress:progress('Файл передан; ожидаю загрузку и настройки')
+        title_selector=wait_for_title(tab,progress=progress)
+        tab.fill(title_selector,row['title'])
+        audience={'kids':'VIDEO_MADE_FOR_KIDS_MFK','not_kids':'VIDEO_MADE_FOR_KIDS_NOT_MFK'}.get(row['audience'])
+        if not audience: raise StudioError('Аудитория не подтверждена')
+        radio='tp-yt-paper-radio-button[name="'+audience+'"]'
+        click(tab,radio)
+        if not selected(tab,radio):raise StudioError('YouTube не подтвердил выбор аудитории')
+        for _ in range(3):
+            click(tab,'ytcp-uploads-dialog #next-button button',timeout=600)
+            time.sleep(2)
+        wait(tab,"!!(document.querySelector('tp-yt-paper-radio-button[name=PUBLIC]')||document.querySelector('#schedule-radio-button'))",30,'Не открылись настройки доступа')
+        if row['publish_at'] is None:
+            radio='tp-yt-paper-radio-button[name="PUBLIC"]'
+            click(tab,radio)
+            if not selected(tab,radio):raise StudioError('YouTube не подтвердил публичный доступ')
+        else:
+            set_schedule(tab,row['publish_at'])
+        channel_ready(tab,expected,timeout=5)
+        candidate=upload_video_id(tab)
+        # The enabled button can precede upload/check completion.
+        click(tab,'ytcp-uploads-dialog #done-button button',timeout=1800)
+        if progress:progress('Запрос публикации отправлен; ожидаю подтверждение Studio')
+        return wait_for_submission(tab,candidate_id=candidate,progress=progress)
+
+    def upload_batch(self, queue, first, profile, channel_id, stop_event, progress, on_confirm):
+        """Submit all ready clips in separate tabs, then wait for every exact ID."""
+        with _LOCK:
+            browser=Browser(self.root,profile)
+            # Already submitted videos must never be interrupted by an error.
+            browser.keep_open=bool(queue.submitted_uploads(profile))
+            with browser as tab:
+                current=first;used=False;monitor=None;last_report=0;last_refresh=time.monotonic()+30;monitor_errors=0
+                while not stop_event.is_set():
+                    if current is not None:
+                        progress(current['id'],'загрузка на канал '+channel_id)
+                        try:
+                            upload_tab=tab if not used else browser.open_upload_tab(channel_id)
+                            used=True
+                            video_id=self.submit(upload_tab,browser,current,progress=lambda msg:progress(current['id'],msg))
+                            queue.mark_submitted(current['id'],channel_id,video_id)
+                        except Exception as exc:
+                            detail=str(exc)[:400] if isinstance(exc,StudioError) else 'Ошибка связи с браузером'
+                            queue.mark_uncertain(current['id'],type(exc).__name__+': '+detail)
+                            raise
+                        progress(current['id'],'отправлено в Studio; обработка продолжится параллельно')
+                        current=None
+                    current=queue.claim(finished_only=True,profile=profile)
+                    if current is not None:continue
+                    pending=queue.submitted_uploads(profile)
+                    if not pending:
+                        browser.keep_open=False
+                        return
+                    if monitor is None:
+                        channel_ready(tab,channel_id)
+                        monitor=browser.open_monitor(channel_id)
+                        progress(pending[0]['id'],f'Все доступные ролики отправлены; ожидаю обработку: {len(pending)}. Не закрывайте Chrome')
+                    try:
+                        for row in pending:
+                            if monitor_status(monitor,channel_id,row['video_id'],row['publish_at'] is not None)=='ready':
+                                queue.confirm(row['id'],channel_id,row['video_id'])
+                                on_confirm(row['id'],row['video_id'])
+                        if time.monotonic()>=last_refresh:
+                            if hasattr(monitor,'reload_monitor'):monitor.reload_monitor()
+                            else:monitor.call('Page.reload',ignoreCache=True)
+                            last_refresh=time.monotonic()+30
+                        monitor_errors=0
+                    except Exception:
+                        monitor_errors+=1
+                        if monitor_errors>=10:raise StudioError('Потеряна связь с окном обработки; отправленные видео не будут загружены повторно')
+                    if time.monotonic()-last_report>=60:
+                        left=len(queue.submitted_uploads(profile))
+                        if left:progress(pending[0]['id'],f'Ожидаю загрузку и обработку {left} видео; не закрывайте Chrome')
+                        last_report=time.monotonic()
+                    stop_event.wait(5)
+                # Leave the browser open; submitted video IDs survive a restart.
+                browser.keep_open=True
+
     def upload(self,row,progress=None):
         with _LOCK:
             browser=Browser(self.root,row['profile'])

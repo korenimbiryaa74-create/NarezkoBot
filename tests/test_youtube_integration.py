@@ -115,6 +115,23 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertFalse(svc.youtube_once())
 
 class BrowserFlowTests(unittest.TestCase):
+    def test_read_only_reconnect_never_replays_actions(self):
+        class Socket:
+            def close(self):pass
+        class WebSocketFailure(Exception):pass
+        ws=stub('websocket',WebSocketException=WebSocketFailure,create_connection=lambda *a,**k:Socket())
+        with patch.dict(sys.modules,{'websocket':ws}):
+            tab=studio.CDP('ws://127.0.0.1/test')
+            with patch.object(tab,'js',side_effect=[ConnectionAbortedError('lost'),{'state':'ready'}]) as read,patch.object(tab,'reconnect') as reconnect:
+                self.assertEqual(tab.read_js('read-only'),{'state':'ready'})
+                self.assertEqual(read.call_count,2);reconnect.assert_called_once()
+            with patch.object(tab,'js',side_effect=studio.StudioError('bad expression')),patch.object(tab,'reconnect') as reconnect:
+                with self.assertRaises(studio.StudioError):tab.read_js('read-only')
+                reconnect.assert_not_called()
+            with patch.object(tab,'call',side_effect=ConnectionAbortedError('lost')) as action,patch.object(tab,'reconnect') as reconnect:
+                with self.assertRaises(ConnectionAbortedError):tab.key('a','KeyA')
+                self.assertEqual(action.call_count,1);reconnect.assert_not_called()
+
     def test_channel_url_validation(self):
         self.assertEqual(studio.channel_from_url('https://studio.youtube.com/channel/'+CHANNEL+'/videos'),CHANNEL)
         for url in ('https://evil.example/channel/'+CHANNEL,'https://studio.youtube.com.evil.example/channel/'+CHANNEL,'http://studio.youtube.com/channel/'+CHANNEL):
