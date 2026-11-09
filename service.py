@@ -275,29 +275,44 @@ class Service:
     def youtube_once(self):
         enabled=self.settings.load().get('youtube',{}).get('enabled')
         row=self.youtube_queue.claim(finished_only=True) if enabled else None
-        if not row:
+        pending=self.youtube_queue.submitted_uploads() if enabled else []
+        if not row and not pending:
             message=self.youtube_queue.waiting_reason(enabled=bool(enabled))
             if message and message!=self._youtube_wait_message:self.log(message)
             self._youtube_wait_message=message
             return False
         self._youtube_wait_message=''
-        try:
-            self.log(f"YouTube №{row['id']}: загрузка на канал {row['channel_id']}")
-            video_id=self.youtube_studio.upload(row,progress=lambda message:self.log(f"YouTube №{row['id']}: {message}"))
-            self.youtube_queue.confirm(row['id'],row['channel_id'],video_id)
-        except Exception as exc:
-            # Even selecting a file can create a draft. Never retry blindly.
-            detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
-            self.youtube_queue.mark_uncertain(row['id'],detail)
-            self.store.notify(f"YouTube №{row['id']}: требуется проверка YouTube Studio перед повтором. Если браузер остался открыт, дождитесь завершения загрузки.")
-            self.log(f"YouTube №{row['id']}: остановлено — {detail}")
+        # The fallback keeps compatibility with alternate uploader implementations.
+        if not hasattr(self.youtube_studio,'upload_batch'):
+            if not row:return False
+            try:
+                self.log(f"YouTube №{row['id']}: загрузка на канал {row['channel_id']}")
+                vid=self.youtube_studio.upload(row,progress=lambda msg:self.log(f"YouTube №{row['id']}: {msg}"))
+                self.youtube_queue.confirm(row['id'],row['channel_id'],vid)
+            except Exception as exc:
+                detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
+                self.youtube_queue.mark_uncertain(row['id'],detail)
+                self.log(f"YouTube №{row['id']}: остановлено — {detail}")
+                return True
+            self.log(f"YouTube №{row['id']}: подтверждено https://youtu.be/{vid}")
             return True
-        # A notification failure must not undo or misclassify a confirmed upload.
+        anchor=row or pending[0]
+        def progress(upload_id,message):self.log(f'YouTube №{upload_id}: {message}')
+        def confirmed(upload_id,video_id):
+            self.log(f'YouTube №{upload_id}: подтверждено https://youtu.be/{video_id}')
+            try:self.store.notify(f'YouTube: нарезка №{upload_id} принята: https://youtu.be/{video_id}')
+            except Exception:self.log(f'YouTube №{upload_id}: не удалось сохранить уведомление')
         try:
-            self.store.notify(f"YouTube: нарезка №{row['id']} принята: https://youtu.be/{video_id}")
-        except Exception:
-            self.log(f"YouTube №{row['id']}: не удалось сохранить уведомление")
-        self.log(f"YouTube №{row['id']}: подтверждено https://youtu.be/{video_id}")
+            self.youtube_studio.upload_batch(self.youtube_queue,row,anchor['profile'],anchor['channel_id'],self.stop_event,progress,confirmed)
+        except Exception as exc:
+            detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
+            if row:
+                current=next((r for r in self.youtube_queue.list_uploads() if r['id']==row['id']),None)
+                if current and current['state']=='uploading' and not current.get('submitted'):
+                    self.youtube_queue.mark_uncertain(row['id'],detail)
+            self.log('YouTube: пакет остановлен — '+detail+'; проверьте Studio, не повторяйте загрузку вслепую')
+            self.store.notify('YouTube: пакет остановлен; проверьте Studio перед повтором.')
+            self.stop_event.wait(15)
         return True
 
     def _youtube_loop(self):
