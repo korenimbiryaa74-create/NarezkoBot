@@ -72,7 +72,7 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertEqual([u['title'] for u in uploads],['clip 0','clip 1','clip 2'])
         calls=[]
         class Uploader:
-            def upload(self,row):calls.append(row);return 'a'*11
+            def upload(self,row,progress=None):calls.append(row);return 'a'*11
         svc.youtube_studio=Uploader()
         self.assertTrue(svc.youtube_once())
         self.assertEqual(calls[0]['channel_id'],CHANNEL)
@@ -86,7 +86,7 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertTrue(svc.worker_once())
         self.assertEqual([r['publish_at'] for r in svc.youtube_queue.list_uploads()],[None]*3)
         class Broken:
-            def upload(self,row): raise RuntimeError('connection lost')
+            def upload(self,row,progress=None): raise RuntimeError('connection lost')
         svc.youtube_studio=Broken()
         self.assertTrue(svc.youtube_once())
         self.assertFalse(svc.youtube_once())
@@ -98,7 +98,7 @@ class ServiceIntegrationTests(unittest.TestCase):
         p=self.root/'one.mp4';p.write_bytes(b'v')
         svc.youtube_queue.enqueue(job['id'],'kussia88',[p])
         class Upload:
-            def upload(self,row):raise AssertionError('must not upload')
+            def upload(self,row,progress=None):raise AssertionError('must not upload')
         svc.youtube_studio=Upload()
         self.assertFalse(svc.youtube_once())
         svc.store.finish(job['id'],'failed')
@@ -118,6 +118,28 @@ class BrowserFlowTests(unittest.TestCase):
         with self.assertRaises(studio.StudioError):studio.local_schedule_timestamp(9999999999,'no timezone',now=1)
         with self.assertRaises(studio.StudioError):studio.local_schedule_timestamp(100,'UTC+00:00',now=99)
 
+    def test_check_prompt_is_confirmed_only_once_then_receipt(self):
+        messages=[]
+        class Tab:
+            def __init__(self):self.states=iter([{'links':None,'warning':True},{'links':None,'warning':True},
+                {'links':['https://youtu.be/'+'a'*11],'warning':False}]);self.clicks=0
+            def js(self,script):
+                if script==studio._CONFIRM_CHECKS_WARNING:self.clicks+=1;return 'clicked'
+                return next(self.states)
+        tab=Tab()
+        with patch.object(studio.time,'sleep'):
+            self.assertEqual(studio.wait_for_receipt(tab,progress=messages.append,timeout=10),'a'*11)
+        self.assertEqual(tab.clicks,1);self.assertEqual(len(messages),1)
+
+    def test_receipt_and_warning_must_be_unambiguous(self):
+        class Tab:
+            def __init__(self,ambiguous=False):self.ambiguous=ambiguous
+            def js(self,script):
+                if self.ambiguous:return 'ambiguous' if script==studio._CONFIRM_CHECKS_WARNING else {'links':None,'warning':True}
+                return {'links':['https://youtu.be/'+'a'*11,'https://youtu.be/'+'b'*11],'warning':False}
+        for ambiguous in (False,True):
+            with self.assertRaises(studio.StudioError):studio.wait_for_receipt(Tab(ambiguous),timeout=10)
+
     def test_public_and_scheduled_go_through_distinct_visibility_steps(self):
         class Tab:
             def fill(self,*args): pass
@@ -127,7 +149,7 @@ class BrowserFlowTests(unittest.TestCase):
             return ['https://youtu.be/'+'a'*11] if 'ytcp-video-share-dialog' in expr else True
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
         obj=studio.YouTubeStudio('/tmp')
-        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
             self.assertEqual(obj.upload(row),'a'*11)
             self.assertIn('tp-yt-paper-radio-button[name="PUBLIC"]',calls)
             schedule.assert_not_called()

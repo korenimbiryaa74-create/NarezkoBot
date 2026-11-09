@@ -54,6 +54,9 @@ class BlurFilterTests(unittest.TestCase):
     def test_actual_crop_at_edge_small_chroma_plane(self):
         # Requested 20px crop is clipped to 18px by FFmpeg at frame edge.
         graph=banner_blur.filter_for_chunk([(46,0,20,20,[(0,1)])])
+        # Strictly less than half, including FFmpeg builds rejecting equality.
+        self.assertIn('floor((min(w,h)-1)/2)',graph)
+        self.assertIn('floor((min(cw,ch)-1)/2)',graph)
         result=subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=size=64x64:rate=1',
             '-vf',graph,'-frames:v','1','-f','null','-'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)

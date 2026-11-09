@@ -279,7 +279,7 @@ class Service:
         if not row: return False
         try:
             self.log(f"YouTube №{row['id']}: загрузка на канал {row['channel_id']}")
-            video_id=self.youtube_studio.upload(row)
+            video_id=self.youtube_studio.upload(row,progress=lambda message:self.log(f"YouTube №{row['id']}: {message}"))
             self.youtube_queue.confirm(row['id'],row['channel_id'],video_id)
         except Exception as exc:
             # Even selecting a file can create a draft. Never retry blindly.
