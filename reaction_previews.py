@@ -144,24 +144,34 @@ def render_preview(background,cutout,label,destination):
         if os.path.exists(tmp):os.unlink(tmp)
     return dest
 
-def generate(root,login,row,segs,output,cancel=None):
+def choose_style(root,login):
+    if not re.fullmatch(r'[a-z0-9_]{1,25}',str(login)):raise PreviewError('Укажите Twitch-логин стримера для превью')
+    folder=Path(root)/'thumbnail_styles'
+    files=[folder/(login+ext) for ext in ('.png','.jpg','.jpeg') if (folder/(login+ext)).is_file() and not (folder/(login+ext)).is_symlink()]
+    if len(files)!=1:raise PreviewError(f'Нужен один пример стиля: thumbnail_styles/{login}.jpg или .png')
+    return files[0]
+
+
+def generate(root,login,row,segs,output,cancel=None,status=None):
     if row.get('type')!='reaction':raise PreviewError('Превью пока только для реакций')
     label=row.get('preview_text') or ''
-    if not label:raise PreviewError('Нет надписи для превью в ответе ChatGPT; проверьте ответ вручную')
-    warnings=[]
+    if not isinstance(label,str) or not label.strip():raise PreviewError('Нет надписи для превью в ответе ChatGPT; проверьте ответ вручную')
+    import preview_local
+    preview_local.check_install(root)  # Fail before performing any network search.
+    cutout=choose_cutout(root,login,row);style=choose_style(root,login)
+    warnings=['ИИ может изменить лицо, оригинальную картинку и буквы. Обязательно проверьте результат.']
     if len(label)>32 or len(label.split())>4:
         warnings.append('Надпись длиннее 4 слов или 32 символов: проверьте и сократите вручную')
-    cutout=choose_cutout(root,login,row)
     candidates,queries_used=find_candidates(row,segs,cancel=cancel) if cancel else find_candidates(row,segs)
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
     source=candidates[0];image,url=download_thumbnail(source['id'])
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
-    render_preview(image,cutout,label,output)
-    # Candidate ranking is heuristic; never label it as a confirmed match.
+    preview_local.generate_reaction(root,cutout,style,image,label,output,progress=status or (lambda _:None),cancel=cancel)
     return {'status':'требует проверки','source_url':'https://www.youtube.com/watch?v='+source['id'],
             'image_url':url,'source_title':source['title'],'source_channel':source['channel'],
             'search_queries':queries_used,'candidates':candidates[:6],
-            'cutout':cutout.name,'preview_text':label,'warnings':warnings}
+            'cutout':cutout.name,'style_reference':style.name,'preview_text':label,'warnings':warnings,
+            'generator':'FLUX 3 Image Klein (локально)', 'text_unverified':True}
 
 
 def _cached_label(root, row):
@@ -231,7 +241,7 @@ def prepare_saved_clip(root, video, test_login=''):
             if m<60 and s<60 and t<=duration:segs.append({'start':t,'text':match.group(4)})
     if not segs:raise PreviewError('В транскрипте нарезки не найдены реплики с таймкодами')
     local_row=dict(row,start=0.0,end=duration+1,preview_text=label.strip())
-    target=video.with_name(video.stem+' — превью.jpg')
+    target=video.with_name(video.stem+' — ИИ-превью.jpg')
     return {'video':video,'login':login,'row':local_row,'segs':segs,'target':target,'report':target.with_suffix('.json')}
 
 
@@ -250,7 +260,7 @@ def generate_saved_clip(root, video, test_login='', cancel=None, status=None):
     if report.exists():raise PreviewError('Найден отчёт без превью; не перезаписываю существующий файл')
     if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
     status('Ищу исходное видео и собираю превью; надпись взята из сохранённого ответа')
-    info=generate(root,data['login'],data['row'],data['segs'],target,cancel=cancel)
+    info=generate(root,data['login'],data['row'],data['segs'],target,cancel=cancel,status=status)
     fd,tmp=tempfile.mkstemp(prefix='.preview-report-',suffix='.json',dir=report.parent)
     try:
         with os.fdopen(fd,'w',encoding='utf8') as f:json.dump(info,f,ensure_ascii=False,indent=2);f.flush();os.fsync(f.fileno())
