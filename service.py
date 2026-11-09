@@ -34,6 +34,8 @@ class Service:
         if any(t.is_alive() for t in self._threads): return 0
         interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов','Готово'))
         youtube_interrupted=self.youtube_queue.recover_interrupted()
+        detached=self.youtube_queue.detach_previous_submitted()
+        if detached:self.log(f'YouTube: прежних отправленных видео {detached}; статус после перезапуска не подтверждён, новые публикации не блокируются')
         if youtube_interrupted:
             self.log(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором')
             self.store.notify(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором.')
@@ -44,7 +46,7 @@ class Service:
     def start(self):
         if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
         self.recover_interrupted()
-        self.stop_event.clear(); self._youtube_wait_message=''
+        self.stop_event.clear(); self._youtube_wait_message=''; self._youtube_batch_blocked.clear()
         with self._lock:
             self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
@@ -238,9 +240,9 @@ class Service:
                     raise ValueError('Сначала привяжите канал YouTube и укажите аудиторию')
                 # Temporarily publish with the existing filenames; no additional
                 # ChatGPT request is made to generate titles.
-                progress('Очередь YouTube','Добавление готовых видео в очередь YouTube')
+                progress('Публикация YouTube','Подготовка готовых видео к публикации')
                 added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')))
-                self.log(f"VOD {job['vod_id']}: в очередь YouTube добавлено {added}")
+                self.log(f"VOD {job['vod_id']}: подготовлено к публикации на YouTube: {added}")
             name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
             notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих моментов не найдено.'
             self.store.finish(job['id'],'done',f"Видео: {count}; {outcome['folder']}",notification=notice)

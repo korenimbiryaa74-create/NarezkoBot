@@ -60,6 +60,8 @@ class YouTubeQueue:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
             if 'submitted' not in columns:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN submitted INTEGER NOT NULL DEFAULT 0")
+            if 'tracking' not in columns:
+                db.execute("ALTER TABLE youtube_uploads ADD COLUMN tracking INTEGER NOT NULL DEFAULT 1")
 
     @contextmanager
     def _connect(self):
@@ -86,7 +88,7 @@ class YouTubeQueue:
             db.execute('BEGIN IMMEDIATE')
             existing = db.execute('SELECT channel_id FROM youtube_profiles WHERE profile=?', (profile,)).fetchone()
             if existing and existing['channel_id'] != channel_id:
-                pending = db.execute("SELECT 1 FROM youtube_uploads WHERE profile=? AND state IN ('queued','uploading','needs_review') LIMIT 1", (profile,)).fetchone()
+                pending = db.execute("SELECT 1 FROM youtube_uploads WHERE profile=? AND (state IN ('queued','needs_review') OR (state='uploading' AND tracking=1)) LIMIT 1", (profile,)).fetchone()
                 if pending:
                     db.rollback()
                     raise ValueError('Нельзя менять канал, пока есть незавершённые публикации')
@@ -182,7 +184,7 @@ class YouTubeQueue:
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index
                     AND prior.state NOT IN ('confirmed','cancelled') AND NOT (prior.state='uploading' AND prior.submitted=1))
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads blocking WHERE blocking.profile=u.profile
-                    AND (blocking.state='needs_review' OR (blocking.state='uploading' AND blocking.submitted=0)))
+                    AND blocking.state='uploading' AND blocking.submitted=0)
                 ORDER BY u.id LIMIT 1''',params).fetchone()
             if row is None:
                 db.commit()
@@ -223,7 +225,7 @@ class YouTubeQueue:
 
     def submitted_uploads(self, profile=None):
         with self._connect() as db:
-            where="state='uploading' AND submitted=1 AND video_id IS NOT NULL"
+            where="state='uploading' AND submitted=1 AND tracking=1 AND video_id IS NOT NULL"
             params=()
             if profile is not None:where+=' AND profile=?';params=(profile_key(profile),)
             return [dict(r) for r in db.execute('SELECT * FROM youtube_uploads WHERE '+where+' ORDER BY id',params)]
@@ -261,6 +263,15 @@ class YouTubeQueue:
         with self._connect() as db:
             cur = db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE state='uploading' AND submitted=0",
                              ('Прервано: проверьте YouTube Studio перед повтором',now))
+            return cur.rowcount
+
+    def detach_previous_submitted(self, *, now=None):
+        """Stop tracking receipts from before a restart; never re-upload or delete them."""
+        now=time.time() if now is None else float(now)
+        with self._connect() as db:
+            cur=db.execute("""UPDATE youtube_uploads SET tracking=0,
+                detail='Отправлено до перезапуска; статус в Studio не подтверждён',updated_at=?
+                WHERE state='uploading' AND submitted=1 AND tracking=1""", (now,))
             return cur.rowcount
 
     def list_profiles(self):
@@ -308,7 +319,7 @@ class YouTubeQueue:
             if not enabled:return 'YouTube: загрузка отключена в настройках; задания остаются в очереди'
             blocked=db.execute("""SELECT b.id,b.profile FROM youtube_uploads b
                 WHERE b.state='needs_review' AND EXISTS
-                (SELECT 1 FROM youtube_uploads q WHERE q.profile=b.profile AND q.state='queued')
+                (SELECT 1 FROM youtube_uploads q WHERE q.job_id=b.job_id AND q.clip_index>b.clip_index AND q.state='queued')
                 ORDER BY b.id LIMIT 1""").fetchone()
             if blocked:
                 return (f"YouTube: профиль {blocked['profile']} ожидает проверки загрузки №{blocked['id']}; "
