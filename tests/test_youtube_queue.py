@@ -95,6 +95,26 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.confirm(second['id'],CHANNEL_A,'a'*11)
         with self.assertRaises(ValueError):self.queue.cancel_reviewed_or_queued(second['id'])
 
+    def test_clear_pending_keeps_uploading_and_confirmed(self):
+        self.queue.bind('a',CHANNEL_A,audience='not_kids')
+        self.queue.bind('b',CHANNEL_B,audience='not_kids')
+        self.queue.bind('c','UC'+'c'*22,audience='not_kids')
+        self.queue.enqueue(1,'a',self.files[:2])
+        self.queue.enqueue(2,'b',self.files[2:3])
+        self.queue.enqueue(3,'c',self.files[3:4])
+        first=self.queue.claim();self.queue.mark_uncertain(first['id'],'uncertain')
+        second=self.queue.claim();self.queue.confirm(second['id'],CHANNEL_B,'a'*11)
+        third=self.queue.claim()
+        self.assertEqual(third['profile'],'c')
+        self.assertEqual(self.queue.clear_pending_uploads(),2)
+        rows=self.queue.list_uploads()
+        self.assertEqual([r['state'] for r in rows],['cancelled','cancelled','confirmed','uploading'])
+        self.assertEqual(self.queue.clear_pending_uploads(),0)
+        self.assertIsNone(self.queue.claim())
+        # Cancelled records prevent silently re-enqueueing the same source job.
+        self.assertEqual(self.queue.enqueue(1,'a',self.files[:2]),0)
+        self.queue.confirm(third['id'],'UC'+'c'*22,'b'*11)
+
     def test_verified_receipt_and_channel_protection(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')
         with self.assertRaises(ValueError): self.queue.bind('b', CHANNEL_A)

@@ -288,6 +288,13 @@ class YouTubeQueue:
                 ('Отменено пользователем после проверки Studio',time.time(),upload_id))
             if cur.rowcount != 1:raise ValueError('Можно отменить только ожидающую или требующую проверки запись')
 
+    def clear_pending_uploads(self):
+        """Cancel pending/review records atomically; never touch active or confirmed uploads."""
+        with self._connect() as db:
+            cur=db.execute("UPDATE youtube_uploads SET state='cancelled',detail=?,updated_at=? WHERE state IN ('queued','needs_review')",
+                ('Отменено пользователем при очистке очереди YouTube',time.time()))
+            return cur.rowcount
+
     def list_uploads(self):
         with self._connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM youtube_uploads ORDER BY id')]
