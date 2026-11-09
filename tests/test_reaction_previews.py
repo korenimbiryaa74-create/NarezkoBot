@@ -8,6 +8,7 @@ import pipeline
 import reactions
 import settings
 import reaction_previews as rp
+import preview_local as pl
 from chatgpt_finder import ChatGPTFinder
 
 class Tests(unittest.TestCase):
@@ -26,15 +27,16 @@ class Tests(unittest.TestCase):
                      'ПОПАЛИСЬ ГОЛУБЧИКИ', '«стример смотрит»', 'не выдумывай'):
             self.assertIn(text,prompt)
 
-    def test_long_labels_flagged_not_silently_truncated(self):
+    def test_long_labels_reach_local_model_without_truncation(self):
         label='ПОЛИЦИЯ РАЗБИРАЕТСЯ С БЫТОВЫМИ ВЫЗОВАМИ'
-        with (patch.object(rp,'choose_cutout',return_value=Path('x.png')),
+        with (patch.object(pl,'check_install'),patch.object(rp,'choose_cutout',return_value=Path('x.png')),
+             patch.object(rp,'choose_style',return_value=Path('style.jpg')),
              patch.object(rp,'find_candidates',return_value=([{'id':'6EH2wmSPbMA','title':'x','channel':'y'}],[])),
              patch.object(rp,'download_thumbnail',return_value=(object(),'https://example.com')),
-             patch.object(rp,'render_preview') as render):
+             patch.object(pl,'generate_reaction') as render):
             info=rp.generate('/unused','name',{'type':'reaction','preview_text':label},[],Path('/unused/x.jpg'))
-        self.assertEqual(info['preview_text'],label);self.assertTrue(info['warnings'])
-        self.assertEqual(render.call_args.args[2],label)
+        self.assertEqual(info['preview_text'],label);self.assertTrue(info['warnings']);self.assertTrue(info['text_unverified'])
+        self.assertEqual(render.call_args.args[4],label)
 
     def test_search_uses_only_relevant_snippets_not_entire_stream(self):
         row={'start':10.,'end':30.,'title':'НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}
@@ -87,8 +89,8 @@ class Tests(unittest.TestCase):
             with patch.object(pipeline,'media_duration',return_value=60),patch.object(rp,'generate',side_effect=generate):
                 result=engine.run({'vod_id':'123','streamer':'kussia88'},cfg,lambda *a:progress.append(a))
             self.assertEqual(len(result['outputs']),2);self.assertEqual(seen,[('kussia88','reaction')])
-            self.assertEqual(len(list(Path(result['folder']).glob('* — превью.jpg'))),1)
-            self.assertEqual(len(list(Path(result['folder']).glob('* — превью.json'))),1)
+            self.assertEqual(len(list(Path(result['folder']).glob('* — ИИ-превью.jpg'))),1)
+            self.assertEqual(len(list(Path(result['folder']).glob('* — ИИ-превью.json'))),1)
             self.assertTrue(any('требует проверки' in x[1] for x in progress))
 
     def test_local_test_passes_configured_streamer_not_test_placeholder(self):
@@ -130,7 +132,7 @@ class SavedClipTests(unittest.TestCase):
         self.assertEqual(prepared['row']['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
         self.assertEqual(prepared['row']['start'],0)
         self.assertEqual(prepared['segs'][0]['start'],5)
-        def generate(root,login,row,segs,target,cancel=None):
+        def generate(root,login,row,segs,target,cancel=None,status=None):
             self.assertEqual(login,'kussia88');self.assertEqual(row['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
             target.write_bytes(b'jpg')
             return {'source_url':'https://example.org/test','preview_text':row['preview_text'],'warnings':[]}
@@ -152,13 +154,91 @@ class SavedClipTests(unittest.TestCase):
         self.row.update(type='discussion',preview_text='НЕ НАДО');self.write_metadata()
         with self.assertRaisesRegex(rp.PreviewError,'не отмечена как реакция'):rp.prepare_saved_clip(self.root,self.clip,'kussia88')
     def test_existing_without_report_does_not_claim_text(self):
-        target=self.clip.with_name(self.clip.stem+' — превью.jpg');target.write_bytes(b'previous')
+        target=self.clip.with_name(self.clip.stem+' — ИИ-превью.jpg');target.write_bytes(b'previous')
         with patch.object(rp,'generate') as generate:
             result=rp.generate_saved_clip(self.root,self.clip,'kussia88')
         generate.assert_not_called();self.assertEqual(result['preview_text'],'');self.assertEqual(target.read_bytes(),b'previous')
     def test_report_alone_is_not_overwritten(self):
-        report=self.clip.with_name(self.clip.stem+' — превью.json');report.write_text('{}',encoding='utf8')
+        report=self.clip.with_name(self.clip.stem+' — ИИ-превью.json');report.write_text('{}',encoding='utf8')
         with self.assertRaisesRegex(rp.PreviewError,'отчёт без превью'):rp.generate_saved_clip(self.root,self.clip,'kussia88')
         self.assertEqual(report.read_text(encoding='utf8'),'{}')
+
+class LocalModelGraphTests(unittest.TestCase):
+    def test_three_reference_roles_and_headline_in_model_prompt(self):
+        graph=pl.build_reaction_graph('style.png','person.png','source.png','ВЗЛОМАЛИ ДВЕРЬ',42)
+        self.assertEqual(graph['4']['inputs']['image'],'style.png')
+        self.assertEqual(graph['14']['inputs']['image'],'person.png')
+        self.assertEqual(graph['15']['inputs']['image'],'source.png')
+        for node in ('7','12'):
+            self.assertEqual(graph[node]['inputs']['images.image0'],['4',0])
+            self.assertEqual(graph[node]['inputs']['images.image1'],['14',0])
+            self.assertEqual(graph[node]['inputs']['images.image2'],['15',0])
+        prompt=graph['13']['inputs']['prompt']
+        for part in ('ВЗЛОМАЛИ ДВЕРЬ','<ref_image_0>','<ref_image_1>','<ref_image_2>'):self.assertIn(part,prompt)
+        self.assertNotIn('No text',prompt)
+    def test_references_same_shape_and_original_output_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            d=Path(d);cut=d/'person.png';style=d/'style.jpg'
+            Image.new('RGBA',(300,404),(255,0,0,130)).save(cut)
+            Image.new('RGB',(720,404),(30,60,90)).save(style)
+            for i,source in enumerate((cut,style,Image.new('RGB',(640,480)))):
+                target=d/f'ref{i}.png';pl._prepare_reference(source,target)
+                with Image.open(target) as im:self.assertEqual(im.size,(1024,576))
+            import io
+            data=io.BytesIO();Image.new('RGB',(1024,576),(20,20,20)).save(data,'PNG')
+            target=d/'output.jpg';pl._save_model_image(data.getvalue(),target);before=target.read_bytes()
+            with self.assertRaises(pl.PreviewError):pl._save_model_image(data.getvalue(),target)
+            self.assertEqual(target.read_bytes(),before)
+    def test_single_style_reference_and_missing_install_fails_before_search(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder=Path(d)/'thumbnail_styles';folder.mkdir();(folder/'kussia88.jpg').write_bytes(b'x')
+            self.assertEqual(rp.choose_style(d,'kussia88').name,'kussia88.jpg')
+            (folder/'kussia88.png').write_bytes(b'x')
+            with self.assertRaises(rp.PreviewError):rp.choose_style(d,'kussia88')
+            with patch.object(rp,'find_candidates') as search:
+                with self.assertRaises(pl.PreviewError):rp.generate(d,'kussia88',{'type':'reaction','preview_text':'ТЕСТ'},[],Path(d)/'x.jpg')
+                search.assert_not_called()
+
+    def test_full_local_flow_uses_three_refs_and_does_not_overlay_text(self):
+        import io, types
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); home=root/'desktop'/'tools'/'ComfyUI_windows_portable';comfy=home/'ComfyUI'
+            for p in [home/'python_embeded'/'python.exe',comfy/'main.py',comfy/'models'/'diffusion_models'/pl.MODEL,comfy/'models'/'text_encoders'/pl.ENCODER,comfy/'models'/'vae'/pl.VAE,comfy/'models'/'text_encoders'/pl.UPSAMPLER]:
+                p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'fixture')
+            assets=root/'thumbnail_assets'/'kussia88';assets.mkdir(parents=True)
+            Image.new('RGBA',(300,404),(240,10,10,150)).save(assets/'01.png')
+            styles=root/'thumbnail_styles';styles.mkdir()
+            Image.new('RGB',(720,404),(50,10,10)).save(styles/'kussia88.jpg')
+            buf=io.BytesIO();Image.new('RGB',(1024,576),'navy').save(buf,'PNG');saved_graph=[]
+            class Reply:
+                ok=True;content=buf.getvalue()
+                def __init__(self,obj=None):self.obj=obj or {}
+                def raise_for_status(self):pass
+                def json(self):return self.obj
+            class Session:
+                trust_env=True
+                def get(self,url,**kwargs):
+                    if url.endswith('/system_stats'):return Reply()
+                    if '/history/' in url:return Reply({'job1':{'outputs':{'10':{'images':[{'filename':'test.png'}]}}}})
+                    if url.endswith('/view'):return Reply()
+                    raise AssertionError(url)
+                def post(self,url,json,**kwargs):saved_graph.append(json['prompt']);return Reply({'prompt_id':'job1'})
+                def close(self):pass
+            class Process:
+                def __init__(self,*a,**k):self.stopped=False
+                def poll(self):return 0 if self.stopped else None
+                def terminate(self):self.stopped=True
+                def wait(self,timeout):return 0
+            output=root/'out.jpg';row={'type':'reaction','title':'полиция тест','preview_text':'ВЗЛОМАЛИ ДВЕРЬ','start':0,'end':10}
+            source=Image.new('RGB',(1280,720),'blue')
+            with (patch.object(pl.requests,'Session',Session),patch.object(pl.subprocess,'Popen',Process),
+                  patch.object(pl,'_save_caption',side_effect=AssertionError('overlay used')),
+                  patch.object(rp,'find_candidates',return_value=([{'id':'6EH2wmSPbMA','title':'полиция тест','channel':'x'}],['полиция тест'])),
+                  patch.object(rp,'download_thumbnail',return_value=(source,'https://example.com/thumbnail.jpg'))):
+                info=rp.generate(root,'kussia88',row,[{'start':1,'text':'полиция тест'}],output)
+            self.assertTrue(output.is_file());self.assertTrue(info['text_unverified']);self.assertEqual(len(saved_graph),1)
+            self.assertIn('ВЗЛОМАЛИ ДВЕРЬ',saved_graph[0]['13']['inputs']['prompt'])
+            self.assertEqual(len(list((comfy/'input').glob('narezko_*.png'))),0)
+            with Image.open(output) as im:self.assertEqual(im.size,(1280,720))
 
 if __name__=='__main__':unittest.main()

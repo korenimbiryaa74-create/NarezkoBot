@@ -39,3 +39,6 @@ preview_test/
 
 # User-provided transparent portraits
 thumbnail_assets/
+
+# User-supplied preview style references
+thumbnail_styles/

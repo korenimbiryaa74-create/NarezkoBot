@@ -37,7 +37,7 @@ function Download-PreviewArchive([string]$archive) {
 
 function Install-LocalPreview {
     Write-Host ''
-    Write-Host 'Тест превью: локальный ComfyUI и FLUX Klein, загрузка около 20 ГБ; рекомендуется 35 ГБ свободного места.'
+    Write-Host 'ИИ-превью: локальный ComfyUI и FLUX 3 Image Klein. При первой установке загрузка около 20 ГБ; рекомендуется 35 ГБ свободного места.'
     Write-Host 'Нужен бесплатный аккаунт Hugging Face, принятие лицензии модели и токен с доступом к ней.'
     $answer = Read-Host 'Установить генератор превью сейчас? [y/N]'
     if ($answer -notmatch '^(y|yes|д|да)$') { Write-Host 'Генератор пропущен; установить его можно повторным запуском INSTALL.bat.'; return }
@@ -77,5 +77,5 @@ function Install-LocalPreview {
     Write-Host 'Вставьте токен Hugging Face в приглашении ниже; он не добавляется в настройки Нарезкобота.'
     Run-Checked -file $py -arguments @('-c','from huggingface_hub import login; login(skip_if_logged_in=True)')
     Run-Checked -file $py -arguments @((Join-Path $PSScriptRoot 'preview_download_models.py'),(Join-Path $comfyHome 'ComfyUI\models'))
-    Write-Host 'Локальный генератор превью установлен.' -ForegroundColor Green
+    Write-Host 'Локальная модель FLUX 3 Image Klein подготовлена. Превью и текст модели необходимо проверять.' -ForegroundColor Green
 }

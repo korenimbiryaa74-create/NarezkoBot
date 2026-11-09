@@ -248,3 +248,140 @@ def generate_test(root,video,title,style,progress=lambda _:None,cancel=None):
                 except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=5)
             input_path.unlink(missing_ok=True)
             session.close()
+
+
+def build_reaction_graph(style_image, person_image, source_image, title, seed):
+    """One local diffusion call: style, actual cutout, source video thumbnail."""
+    title=safe_label(title); quoted_title=json.dumps(title,ensure_ascii=False)
+    if any(ord(c)<32 for c in title):raise PreviewError('Недопустимые символы в тексте превью.')
+    prompt=(f'Create one polished YouTube reaction thumbnail in a wide 16:9 format. '
+        f'Use <ref_image_0> ONLY as a visual style and layout reference: strong thumbnail design, '
+        f'large heavy italic yellow and white headline with dark outline, depth and shadow. '
+        f'Use the person from <ref_image_1> as the recognizable streamer; preserve their real face, '
+        f'hair, glasses and clothing. Put them large on the right. '
+        f'Use <ref_image_2> as the video being watched, place it as a large clear framed image on the left; '
+        f'preserve its actual content. In the lower-left, draw the following exact Russian Cyrillic headline: '
+        f'{quoted_title}. Use large legible bold type, arrange it to fit the composition. '
+        f'No other text, no duplicated faces, no extra people, no watermarks. '
+        f'Do not copy any words from <ref_image_0>.')
+    def node(t,**kw):return {'class_type':t,'inputs':kw}
+    refs={'images.image0':['4',0], 'images.image1':['14',0], 'images.image2':['15',0]}
+    return {
+      '1':node('UNETLoader',unet_name=MODEL,weight_dtype='default'),
+      '2':node('CLIPLoader',clip_name=ENCODER,type='flux3',device='default'),
+      '3':node('VAELoader',vae_name=VAE),
+      '4':node('LoadImage',image=style_image),
+      '14':node('LoadImage',image=person_image),
+      '15':node('LoadImage',image=source_image),
+      '5':node('CLIPTextEncode',clip=['2',0],text=['13',0]),
+      '6':node('ConditioningZeroOut',conditioning=['5',0]),
+      '7':node('ReferenceMultiLatent',positive=['5',0],negative=['6',0],vae=['3',0],resolution='keep resolution',**refs),
+      '8':node('KSampler',model=['1',0],positive=['7',0],negative=['7',1],latent_image=['7',2],seed=int(seed),steps=16,cfg=1,sampler_name='euler',scheduler='simple',denoise=1),
+      '9':node('VAEDecode',samples=['8',0],vae=['3',0]),
+      '10':node('SaveImage',images=['9',0],filename_prefix='narezko_test/'+uuid.uuid4().hex),
+      '11':node('CLIPLoader',clip_name=UPSAMPLER,type='flux3',device='default'),
+      '12':node('BatchImagesNode',**refs),
+      '13':node('TextGenerate',clip=['11',0],image=['12',0],prompt=prompt,
+         system_prompt=('Expand the request into a detailed visual description for an image editing model. '
+           'Use all reference images for their specified roles. The quoted Cyrillic headline is exact: '
+           'keep every character unchanged, never translate, correct, replace or omit it. '
+           'Do not add any other text. Output only the expanded visual instruction.'),
+         max_length=1024,sampling_mode='on',
+         **{'sampling_mode.temperature':1,'sampling_mode.top_k':1,'sampling_mode.top_p':0.95,
+            'sampling_mode.min_p':0,'sampling_mode.repetition_penalty':1.05,'sampling_mode.seed':0,
+            'sampling_mode.presence_penalty':0,'thinking':False,'use_default_template':True,'mtp':'off'}),
+    }
+
+
+def _prepare_reference(image, destination):
+    """Pad, not crop; consistent 16:9 input sizes for the ComfyUI batch node."""
+    from PIL import Image, ImageOps
+    try:
+        if isinstance(image,(str,Path)):
+            with Image.open(image) as source:
+                if source.width*source.height>40_000_000:raise PreviewError('Изображение для модели слишком большое.')
+                im=ImageOps.exif_transpose(source).convert('RGBA')
+        else:
+            if image.width*image.height>40_000_000:raise PreviewError('Изображение для модели слишком большое.')
+            im=image.convert('RGBA')
+        im=ImageOps.contain(im,(1024,576),Image.Resampling.LANCZOS)
+        canvas=Image.new('RGBA',(1024,576),(28,6,8,255))
+        canvas.alpha_composite(im,((1024-im.width)//2,(576-im.height)//2))
+        canvas.convert('RGB').save(destination,'PNG')
+    except PreviewError:raise
+    except Exception as exc:raise PreviewError('Не удалось прочитать референс изображения: '+str(exc)[:150]) from exc
+
+
+def _save_model_image(data,dest):
+    from io import BytesIO
+    from PIL import Image, ImageOps
+    import tempfile
+    dest=Path(dest);dest.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if image.width<320 or image.height<180 or image.width*image.height>40_000_000:raise PreviewError('Модель вернула изображение неподходящего размера.')
+            im=ImageOps.fit(image.convert('RGB'),(1280,720),method=Image.Resampling.LANCZOS)
+            fd,tmp=tempfile.mkstemp(prefix='.ai-preview-',suffix='.jpg',dir=dest.parent);os.close(fd)
+            try:
+                im.save(tmp,'JPEG',quality=93,optimize=True)
+                if dest.exists():raise PreviewError('Превью уже существует; не перезаписываю.')
+                if os.name=='nt':os.rename(tmp,dest)
+                else:os.link(tmp,dest)
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+    except PreviewError:raise
+    except Exception as exc:raise PreviewError('Не удалось сохранить изображение модели: '+str(exc)[:150]) from exc
+
+
+def generate_reaction(root, cutout, style_image, source_image, title, destination, progress=lambda _:None, cancel=None):
+    """Run the installed model locally once. No GPT request and no caption overlay."""
+    home=check_install(root);_cancelled(cancel)
+    destination=Path(destination)
+    if destination.exists():raise PreviewError('Превью уже существует; не перезаписываю.')
+    dest=Path(root)/'preview_test';dest.mkdir(parents=True,exist_ok=True)
+    input_dir=home/'ComfyUI'/'input';input_dir.mkdir(parents=True,exist_ok=True)
+    input_paths=[];proc=None;session=requests.Session();session.trust_env=False
+    port=_port();base=f'http://127.0.0.1:{port}'
+    try:
+        for image in (style_image,cutout,source_image):
+            _cancelled(cancel)
+            path=input_dir/('narezko_'+uuid.uuid4().hex+'.png');input_paths.append(path)
+            _prepare_reference(image,path)
+        log_path=dest/'comfyui_test.log'
+        progress('Запускаю локальную модель FLUX 3. Первый запуск может занять несколько минут.')
+        with open(log_path,'ab') as log:
+            proc=subprocess.Popen([str(home/'python_embeded'/'python.exe'),'-s',str(home/'ComfyUI'/'main.py'),'--listen','127.0.0.1','--port',str(port),'--disable-auto-launch','--disable-api-nodes','--disable-all-custom-nodes','--lowvram','--cache-none'],cwd=str(home/'ComfyUI'),stdout=log,stderr=subprocess.STDOUT,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            _ready(session,base,proc,cancel=cancel)
+            graph=build_reaction_graph(*(p.name for p in input_paths),title,int.from_bytes(os.urandom(6),'big'))
+            try:
+                r=session.post(base+'/prompt',json={'prompt':graph,'client_id':uuid.uuid4().hex},timeout=30)
+                if not r.ok:log.write(('\\nОшибка задания ComfyUI: '+r.text[:4000]+'\\n').encode('utf8'));log.flush()
+                r.raise_for_status();job=r.json()['prompt_id']
+            except (requests.RequestException,KeyError,ValueError) as exc:raise PreviewError('ComfyUI не принял задание; см. preview_test/comfyui_test.log.') from exc
+            progress('Модель рисует превью и текст локально; потребуется ручная проверка.')
+            end=time.monotonic()+1800
+            while time.monotonic()<end:
+                _cancelled(cancel)
+                if proc.poll() is not None:raise PreviewError('ComfyUI завершился во время генерации; проверьте preview_test/comfyui_test.log.')
+                try:
+                    r=session.get(base+'/history/'+quote(job,safe=''),timeout=10);r.raise_for_status();entry=r.json().get(job)
+                except (requests.RequestException,ValueError) as exc:raise PreviewError('Потеряна связь с ComfyUI.') from exc
+                if entry:
+                    if entry.get('status',{}).get('status_str')=='error':raise PreviewError('Ошибка модели; проверьте preview_test/comfyui_test.log (возможно, не хватает памяти).')
+                    images=entry.get('outputs',{}).get('10',{}).get('images',[])
+                    if len(images)!=1:raise PreviewError('ComfyUI не вернул одно изображение.')
+                    img=images[0]
+                    try:
+                        r=session.get(base+'/view',params={'filename':img['filename'],'subfolder':img.get('subfolder',''),'type':'output'},timeout=60);r.raise_for_status();_cancelled(cancel);_save_model_image(r.content,destination)
+                    except (requests.RequestException,KeyError) as exc:raise PreviewError('Не удалось получить изображение из ComfyUI.') from exc
+                    progress('Готово. Проверьте буквы, лицо и соответствие оригиналу.')
+                    return destination
+                _sleep(2,cancel)
+            raise PreviewError('Превышено время ожидания модели (30 минут).')
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=5)
+        for path in input_paths:path.unlink(missing_ok=True)
+        session.close()
