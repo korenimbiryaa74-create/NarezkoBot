@@ -350,9 +350,11 @@ def local_schedule_timestamp(timestamp, tz_text, now=None):
     intended=datetime.fromtimestamp(timestamp).astimezone()
     if intended.utcoffset() != timedelta(minutes=minutes):
         raise StudioError('Часовой пояс YouTube не совпадает с часовым поясом компьютера')
-    # Studio date/time controls have minute precision.
-    if intended.second or intended.microsecond:
-        intended=(intended+timedelta(minutes=1)).replace(second=0,microsecond=0)
+    # Match the first publication's displayed minute (14:34 -> 15:34).
+    # Studio controls have minute precision; never submit a time that is too close.
+    intended=intended.replace(second=0,microsecond=0)
+    if intended.timestamp() <= now + 120:
+        raise StudioError('Запланированное время слишком близко или прошло; проверьте расписание вручную')
     return intended
 
 
@@ -530,6 +532,13 @@ def wait_for_submission(tab, candidate_id=None, progress=None, timeout=300):
     raise StudioError('Studio не подтвердила отправку; проверьте видео перед повтором')
 
 
+def validate_publication_plan(row):
+    # Older test jobs may have stored public access for every clip. Never
+    # silently publish an old second or later clip without a schedule.
+    if row.get('clip_index',1)>1 and row.get('publish_at') is None:
+        raise StudioError('У старого задания нет расписания для этой нарезки; создайте новое задание')
+
+
 class YouTubeStudio:
     def __init__(self,root): self.root=Path(root)
     def connect(self,profile,ready_event,opened_event=None,timeout=600):
@@ -540,6 +549,7 @@ class YouTubeStudio:
                     raise StudioError('Время входа истекло; повторите подключение')
                 return channel_ready(tab,timeout=30)
     def submit(self,tab,browser,row,progress=None):
+        validate_publication_plan(row)
         expected=row['channel_id']
         try:prepare_upload_dialog(tab,expected,progress=progress)
         except UnsafeUploadState:
@@ -658,6 +668,7 @@ class YouTubeStudio:
                 browser.keep_open=True
 
     def upload(self,row,progress=None):
+        validate_publication_plan(row)
         with _LOCK:
             browser=Browser(self.root,row['profile'])
             with browser as tab:

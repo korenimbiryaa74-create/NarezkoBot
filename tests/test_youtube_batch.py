@@ -45,6 +45,38 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([e[0] for e in self.events if e[0] in ('submit','monitor')],['submit']*3+['monitor']*3)
         self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed']*3)
         self.assertEqual(Browser.last.tabs,2);self.assertFalse(Browser.last.keep_open)
+    def test_submit_uses_public_for_first_and_scheduler_for_next(self):
+        class Tab:
+            def fill(self,*args):pass
+        class B:
+            keep_open=False
+            attempt_may_upload=False
+        row=self.first.copy();tab=Tab();browser=B()
+        with patch.object(studio,'prepare_upload_dialog'),patch.object(studio,'channel_ready'),\
+             patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value='title'),\
+             patch.object(studio,'selected',return_value=True),patch.object(studio,'wait'),\
+             patch.object(studio,'click') as click,patch.object(studio,'set_schedule') as schedule,\
+             patch.object(studio,'upload_video_id',return_value='a'*11),\
+             patch.object(studio,'wait_for_submission',return_value='a'*11),patch.object(studio.time,'sleep'):
+            self.obj.submit(tab,browser,row)
+            self.assertTrue(any(c.args[1]=='tp-yt-paper-radio-button[name="PUBLIC"]' for c in click.call_args_list))
+            schedule.assert_not_called()
+            click.reset_mock();row['publish_at']=123456
+            self.obj.submit(tab,browser,row)
+            schedule.assert_called_once_with(tab,123456)
+            self.assertFalse(any(c.args[1]=='tp-yt-paper-radio-button[name="PUBLIC"]' for c in click.call_args_list))
+
+    def test_legacy_later_public_clip_is_rejected_before_browser_actions(self):
+        row=self.first.copy();row['clip_index']=2;row['publish_at']=None
+        with patch.object(studio,'prepare_upload_dialog') as prepare:
+            with self.assertRaisesRegex(studio.StudioError,'нет расписания'):
+                self.obj.submit(object(),object(),row)
+            prepare.assert_not_called()
+        with patch.object(studio,'Browser') as browser:
+            with self.assertRaisesRegex(studio.StudioError,'нет расписания'):
+                self.obj.upload(row)
+            browser.assert_not_called()
+
     def test_uncertain_upload_is_not_retried_and_later_clip_continues(self):
         calls=[]
         def submit(tab,browser,row,progress=None):
