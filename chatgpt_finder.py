@@ -115,10 +115,11 @@ class ChatGPTFinder:
 
     def find_donations(self, segs, rows, progress, manual=None):
         """One separate request; existing reaction response and speech caches stay valid."""
-        if not rows: return []
-        boundaries='\n'.join(f"{i}: {reactions.tr.fmt_ts(r['start'], '.')} — {reactions.tr.fmt_ts(r['end'], '.')}" for i,r in enumerate(rows,1))
+        eligible=[(i,r) for i,r in enumerate(rows,1) if r.get('type','reaction')=='reaction']
+        if not eligible: return []
+        boundaries='\n'.join(f"{i}: {reactions.tr.fmt_ts(r['start'], '.')} — {reactions.tr.fmt_ts(r['end'], '.')}" for i,r in eligible)
         doc=reactions.reaction_transcript(segs)
-        instructions=("Найди в транскрипте только отвлечения на донаты внутри перечисленных фрагментов (реакций и обсуждений). "
+        instructions=("Найди в транскрипте только отвлечения на донаты только внутри перечисленных реакций на видео. Обсуждения и другие интересные моменты не обрабатывай. "
           "Нужны интервалы, которые можно полностью вырезать: чтение/озвучивание доната и ответ стримера, "
           "когда он отвлёкся от основной темы или просмотра. Не вырезай обсуждение самого ролика, реплики из ролика, "
           "игровые события или простое упоминание слова донат. Если сомневаешься, не включай. "
@@ -132,7 +133,7 @@ class ChatGPTFinder:
             progress('Поиск реакций','Используется сохранённый ответ ChatGPT о донатах')
             raw=manual
         else:
-            progress('Поиск реакций','ChatGPT: поиск ответов на донаты внутри найденных моментов')
+            progress('Поиск реакций','ChatGPT: поиск ответов на донаты только внутри реакций')
             raw=self._ask_document(instructions,doc,'transcript.txt',self.timeout,
                 log=lambda msg:progress('Поиск реакций',msg),need='donation_cuts')
         parsed=reactions.tc.parse_answer(raw)
@@ -146,6 +147,8 @@ class ChatGPTFinder:
                 raise reactions.ReactionsError('Неуверенный интервал доната: проверьте ответ ChatGPT вручную')
             a,b=reactions.reaction_time(c.get('start')),reactions.reaction_time(c.get('end'))
             r=rows[c['reaction']-1]
+            if r.get('type','reaction')!='reaction':
+                raise reactions.ReactionsError('Интервал доната указан для обсуждения; донаты из него не удаляются')
             if a is None or b is None or b<=a or a<r['start'] or b>r['end']:
                 raise reactions.ReactionsError('Интервал доната вне границ реакции или некорректен')
             if b-a>180 or b-a>(r['end']-r['start'])*.5:

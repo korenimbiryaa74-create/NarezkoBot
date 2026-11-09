@@ -156,6 +156,8 @@ def validate_donation_cuts(cuts, rows):
     clean=[]
     for c in cuts:
         if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or not 1<=c['reaction']<=len(rows): raise PipelineError('Некорректный номер реакции доната')
+        if rows[c['reaction']-1].get('type','reaction')!='reaction':
+            raise PipelineError('Донат указан для обсуждения; не выполняю монтаж')
         try:
             if isinstance(c['start'],bool) or isinstance(c['end'],bool): raise ValueError()
             a,b=float(c['start']),float(c['end']);row=rows[c['reaction']-1]
@@ -334,7 +336,7 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
         res={'src':str(src),'info':info,'streams':stream_cutter.audio_streams(info),'total':total}
         if not res['streams']: raise PipelineError('В видео нет аудиодорожек')
         keeps=[(start,end)]
-    donation_cuts=[(c['start']-source_offset,c['end']-source_offset) for c in row.get('donation_cuts',[])]
+    donation_cuts=[(c['start']-source_offset,c['end']-source_offset) for c in row.get('donation_cuts',[])] if row.get('type','reaction')=='reaction' else []
     if donation_cuts:
         if progress_callback: progress_callback(f'Удаление ответов на донаты: {len(donation_cuts)}')
         keeps=subtract_intervals(keeps,donation_cuts)
@@ -588,7 +590,7 @@ class Pipeline:
                 finder_cfg=dict(cfg,_manual_reactions=manual['text'])
         rows=validate_intervals(self.finder(str(src),segs,duration,login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
         check_local()
-        if cfg.get('remove_donations',False) and rows:
+        if cfg.get('remove_donations',False) and any(r.get('type','reaction')=='reaction' for r in rows):
             if not hasattr(self.finder,'find_donations'): raise PipelineError('Поиск донатов недоступен у текущего поставщика')
             manual_donation=None
             if isinstance(job.get('id'),int) and not isinstance(job['id'],bool) and job['id']>0:
@@ -596,7 +598,8 @@ class Pipeline:
                 if isinstance(saved,dict) and saved.get('job')==job_identity(job) and isinstance(saved.get('text'),str): manual_donation=saved['text']
             cuts=validate_donation_cuts(self.finder.find_donations(segs,rows,progress,manual=manual_donation),rows)
             for i,row in enumerate(rows,1):
-                row['donation_cuts']=[{'start':c['start'],'end':c['end']} for c in cuts if c['reaction']==i]
+                if row.get('type','reaction')=='reaction':
+                    row['donation_cuts']=[{'start':c['start'],'end':c['end']} for c in cuts if c['reaction']==i]
             check_local()
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]
