@@ -165,11 +165,22 @@ class App:
         ttk.Button(ybar,text='Сохранить скорость / аудиторию',command=self.youtube_save_profile).pack(side='left')
         ttk.Label(youtube,text='Войдите в Google, выберите нужный канал в YouTube Studio и нажмите «Подтвердить выбранный канал». Тестовый профиль — отдельный канал __test__.',wraplength=900).grid(row=5,column=0,columnspan=2,sticky='w',padx=8)
         ttk.Label(youtube,text='Первая нарезка — публично сразу; остальные планируются на YouTube. Тестовые видео — все публично сразу. Разрешено только для контента, который вы вправе публиковать.',wraplength=900).grid(row=6,column=0,columnspan=2,sticky='w',padx=8,pady=4)
-        self.youtube_rows=ttk.Treeview(youtube,columns=('id','profile','state','time','detail'),show='headings',height=7)
+        ttk.Label(youtube,text='Привязанные каналы (сохранены локально; вход может истечь). Выберите строку для редактирования.').grid(row=7,column=0,columnspan=2,sticky='w',padx=8)
+        yprofiles=ttk.Frame(youtube);yprofiles.grid(row=8,column=0,columnspan=2,sticky='nsew',padx=8,pady=2);youtube.rowconfigure(8,weight=1)
+        self.youtube_profiles=ttk.Treeview(yprofiles,columns=('profile','channel','speed','audience'),show='headings',height=3,selectmode='browse')
+        for key,width,label in [('profile',160,'Профиль'),('channel',300,'ID канала YouTube'),('speed',160,'Скорость'),('audience',260,'Аудитория')]:
+            self.youtube_profiles.heading(key,text=label);self.youtube_profiles.column(key,width=width,stretch=True)
+        ypscroll=ttk.Scrollbar(yprofiles,orient='vertical',command=self.youtube_profiles.yview)
+        self.youtube_profiles.configure(yscrollcommand=ypscroll.set);self.youtube_profiles.pack(side='left',fill='both',expand=True);ypscroll.pack(side='right',fill='y')
+        self.youtube_profiles.bind('<<TreeviewSelect>>',self.youtube_profile_selected)
+        ttk.Label(youtube,text='Очередь загрузок (отдельно от списка каналов)').grid(row=9,column=0,columnspan=2,sticky='w',padx=8)
+        yuploads=ttk.Frame(youtube);yuploads.grid(row=10,column=0,columnspan=2,sticky='nsew',padx=8,pady=2);youtube.rowconfigure(10,weight=1)
+        self.youtube_rows=ttk.Treeview(yuploads,columns=('id','profile','state','time','detail'),show='headings',height=3)
         for key,width,label in [('id',50,'№'),('profile',110,'Профиль'),('state',120,'Состояние'),('time',150,'Дата публикации'),('detail',420,'Информация')]:
             self.youtube_rows.heading(key,text=label);self.youtube_rows.column(key,width=width,stretch=True)
-        self.youtube_rows.grid(row=7,column=0,columnspan=2,sticky='nsew',padx=8,pady=4);youtube.rowconfigure(7,weight=1)
-        yr=ttk.Frame(youtube);yr.grid(row=8,column=0,columnspan=2,sticky='w',padx=8)
+        yuscroll=ttk.Scrollbar(yuploads,orient='vertical',command=self.youtube_rows.yview)
+        self.youtube_rows.configure(yscrollcommand=yuscroll.set);self.youtube_rows.pack(side='left',fill='both',expand=True);yuscroll.pack(side='right',fill='y')
+        yr=ttk.Frame(youtube);yr.grid(row=11,column=0,columnspan=2,sticky='w',padx=8)
         ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
         ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
@@ -239,6 +250,35 @@ class App:
         if not self.yt_browser_opened or not self.yt_browser_opened.is_set():
             messagebox.showinfo('YouTube','Дождитесь открытия окна браузера и выберите канал.');return
         self.yt_connect_event.set();self.status.set('YouTube: проверяю выбранный канал')
+
+    def refresh_youtube_profiles(self):
+        # Update rows in place: refreshing must not clear selection or overwrite edits.
+        rows=self.service.youtube_queue.list_profiles()
+        existing=set(self.youtube_profiles.get_children())
+        audience={'kids':'Для детей','not_kids':'Не специально для детей'}
+        for index,row in enumerate(rows):
+            profile=row['profile']
+            label=profile+' (тестовый)' if profile=='__test__' else profile
+            speed='Все сразу' if profile=='__test__' else ('16 часов' if row['interval_hours']==16 else '1 час')
+            values=(label,row['channel_id'],speed,audience.get(row['audience'],'Не указана'))
+            if profile in existing:
+                if tuple(self.youtube_profiles.item(profile,'values'))!=values:
+                    self.youtube_profiles.item(profile,values=values)
+                self.youtube_profiles.move(profile,'',index)
+                existing.remove(profile)
+            else:
+                self.youtube_profiles.insert('',index,iid=profile,values=values)
+        for profile in existing:self.youtube_profiles.delete(profile)
+
+    def youtube_profile_selected(self,event=None):
+        selected=self.youtube_profiles.selection()
+        if not selected:return
+        row=self.service.youtube_queue.get_profile(selected[0])
+        if not row:return
+        self.variables['youtube_profile'].set(row['profile'])
+        self.variables['youtube_speed'].set('Медленно: 16 часов' if row['interval_hours']==16 else 'Быстро: 1 час')
+        audience={'kids':'Предназначено для детей','not_kids':'Не предназначено специально для детей'}
+        self.variables['youtube_audience'].set(audience.get(row['audience'],'Выберите'))
 
     def youtube_save_profile(self):
         try:
@@ -503,6 +543,7 @@ class App:
             # Keep it until the selection is cleared, then catch up on new events.
             if not self.events.tag_ranges('sel') and self.events.get('1.0','end-1c') != text:
                 self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
+            self.refresh_youtube_profiles()
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
             ytlabels={'queued':'В очереди','uploading':'Загрузка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
