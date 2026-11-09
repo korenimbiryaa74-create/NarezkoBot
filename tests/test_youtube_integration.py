@@ -160,9 +160,25 @@ class BrowserFlowTests(unittest.TestCase):
         class Tab:
             def fill(self,*args):pass
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
-        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click'),patch.object(studio,'wait',return_value=True),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',side_effect=studio.StudioError('timeout')),patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click'),patch.object(studio,'wait',return_value=True),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',side_effect=studio.StudioError('timeout')),patch.object(studio.time,'sleep'):
             with self.assertRaises(studio.StudioError):studio.YouTubeStudio('/tmp').upload(row)
         self.assertTrue(Browser.last.keep_open)
+
+    def test_title_wait_accepts_safe_fallback_and_rejects_ambiguous(self):
+        class Tab:
+            def __init__(self,state):self.state=state
+            def js(self,script):return self.state
+        fallback=studio._TITLE_SELECTORS[1]
+        self.assertEqual(studio.wait_for_title(Tab({'selector':fallback}),timeout=1),fallback)
+        with self.assertRaises(studio.StudioError):
+            studio.wait_for_title(Tab({'ambiguous':True}),timeout=1)
+
+    def test_title_wait_times_out_without_reupload(self):
+        class Tab:
+            def js(self,script):return {'dialog':1,'title':False}
+        with patch.object(studio.time,'sleep'):
+            with self.assertRaisesRegex(studio.StudioError,'черновики'):
+                studio.wait_for_title(Tab(),timeout=.001)
 
     def test_browser_is_not_terminated_for_uncertain_upload(self):
         class Proc:
@@ -194,7 +210,7 @@ class BrowserFlowTests(unittest.TestCase):
             return ['https://youtu.be/'+'a'*11] if 'ytcp-video-share-dialog' in expr else True
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
         obj=studio.YouTubeStudio('/tmp')
-        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
             self.assertEqual(obj.upload(row),'a'*11)
             self.assertIn('tp-yt-paper-radio-button[name="PUBLIC"]',calls)
             schedule.assert_not_called()

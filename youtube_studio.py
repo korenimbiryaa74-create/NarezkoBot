@@ -161,6 +161,37 @@ def wait(tab, expression, timeout, message):
     raise StudioError(message)
 
 
+# Restrict fallbacks to the title container: never mistake description for title.
+_TITLE_SELECTORS = (
+    'ytcp-uploads-dialog #title-textarea #textbox',
+    'ytcp-uploads-dialog #title-textarea [contenteditable="true"]',
+    'ytcp-uploads-dialog #title-textarea textarea',
+    'ytcp-uploads-dialog #title-textarea input',
+)
+
+def wait_for_title(tab, progress=None, timeout=180):
+    """Wait for one visible title field. Do not re-select the file or dismiss errors."""
+    deadline=time.monotonic()+timeout
+    next_report=time.monotonic()+20
+    script="""(()=>{const selectors=%s;
+        const visible=e=>!!e.getClientRects().length && !e.disabled && e.getAttribute('aria-disabled')!=='true';
+        for(const selector of selectors){const matches=[...document.querySelectorAll(selector)].filter(visible);
+            if(matches.length===1)return {selector:selector};
+            if(matches.length>1)return {ambiguous:true};}
+        const dialogs=[...document.querySelectorAll('ytcp-uploads-dialog')].filter(visible);
+        return {dialog:dialogs.length, title:dialogs.some(d=>!!d.querySelector('#title-textarea'))};})()""" % json.dumps(_TITLE_SELECTORS)
+    while time.monotonic()<deadline:
+        state=tab.js(script) or {}
+        if state.get('selector') in _TITLE_SELECTORS:return state['selector']
+        if state.get('ambiguous'):
+            raise StudioError('Найдено несколько полей названия; проверьте окно YouTube Studio')
+        if progress and time.monotonic()>=next_report:
+            progress('Ожидаю поле названия в YouTube Studio; проверьте окно браузера и не закрывайте его')
+            next_report=time.monotonic()+20
+        time.sleep(.6)
+    raise StudioError('Не появилось поле названия после выбора файла. Проверьте окно Studio, сообщения об ошибке и черновики; браузер оставлен открытым')
+
+
 def channel_ready(tab, expected=None, timeout=45):
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
@@ -381,8 +412,8 @@ class YouTubeStudio:
                 browser.keep_open=True  # a draft/upload may be created even if the next action fails
                 attach_file(tab,row['file_path'])
                 if progress:progress('Файл передан; ожидаю загрузку и настройки')
-                wait(tab,"!!document.querySelector('ytcp-uploads-dialog #title-textarea #textbox')",90,'Не найдено название видео')
-                tab.fill('ytcp-uploads-dialog #title-textarea #textbox',row['title'])
+                title_selector=wait_for_title(tab,progress=progress)
+                tab.fill(title_selector,row['title'])
                 audience={'kids':'VIDEO_MADE_FOR_KIDS_MFK','not_kids':'VIDEO_MADE_FOR_KIDS_NOT_MFK'}.get(row['audience'])
                 if not audience: raise StudioError('Аудитория не подтверждена')
                 radio='tp-yt-paper-radio-button[name="'+audience+'"]'
