@@ -344,7 +344,7 @@ def local_schedule_timestamp(timestamp, tz_text, now=None):
         raise StudioError('Запланированное время слишком близко или прошло; проверьте расписание вручную')
     matches=re.findall(r'\b(?:GMT|UTC)\s*([+-])\s*(\d{1,2})(?::(\d{2}))?',str(tz_text),re.I)
     if len(set(matches)) != 1:
-        raise StudioError('Не удалось однозначно проверить часовой пояс YouTube Studio')
+        raise StudioError('Не удалось прочитать часовой пояс YouTube Studio; откройте «Часовой пояс» и пришлите скриншот')
     sign,h,m=matches[0]; minutes=(int(h)*60+int(m or 0))*(1 if sign=='+' else -1)
     if abs(minutes)>14*60: raise StudioError('Некорректный часовой пояс YouTube')
     intended=datetime.fromtimestamp(timestamp).astimezone()
@@ -374,11 +374,40 @@ def parse_time(value):
     return None
 
 
+# YouTube Studio may present Schedule as a collapsed card, not a visible radio.
+# Restrict the action to one visible upload dialog and one unambiguous heading.
+_OPEN_SCHEDULE = r"""(()=>{
+  const visible=e=>!!e.getClientRects().length && !e.disabled && e.getAttribute('aria-disabled')!=='true';
+  const dialogs=[...document.querySelectorAll('ytcp-uploads-dialog')].filter(visible);
+  if(dialogs.length!==1)return dialogs.length>1?'ambiguous':null;
+  const d=dialogs[0];
+  const time=[...d.querySelectorAll('ytcp-visibility-scheduler #time-of-day-container input')].filter(visible);
+  if(time.length===1)return 'ready';
+  if(time.length>1)return 'ambiguous';
+  const radios=[...d.querySelectorAll('#schedule-radio-button')].filter(visible);
+  if(radios.length>1)return 'ambiguous';
+  if(radios.length===1){radios[0].scrollIntoView({block:'center'});radios[0].click();return 'opened';}
+  const exact=e=>/^(?:schedule|schedule publication|запланировать публикацию)$/i.test((e.innerText||'').trim());
+  const headings=[...d.querySelectorAll('*')].filter(e=>visible(e)&&exact(e)&&
+    ![...e.children].some(c=>visible(c)&&exact(c)));
+  if(headings.length>1)return 'ambiguous';
+  if(headings.length===1){headings[0].scrollIntoView({block:'center'});headings[0].click();return 'opened';}
+  return null;
+})()"""
+_SCHEDULE_OPEN = """(()=>{const d=[...document.querySelectorAll('ytcp-uploads-dialog')].filter(e=>e.getClientRects().length);if(d.length!==1)return false;const es=[...d[0].querySelectorAll('ytcp-visibility-scheduler #time-of-day-container input')].filter(e=>e.getClientRects().length);return es.length===1})()"""
+_SCHEDULE_ZONE = r"""(()=>{const e=document.querySelector('ytcp-uploads-dialog ytcp-visibility-scheduler');if(!e)return null;return [e.innerText,...[...e.querySelectorAll('[aria-label],[title]')].filter(x=>x.getClientRects().length).flatMap(x=>[x.getAttribute('aria-label'),x.getAttribute('title')])].filter(Boolean).join('\n')})()"""
+
+def open_schedule(tab):
+    state=wait(tab,_OPEN_SCHEDULE,30,'Не найдена карточка «Запланировать публикацию» в окне загрузки')
+    if state=='ambiguous':raise StudioError('Карточка «Запланировать публикацию» найдена неоднозначно')
+    wait(tab,_SCHEDULE_OPEN,15,'Карточка расписания не открылась или поле времени не найдено')
+
+
 def set_schedule(tab, timestamp):
-    click(tab,'#schedule-radio-button')
-    tz=wait(tab,"(()=>{const e=document.querySelector('ytcp-visibility-scheduler');return e&&e.innerText})()",30,'Не удалось прочитать расписание YouTube')
+    open_schedule(tab)
+    tz=wait(tab,_SCHEDULE_ZONE,30,'Не удалось прочитать расписание YouTube')
     when=local_schedule_timestamp(timestamp,tz)
-    click(tab,'#datepicker-trigger')
+    click(tab,'#datepicker-trigger',message='Не удалось открыть выбор даты публикации')
     # Picker structure can change; ambiguity is an error, never guess.
     date_sel='ytcp-date-picker input'
     wait(tab,"!!document.querySelector('ytcp-date-picker input')",15,'Не найден выбор даты')
@@ -389,7 +418,7 @@ def set_schedule(tab, timestamp):
     actual=tab.js('''(()=>{const d=document.querySelector('#datepicker-trigger .dropdown-trigger-text');const t=document.querySelector('ytcp-visibility-scheduler #time-of-day-container input');return {date:d&&d.innerText,time:t&&t.value}})()''') or {}
     if parse_date(actual.get('date')) != when.date() or parse_time(actual.get('time')) != when.time():
         raise StudioError('YouTube не подтвердил выбранные дату и время; проверьте черновик')
-    tz2=tab.js("document.querySelector('ytcp-visibility-scheduler').innerText")
+    tz2=tab.js(_SCHEDULE_ZONE)
     if local_schedule_timestamp(timestamp,tz2) != when:
         raise StudioError('Часовой пояс или время изменились; проверьте черновик')
     return when
@@ -577,7 +606,9 @@ class YouTubeStudio:
             click(tab,radio)
             if not selected(tab,radio):raise StudioError('YouTube не подтвердил публичный доступ')
         else:
+            if progress:progress('Настраиваю отложенную публикацию: открываю расписание, проверяю дату, время и часовой пояс')
             set_schedule(tab,row['publish_at'])
+            if progress:progress('Дата и время расписания заполнены; отправляю в Studio')
         channel_ready(tab,expected,timeout=5)
         candidate=upload_video_id(tab)
         # The enabled button can precede upload/check completion.
