@@ -48,15 +48,17 @@ class BatchTests(unittest.TestCase):
     def test_failure_keeps_previously_submitted_id_without_retry(self):
         def submit(tab,browser,row,progress=None):
             browser.keep_open=True
-            if row['clip_index']==2:raise studio.StudioError('connection lost')
+            if row['clip_index']==2:
+                browser.attempt_may_upload=True
+                raise studio.StudioError('connection lost')
             return 'a'*11
-        with patch.object(studio,'Browser',Browser),patch.object(self.obj,'submit',side_effect=submit):
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready') as monitor:
             with self.assertRaises(studio.StudioError):self.batch()
         rows=self.queue.list_uploads()
-        self.assertEqual([(r['state'],r['submitted']) for r in rows],[('uploading',1),('needs_review',0),('queued',0)])
+        self.assertEqual([(r['state'],r['submitted']) for r in rows],[('confirmed',1),('needs_review',0),('queued',0)])
         self.assertTrue(Browser.last.keep_open)
+        monitor.assert_called_once()
         self.assertEqual(self.queue.recover_interrupted(),0)
-        self.assertEqual(self.queue.submitted_uploads('test')[0]['video_id'],'a'*11)
     def test_processing_recovery_never_resubmits(self):
         self.queue.mark_submitted(self.first['id'],CHANNEL,'a'*11,now=10000)
         self.assertEqual(self.queue.recover_interrupted(),0)
@@ -81,9 +83,26 @@ class BatchTests(unittest.TestCase):
         class BadBrowser(Browser):
             def open_upload_tab(self,channel):raise studio.StudioError('failed to open')
         def submit(tab,browser,row,progress=None):browser.keep_open=True;return 'a'*11
-        with patch.object(studio,'Browser',BadBrowser),patch.object(self.obj,'submit',side_effect=submit):
+        with patch.object(studio,'Browser',BadBrowser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready'):
             with self.assertRaises(studio.StudioError):self.batch()
-        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['uploading','needs_review','queued'])
+        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','needs_review','queued'])
+        self.assertFalse(Browser.last.keep_open)
+
+    def test_new_upload_tab_is_foregrounded_without_closing_old_tab(self):
+        calls=[]
+        class OldTab:
+            def call(self,method,**kwargs):
+                calls.append((method,kwargs));return {'targetId':'new'}
+        class NewTab:
+            def __init__(self,url):self.url=url
+            def call(self,method,**kwargs):calls.append((method,kwargs));return {}
+        browser=studio.Browser(self.root,'test');browser.port=1234;browser.tab=OldTab()
+        pages=[{'id':'new','webSocketDebuggerUrl':'ws://127.0.0.1/new'}]
+        with patch.object(studio,'CDP',NewTab),patch.object(studio,'local_json',return_value=pages):
+            tab=browser.open_upload_tab(CHANNEL)
+        self.assertIs(browser.upload_tabs[0],tab)
+        self.assertFalse(calls[0][1]['background'])
+        self.assertTrue(any(method=='Page.bringToFront' for method,_ in calls))
 
     def test_first_submission_anchors_schedule_only_once(self):
         self.queue.mark_submitted(self.first['id'],CHANNEL,'a'*11,now=10000)

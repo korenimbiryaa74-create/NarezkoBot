@@ -102,6 +102,24 @@ class ServiceIntegrationTests(unittest.TestCase):
         svc.youtube_queue.cancel_reviewed_or_queued(row['id'])
         self.assertEqual(svc.youtube_queue.waiting_reason(),'')
 
+    def test_batch_failure_does_not_reopen_browser_in_a_loop(self):
+        svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
+        calls=[]
+        class BrokenBatch:
+            def upload_batch(self,queue,row,profile,channel,stop,progress,confirm):
+                calls.append(profile)
+                raise studio.StudioError('browser failed')
+        svc.youtube_studio=BrokenBatch()
+        with patch.object(svc.stop_event,'wait'):
+            self.assertTrue(svc.youtube_once())
+            self.assertFalse(svc.youtube_once())
+            self.assertEqual(calls,['__test__'])
+            self.assertEqual(svc.youtube_queue.list_uploads()[0]['state'],'needs_review')
+            svc.youtube_queue.retry_reviewed(svc.youtube_queue.list_uploads()[0]['id'])
+            svc.resume_youtube_after_review('__test__')
+            self.assertTrue(svc.youtube_once())
+            self.assertEqual(len(calls),2)
+
     def test_failed_job_is_never_uploaded(self):
         svc=self.make_service()
         job=svc.store.claim()

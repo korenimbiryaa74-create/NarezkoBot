@@ -30,7 +30,7 @@ class ClearUITests(unittest.TestCase):
                 queue=YouTubeQueue(Path(tmp)/'jobs.sqlite3');queue.bind('__test__','UC'+'t'*22,audience='not_kids')
                 video=Path(tmp)/'test.mp4';video.write_bytes(b'video')
                 queue.enqueue(1,'ignored',[video],is_test=True)
-                app.service=types.SimpleNamespace(youtube_queue=queue,log=logs.append)
+                app.service=types.SimpleNamespace(youtube_queue=queue,log=logs.append,resume_youtube_after_review=lambda:None)
                 app.youtube_clear_queue()
                 self.assertEqual(queue.list_uploads()[0]['state'],'queued')
                 answer[0]=True;app.youtube_clear_queue()
