@@ -144,6 +144,7 @@ def validate_intervals(rows,duration,min_seconds=0):
         if 'type' in item:
             if item['type'] not in ('reaction','discussion'): raise PipelineError('Неизвестный тип момента')
             row['type']=item['type']
+        if isinstance(item.get('preview_text'),str): row['preview_text']=item['preview_text'].strip()[:80]
         if item.get('confidence') in ('high','medium','low'): row['confidence']=item['confidence']
         clean.append(row)
     clean.sort(key=lambda x:x['start'])
@@ -654,5 +655,25 @@ class Pipeline:
             outputs.append(str(output))
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
         ready,outputs=organize_clips(folder,job,rows,bool(cfg.get('silence',{}).get('enabled',True)))
+        # Preview failures never trigger a replay of the expensive ChatGPT call.
+        # No preview is applied to YouTube. All candidates require human review.
+        preview_cfg=cfg.get('preview',{})
+        if preview_cfg.get('enabled',False):
+            import reaction_previews
+            preview_login=preview_cfg.get('test_streamer','') if local_name else login
+            for i,(row,video) in enumerate(zip(rows,outputs),1):
+                if row.get('type')!='reaction': continue
+                target=Path(video).with_name(Path(video).stem+' — превью.jpg')
+                report=target.with_suffix('.json')
+                if target.exists() or report.exists():
+                    progress('Превью',f'Нарезка {i}: ранее созданные файлы не перезаписываются; проверьте вручную')
+                    continue
+                progress('Превью',f'Нарезка {i}/{len(rows)}: поиск видео и сборка превью')
+                try:
+                    info=reaction_previews.generate(self.root,preview_login,row,segs,target)
+                    atomic_json(report,info)
+                    progress('Превью',f'Нарезка {i}: превью сохранено, источник требует проверки')
+                except Exception as exc:
+                    progress('Превью',f'Нарезка {i}: превью не готово ({type(exc).__name__}): {str(exc)[:250]}')
         progress('Готово',f'Найдено моментов: {len(rows)}; сохранено видео: {len(outputs)}')
         return {'folder':str(ready),'outputs':outputs,'reactions':len(rows),'moments':rows}
