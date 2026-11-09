@@ -484,12 +484,10 @@ class ChatGPTWeb:
         before_assistants = int(baseline.get('assistants', 0))
         deadline = time.monotonic() + self._remaining(wait_upload)
         expected = self._norm(getattr(self, '_pending_prompt', '') or initial.get('text', ''))
-        payload_consumed = False
         clicks = 0
         stable_key = None
         stable = 0
         next_log = 0.0
-        last_click = 0.0
         self._log('текст в поле; жду завершения загрузки файла и активную кнопку отправки')
         try:
             tab.call('Page.bringToFront')
@@ -505,17 +503,17 @@ class ChatGPTWeb:
             if st.get('uploadError'):
                 raise ChatGPTWebError('ChatGPT сообщил об ошибке загрузки файла; запрос НЕ отправлен')
             current = self._norm(st.get('text', ''))
-            if clicks and (not current):
-                payload_consumed = True
-            if payload_consumed:
+            if clicks:
                 if time.monotonic() >= next_log:
-                    self._status('проверяю доставку; повторно не отправляю')
-                    self._log('поле очистилось после клика; жду подтверждения, повторно НЕ отправляю')
+                    self._status('кнопка нажата; жду подтверждения отправки, повторного клика не будет')
+                    self._log('кнопка нажата; жду подтверждения, повторно НЕ отправляю')
                     next_log = time.monotonic() + 10
                 time.sleep(0.5)
                 continue
             ready = st.get('has') and (not st.get('stop')) and (not st.get('disabled')) and (not st.get('uploading')) and current and (not expected or current == expected)
-            fingerprint = (st.get('key'), current)
+            # The page may replace the button on every render. Stabilize the payload,
+            # then use the current button identity for the single click.
+            fingerprint = current
             if ready:
                 stable = stable + 1 if fingerprint == stable_key else 1
                 stable_key = fingerprint
@@ -536,6 +534,7 @@ class ChatGPTWeb:
                     tab.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
                     tab.call('Input.dispatchMouseEvent', type='mousePressed', x=x, y=y, button='left', clickCount=1)
                     tab.call('Input.dispatchMouseEvent', type='mouseReleased', x=x, y=y, button='left', clickCount=1)
+                    self._status('кнопка нажата; проверяю подтверждение отправки')
                     self._log('нажал кнопку отправки мышью; проверяю доставку')
                 else:
                     if not tab.js(self.JS_CLICK_SEND % json.dumps({'key': st.get('key')})):
@@ -543,9 +542,9 @@ class ChatGPTWeb:
                         stable = 0
                         time.sleep(0.5)
                         continue
+                    self._status('кнопка нажата; проверяю подтверждение отправки')
                     self._log('нажал кнопку отправки через DOM; проверяю доставку')
                 clicks += 1
-                last_click = time.monotonic()
                 stable = 0
             time.sleep(0.5)
         if clicks:
