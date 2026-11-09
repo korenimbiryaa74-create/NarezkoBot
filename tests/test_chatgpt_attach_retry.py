@@ -154,6 +154,25 @@ class AttachRetryTests(unittest.TestCase):
             with self.assertRaises(ChatGPTWebError):self.web._send(wait_upload=35)
         self.assertEqual(self.web.tab.clicks,1)
         self.assertTrue(self.web._send_uncertain)
+        self.assertTrue(any('повторного клика не будет' in event for event in self.events))
+
+    def test_ready_send_with_replaced_button_does_not_stall(self):
+        clock=[0.0]
+        class Fake:
+            def __init__(self):self.polls=0;self.clicks=0
+            def call(self,*a,**kw):return {}
+            def js(self,expr):
+                if expr==self_web.JS_SEND_STATE:
+                    self.polls+=1
+                    return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':'prompt','key':str(self.polls),'hit':False,'users':1 if self.clicks else 0,'assistants':0}
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                self.clicks+=1;return True
+        self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt';self.web._send_baseline={'users':0,'assistants':0}
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+            self.assertTrue(self.web._send(wait_upload=20))
+        self.assertEqual(self.web.tab.clicks,1)
+        self.assertTrue(any('кнопка нажата' in event for event in self.events))
 
     @unittest.skipUnless(shutil.which('chromium'),'requires Chromium')
     def test_dom_recognizes_numbered_transcript_and_upload_progress(self):

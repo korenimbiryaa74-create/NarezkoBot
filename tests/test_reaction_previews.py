@@ -20,6 +20,22 @@ class Tests(unittest.TestCase):
             rows=reactions.find_reactions_whole(str(Path(d)/'x.mp4'),[{'start':0,'end':30,'text':'текст'}],30,{'reactions':{'min_minutes':0}},extra={'chatgpt_doc':ask},log=lambda *_:None)['reactions']
         self.assertEqual(len(calls),1);self.assertIn('preview_text',calls[0]);self.assertEqual(rows[0]['preview_text'],'ИВАНА ЗОЛО ЗАДЕРЖАЛИ');self.assertEqual(rows[1]['preview_text'],'')
         clean=pipeline.validate_intervals(rows,30);self.assertEqual(clean[0]['preview_text'],rows[0]['preview_text'])
+    def test_prompt_requests_short_clickable_labels_not_generic_streamer(self):
+        prompt=reactions.WHOLE_PROMPT
+        for text in ('максимум 4 слова и 32 символа', 'ВЗЛОМАЛИ ДВЕРЬ',
+                     'ПОПАЛИСЬ ГОЛУБЧИКИ', '«стример смотрит»', 'не выдумывай'):
+            self.assertIn(text,prompt)
+
+    def test_long_labels_flagged_not_silently_truncated(self):
+        label='ПОЛИЦИЯ РАЗБИРАЕТСЯ С БЫТОВЫМИ ВЫЗОВАМИ'
+        with (patch.object(rp,'choose_cutout',return_value=Path('x.png')),
+             patch.object(rp,'find_candidates',return_value=([{'id':'6EH2wmSPbMA','title':'x','channel':'y'}],[])),
+             patch.object(rp,'download_thumbnail',return_value=(object(),'https://example.com')),
+             patch.object(rp,'render_preview') as render):
+            info=rp.generate('/unused','name',{'type':'reaction','preview_text':label},[],Path('/unused/x.jpg'))
+        self.assertEqual(info['preview_text'],label);self.assertTrue(info['warnings'])
+        self.assertEqual(render.call_args.args[2],label)
+
     def test_search_uses_only_relevant_snippets_not_entire_stream(self):
         row={'start':10.,'end':30.,'title':'НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}
         segs=[{'start':0,'text':'НЕ ПОПАДЁТ В ПОИСК'}, {'start':12,'text':'Посмотрим ролик про потерю человечности в тик токе'}]
@@ -74,6 +90,19 @@ class Tests(unittest.TestCase):
             self.assertEqual(len(list(Path(result['folder']).glob('* — превью.jpg'))),1)
             self.assertEqual(len(list(Path(result['folder']).glob('* — превью.json'))),1)
             self.assertTrue(any('требует проверки' in x[1] for x in progress))
+
+    def test_local_test_passes_configured_streamer_not_test_placeholder(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'test_input').mkdir();video=root/'test_input'/'video.mp4';video.write_bytes(b'x'*2000)
+            stamp=video.stat();seen=[]
+            def finder(src,segs,duration,login,cfg,progress):seen.append(login);return []
+            def speech(*a,**kw):return ([{'start':1,'end':2,'text':'пример'}],60.)
+            engine=pipeline.Pipeline(root,finder,speech=speech)
+            job={'vod_id':'test-'+'a'*32,'streamer':'test','local_name':video.name,'local_size':stamp.st_size,'local_mtime_ns':stamp.st_mtime_ns}
+            with patch.object(pipeline,'media_duration',return_value=60):
+                engine.run(job,{'min_reaction_minutes':0,'preview':{'enabled':False,'test_streamer':'kussia88'}})
+                engine.run(job,{'min_reaction_minutes':0,'preview':{'enabled':False,'test_streamer':''}})
+            self.assertEqual(seen,['kussia88',''])
 
     def test_no_preview_for_discussion(self):
         with self.assertRaises(rp.PreviewError):rp.generate('/unused','name',{'type':'discussion'},[],Path('/tmp/a.jpg'))
