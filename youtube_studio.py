@@ -566,9 +566,12 @@ class YouTubeStudio:
                             else:monitor.call('Page.reload',ignoreCache=True)
                             last_refresh=time.monotonic()+30
                         monitor_errors=0
-                    except Exception:
+                    except Exception as exc:
                         monitor_errors+=1
-                        if monitor_errors>=10:raise StudioError('Потеряна связь с окном обработки; отправленные видео не будут загружены повторно')
+                        # Failure to read one processing page must not prevent
+                        # other newly rendered clips from being submitted.
+                        if monitor_errors==1 or monitor_errors % 12==0:
+                            progress(pending[0]['id'],'Не удалось прочитать статус обработки ('+type(exc).__name__+'); продолжу публикацию готовых нарезок и повторю проверку')
                     if time.monotonic()-last_report>=60:
                         left=len(queue.submitted_uploads(profile))
                         if left:progress(pending[0]['id'],f'Ожидаю загрузку и обработку {left} видео; не закрывайте Chrome')
