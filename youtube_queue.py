@@ -165,7 +165,7 @@ class YouTubeQueue:
             db.commit()
             return len(prepared)
 
-    def claim(self, now=None, *, finished_only=False, profile=None):
+    def claim(self, now=None, *, finished_only=False, profile=None, exclude_profiles=()):
         """Claim next clip only when its batch and browser profile are safe to use."""
         now = time.time() if now is None else float(now)
         with self._connect() as db:
@@ -173,6 +173,10 @@ class YouTubeQueue:
             ready = " AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=u.job_id AND j.state='done')" if finished_only else ''
             profile_filter=" AND u.profile=?" if profile is not None else ''
             params=(profile_key(profile),) if profile is not None else ()
+            excluded=tuple(profile_key(p) for p in exclude_profiles)
+            if excluded:
+                profile_filter+=' AND u.profile NOT IN ('+','.join('?' for _ in excluded)+')'
+                params+=excluded
             row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued' ''' + ready + profile_filter + '''
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads prior
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index

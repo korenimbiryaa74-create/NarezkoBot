@@ -24,7 +24,7 @@ class Service:
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
         self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
-        self._watch_state={}; self._watch_generation=0; self._youtube_wait_message=''
+        self._watch_state={}; self._watch_generation=0; self._youtube_wait_message=''; self._youtube_batch_blocked=set()
 
     def log(self,text):
         with self._lock: self._logs.append((time.time(),str(text)))
@@ -272,10 +272,15 @@ class Service:
             except Exception as exc:self.log(f'Ошибка очереди ({type(exc).__name__})')
             self.stop_event.wait(5)
 
+    def resume_youtube_after_review(self, profile=None):
+        if profile is None:self._youtube_batch_blocked.clear()
+        else:self._youtube_batch_blocked.discard(profile)
+        self.wake.set()
+
     def youtube_once(self):
         enabled=self.settings.load().get('youtube',{}).get('enabled')
-        row=self.youtube_queue.claim(finished_only=True) if enabled else None
-        pending=self.youtube_queue.submitted_uploads() if enabled else []
+        row=self.youtube_queue.claim(finished_only=True,exclude_profiles=tuple(self._youtube_batch_blocked)) if enabled else None
+        pending=[r for r in self.youtube_queue.submitted_uploads() if r['profile'] not in self._youtube_batch_blocked] if enabled else []
         if not row and not pending:
             message=self.youtube_queue.waiting_reason(enabled=bool(enabled))
             if message and message!=self._youtube_wait_message:self.log(message)
@@ -310,7 +315,8 @@ class Service:
                 current=next((r for r in self.youtube_queue.list_uploads() if r['id']==row['id']),None)
                 if current and current['state']=='uploading' and not current.get('submitted'):
                     self.youtube_queue.mark_uncertain(row['id'],detail)
-            self.log('YouTube: пакет остановлен — '+detail+'; проверьте Studio, не повторяйте загрузку вслепую')
+            self._youtube_batch_blocked.add(anchor['profile'])
+            self.log('YouTube: пакет остановлен — '+detail+'; автоматический повтор приостановлен, чтобы не открывать новые окна Chrome')
             self.store.notify('YouTube: пакет остановлен; проверьте Studio перед повтором.')
             self.stop_event.wait(15)
         return True
