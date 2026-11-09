@@ -228,7 +228,7 @@ class Service:
             def progress(stage,detail=''):
                 detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
-                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов','Названия YouTube'): self.log(f"VOD {job['vod_id']}: {detail}")
+                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             count=len(outcome['outputs'])
             if cfg.get('youtube',{}).get('enabled') and count:
@@ -236,10 +236,10 @@ class Service:
                 binding=self.youtube_queue.get_profile(profile)
                 if not binding or binding.get('audience') not in ('kids','not_kids'):
                     raise ValueError('Сначала привяжите канал YouTube и укажите аудиторию')
-                progress('Названия YouTube','Подготовка названий готовых видео')
-                titles=self.finder.youtube_titles(job,outcome,progress)
+                # Temporarily publish with the existing filenames; no additional
+                # ChatGPT request is made to generate titles.
                 progress('Очередь YouTube','Добавление готовых видео в очередь YouTube')
-                added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')),titles=titles)
+                added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')))
                 self.log(f"VOD {job['vod_id']}: в очередь YouTube добавлено {added}")
             name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
             notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих моментов не найдено.'
