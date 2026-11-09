@@ -300,6 +300,7 @@ class App:
         if not messagebox.askyesno('YouTube: проверка перед повтором',text):return
         try:
             self.service.youtube_queue.retry_reviewed(int(selected[0]))
+            self.service.resume_youtube_after_review()
             self.service.log('YouTube: пользователь разрешил повтор после ручной проверки')
         except ValueError as exc:messagebox.showerror('YouTube',str(exc))
 
@@ -315,6 +316,7 @@ class App:
         if not messagebox.askyesno('YouTube: отмена загрузки',text):return
         try:
             self.service.youtube_queue.cancel_reviewed_or_queued(row['id'])
+            self.service.resume_youtube_after_review(row['profile'])
             self.service.log('YouTube: отменена запись №'+str(row['id'])+' после проверки пользователем')
         except ValueError as exc:messagebox.showerror('YouTube',str(exc))
 
@@ -326,6 +328,7 @@ class App:
         if not messagebox.askyesno('YouTube: очистить очередь',text):return
         try:
             count=self.service.youtube_queue.clear_pending_uploads()
+            self.service.resume_youtube_after_review()
             self.service.log(f'YouTube: очередь очищена, отменено загрузок {count}')
             messagebox.showinfo('YouTube',f'Отменено загрузок: {count}. Текущая загрузка продолжится.')
         except Exception as exc:messagebox.showerror('YouTube','Не удалось очистить очередь: '+type(exc).__name__)
@@ -347,6 +350,7 @@ class App:
         if not video_id:messagebox.showerror('YouTube','Не удалось прочитать ссылку на видео.');return
         try:
             self.service.youtube_queue.confirm_reviewed(row['id'],video_id)
+            self.service.resume_youtube_after_review(row['profile'])
             self.service.log('YouTube: пользователь подтвердил видео '+video_id)
         except ValueError as exc:messagebox.showerror('YouTube',str(exc))
 
