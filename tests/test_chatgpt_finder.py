@@ -8,7 +8,7 @@ class Web:
     def __init__(self,**kw): self.offscreen=False; self.timeout=0
     def ask(self,prompt,files,until):
         self.calls+=1
-        answer='{"reactions":[{"start":"00:00:10","end":"00:00:40","title":"Видео"}]}'
+        answer='{"reactions":[{"start":"00:00:10","end":"00:00:40","title":"Видео","type":"reaction"}]}'
         assert Path(files[0]).read_text(encoding='utf8') and until(answer)
         return {'text':answer}
     def close(self): pass

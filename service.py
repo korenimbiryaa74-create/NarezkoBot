@@ -223,7 +223,7 @@ class Service:
             outcome=engine.run(job,cfg['pipeline'],progress)
             count=len(outcome['outputs'])
             name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
-            notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих реакций не найдено.'
+            notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих моментов не найдено.'
             self.store.finish(job['id'],'done',f"Видео: {count}; {outcome['folder']}",notification=notice)
             self.log(f"VOD {job['vod_id']}: готово")
         except Exception as exc:
