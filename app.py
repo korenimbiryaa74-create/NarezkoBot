@@ -2,6 +2,7 @@
 from __future__ import annotations
 import copy
 import os
+import queue
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -28,6 +29,7 @@ class App:
         self.finder=ChatGPTFinder(ROOT); self.service=Service(ROOT,self.settings,self.finder)
         self.service.recover_interrupted()
         self.variables={}; self._last_job=None; self.yt_connect_event=None; self.yt_browser_opened=None
+        self._preview_running=False; self._preview_cancel=None; self._preview_close_requested=False; self._preview_events=queue.SimpleQueue()
         self._build()
         self._load_controls()
         self._import_profiles_once()
@@ -72,6 +74,11 @@ class App:
         ttk.Button(testbar,text='Открыть папку тестовых видео',command=self.open_test_input).pack(side='left')
         ttk.Button(testbar,text='Запустить тест из папки',command=self.start_test).pack(side='left',padx=5)
         ttk.Button(testbar,text='Продолжить очередь',command=self.resume_queue).pack(side='left',padx=5)
+        ttk.Button(testbar,text='Тест превью',command=self.test_preview).pack(side='left',padx=5)
+        previewbar=ttk.Frame(dashboard);previewbar.pack(fill='x')
+        ttk.Button(previewbar,text='Отменить тест превью',command=self.cancel_preview).pack(side='right')
+        self.preview_status=tk.StringVar(value='')
+        ttk.Label(previewbar,textvariable=self.preview_status).pack(side='left')
         self.status=tk.StringVar(value='Остановлено')
         ttk.Label(dashboard,textvariable=self.status).pack(anchor='w',pady=(9,4))
         ttk.Label(dashboard,text='Стримеры и ожидаемые записи (сохранённый список)').pack(anchor='w')
@@ -553,6 +560,50 @@ class App:
         try:self.service.store.clear_notifications()
         except Exception as exc:messagebox.showerror('Уведомления','Не удалось очистить уведомления: '+type(exc).__name__)
 
+    def test_preview(self):
+        from tkinter import simpledialog
+        import preview_local
+        if self._preview_running:
+            messagebox.showinfo('Тест превью','Генерация уже идёт. Дождитесь её завершения.');return
+        try:
+            preview_local.check_install(ROOT)
+            import PIL
+        except Exception as exc:
+            messagebox.showerror('Тест превью',str(exc)+'\nУстановите генератор через INSTALL.bat.');return
+        path=filedialog.askopenfilename(title='Выберите готовую нарезку',filetypes=[('Видео','*.mp4 *.mkv *.mov *.webm *.avi'),('Все файлы','*.*')])
+        if not path:return
+        style=messagebox.askyesnocancel('Стиль превью','Выберите стиль: Да — Каша, Нет — Никс.\nОтмена — не запускать.')
+        if style is None:return
+        title=simpledialog.askstring('Надпись на превью','Короткая надпись (до 90 символов):',initialvalue=Path(path).stem[:90],parent=self.window)
+        if title is None:return
+        try:title=preview_local.safe_label(title)
+        except Exception as exc:messagebox.showerror('Тест превью',str(exc));return
+        self._preview_running=True;self._preview_cancel=threading.Event();self._preview_close_requested=False
+        self.preview_status.set('Превью: подготовка…')
+        def work():
+            try:
+                result=preview_local.generate_test(ROOT,path,title,'Каша' if style else 'Никс',lambda msg:self._preview_events.put(('status',msg)),cancel=self._preview_cancel)
+                self._preview_events.put(('done',str(result)))
+            except Exception as exc:self._preview_events.put(('error',str(exc)))
+        threading.Thread(target=work,daemon=True).start()
+        self.window.after(500,self._poll_preview)
+    def cancel_preview(self):
+        if self._preview_running:
+            self._preview_cancel.set();self.preview_status.set('Превью: отмена, ожидание завершения операции…')
+    def _poll_preview(self):
+        while True:
+            try:kind,value=self._preview_events.get_nowait()
+            except queue.Empty:break
+            if kind=='status':self.preview_status.set('Превью: '+value)
+            elif kind=='done':
+                self._preview_running=False;self.preview_status.set('Превью готово: '+value)
+                if messagebox.askyesno('Тест превью','Превью сохранено:\n'+value+'\n\nОткрыть папку?') and hasattr(os,'startfile'):os.startfile(str(Path(value).parent))
+            elif kind=='error':
+                self._preview_running=False;self.preview_status.set('Ошибка генерации превью')
+                if not self._preview_close_requested:messagebox.showerror('Тест превью',value)
+        if self._preview_close_requested and not self._preview_running:
+            self._preview_close_requested=False;self.close();return
+        if self._preview_running:self.window.after(500,self._poll_preview)
     def open_outputs(self):
         folder=ROOT/'recordings';folder.mkdir(exist_ok=True)
         if hasattr(os,'startfile'):os.startfile(str(folder))
@@ -598,6 +649,10 @@ class App:
         except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
         self.window.after(3000,self.refresh)
     def close(self):
+        if self._preview_running:
+            if messagebox.askyesno('Тест превью','Отменить генерацию превью и выйти?'):
+                self._preview_close_requested=True;self.cancel_preview()
+            return
         active=any(j['state']=='running' for j in self.service.store.list_jobs(1000)) or any(j['state']=='uploading' and j.get('tracking',1) for j in self.service.youtube_queue.list_uploads())
         if active and not messagebox.askyesno('Выход','Обработка ещё идёт. Выход прервёт её. Выйти?'):return
         self.service.request_stop()
