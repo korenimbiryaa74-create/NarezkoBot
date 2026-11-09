@@ -1,4 +1,40 @@
 ﻿# Called from install.ps1; shares Run-Checked, Download-Verified and Install-Winget.
+# Keep the partial archive across connection failures and installer restarts.
+function Download-PreviewArchive([string]$archive) {
+    $url = 'https://github.com/Comfy-Org/ComfyUI/releases/download/v0.44.0/ComfyUI_windows_portable_nvidia.7z'
+    $expected = '7170c2db49c182a81adcc051e80234f99dd891656fb200737f87797876348f96'
+    $expectedSize = [Int64]2054382457
+    $part = "$archive.part"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archive) | Out-Null
+    if (Test-Path -LiteralPath $archive) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $expected) { throw "Архив $archive отличается от официального и не изменён." }
+        return
+    }
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (Test-Path -LiteralPath $part) {
+            $bytes = (Get-Item -LiteralPath $part).Length
+            if ($bytes -gt $expectedSize) { throw "Файл $part слишком большой и не изменён. Уберите его вручную и повторите установку." }
+            if ($bytes -eq $expectedSize) {
+                Write-Host 'Проверка контрольной суммы архива ComfyUI...'
+                if ((Get-FileHash -Algorithm SHA256 -LiteralPath $part).Hash.ToLowerInvariant() -ne $expected) { throw "Контрольная сумма $part не совпадает. Файл сохранён; уберите его вручную и запустите установку снова." }
+                Move-Item -LiteralPath $part -Destination $archive
+                return
+            }
+            Write-Host "Продолжаю скачивание ComfyUI: сохранено $([Math]::Round($bytes / 1MB)) МиБ."
+        }
+        & curl.exe --fail --location --continue-at - --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --speed-limit 1024 --speed-time 120 --output $part $url
+        $curlCode = $LASTEXITCODE
+        if ((Test-Path -LiteralPath $part) -and (Get-Item -LiteralPath $part).Length -eq $expectedSize) { continue }
+        if ($attempt -lt 5) { Write-Host "Соединение прервано (код $curlCode); повторяю с сохранённого места..."; Start-Sleep -Seconds 5 }
+    }
+    if ((Test-Path -LiteralPath $part) -and (Get-Item -LiteralPath $part).Length -eq $expectedSize) {
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $part).Hash.ToLowerInvariant() -ne $expected) { throw "Контрольная сумма $part не совпадает. Файл сохранён; уберите его вручную и запустите установку снова." }
+        Move-Item -LiteralPath $part -Destination $archive
+        return
+    }
+    throw "Не удалось закончить загрузку ComfyUI. Частичный файл сохранён: $part. Проверьте интернет и повторите INSTALL.bat."
+}
+
 function Install-LocalPreview {
     Write-Host ''
     Write-Host 'Тест превью: локальный ComfyUI и FLUX Klein, загрузка около 20 ГБ; рекомендуется 35 ГБ свободного места.'
@@ -25,9 +61,9 @@ function Install-LocalPreview {
         $temp = Join-Path ([System.IO.Path]::GetTempPath()) ('narezko-comfy-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $temp | Out-Null
         try {
-            $archive = Join-Path $temp 'comfy.7z'
-            Write-Host 'Загрузка официального ComfyUI portable (~2 ГБ)...'
-            Download-Verified 'https://github.com/Comfy-Org/ComfyUI/releases/download/v0.44.0/ComfyUI_windows_portable_nvidia.7z' $archive '7170c2db49c182a81adcc051e80234f99dd891656fb200737f87797876348f96'
+            $archive = Join-Path $PSScriptRoot 'tools\downloads\ComfyUI-v0.44.0-nvidia.7z'
+            Write-Host 'Загрузка официального ComfyUI portable (~2 ГБ) с поддержкой продолжения...'
+            Download-PreviewArchive $archive
             $extract = Join-Path $temp 'extract'
             Run-Checked -file $seven -arguments @('x','-y',$archive,('-o' + $extract))
             $unpacked = Join-Path $extract 'ComfyUI_windows_portable'
