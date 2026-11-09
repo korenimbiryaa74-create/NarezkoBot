@@ -164,7 +164,7 @@ class App:
         ttk.Button(ybar,text='Подтвердить выбранный канал',command=self.youtube_ready).pack(side='left',padx=5)
         ttk.Button(ybar,text='Сохранить скорость / аудиторию',command=self.youtube_save_profile).pack(side='left')
         ttk.Label(youtube,text='Войдите в Google, выберите нужный канал в YouTube Studio и нажмите «Подтвердить выбранный канал». Тестовый профиль — отдельный канал __test__.',wraplength=900).grid(row=5,column=0,columnspan=2,sticky='w',padx=8)
-        ttk.Label(youtube,text='Первая нарезка — публично сразу; остальные планируются на YouTube. Тестовые видео — все публично сразу. Разрешено только для контента, который вы вправе публиковать.',wraplength=900).grid(row=6,column=0,columnspan=2,sticky='w',padx=8,pady=4)
+        ttk.Label(youtube,text='Все файлы загружаются без ожидания обработки. Первая нарезка — публично сразу, остальные — по расписанию с выбранным интервалом, включая тестовый канал. Публикуйте только контент, на который у вас есть права.',wraplength=900).grid(row=6,column=0,columnspan=2,sticky='w',padx=8,pady=4)
         ttk.Label(youtube,text='Привязанные каналы (сохранены локально; вход может истечь). Выберите строку для редактирования.').grid(row=7,column=0,columnspan=2,sticky='w',padx=8)
         yprofiles=ttk.Frame(youtube);yprofiles.grid(row=8,column=0,columnspan=2,sticky='nsew',padx=8,pady=2);youtube.rowconfigure(8,weight=1)
         self.youtube_profiles=ttk.Treeview(yprofiles,columns=('profile','channel','speed','audience'),show='headings',height=3,selectmode='browse')
@@ -256,7 +256,7 @@ class App:
         for index,row in enumerate(rows):
             profile=row['profile']
             label=profile+' (тестовый)' if profile=='__test__' else profile
-            speed='Все сразу' if profile=='__test__' else ('16 часов' if row['interval_hours']==16 else '1 час')
+            speed='16 часов' if row['interval_hours']==16 else '1 час'
             values=(label,row['channel_id'],speed,audience.get(row['audience'],'Не указана'))
             if profile in existing:
                 if tuple(self.youtube_profiles.item(profile,'values'))!=values:
