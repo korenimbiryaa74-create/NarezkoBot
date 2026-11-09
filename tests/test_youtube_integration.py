@@ -176,6 +176,19 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertEqual(result.second,0)
         self.assertEqual(result.timestamp(),timestamp-timestamp%60)
 
+    def test_open_schedule_waits_for_visible_controls_and_refuses_ambiguity(self):
+        class Tab:
+            def __init__(self,state):self.state=state;self.calls=[]
+            def js(self,script):
+                self.calls.append(script)
+                return self.state if script==studio._OPEN_SCHEDULE else True
+        for state in ('opened','ready'):
+            tab=Tab(state);studio.open_schedule(tab)
+            self.assertEqual(tab.calls,[studio._OPEN_SCHEDULE,studio._SCHEDULE_OPEN])
+        tab=Tab('ambiguous')
+        with self.assertRaisesRegex(studio.StudioError,'неоднозначно'):studio.open_schedule(tab)
+        self.assertEqual(tab.calls,[studio._OPEN_SCHEDULE])
+
     def test_check_prompt_is_confirmed_only_once_then_receipt(self):
         messages=[]
         class Tab:
