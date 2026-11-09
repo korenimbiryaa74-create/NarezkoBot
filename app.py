@@ -183,6 +183,7 @@ class App:
         yr=ttk.Frame(youtube);yr.grid(row=11,column=0,columnspan=2,sticky='w',padx=8)
         ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
         ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
+        ttk.Button(yr,text='Отменить выбранную загрузку',command=self.youtube_cancel).pack(side='left',padx=5)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
@@ -301,6 +302,21 @@ class App:
             self.service.log('YouTube: пользователь разрешил повтор после ручной проверки')
         except ValueError as exc:messagebox.showerror('YouTube',str(exc))
 
+    def youtube_cancel(self):
+        selected=self.youtube_rows.selection()
+        if len(selected)!=1:messagebox.showinfo('YouTube','Выберите одну загрузку.');return
+        row=next((r for r in self.service.youtube_queue.list_uploads() if str(r['id'])==selected[0]),None)
+        if not row or row['state'] not in ('queued','needs_review'):
+            messagebox.showerror('YouTube','Можно отменить только запись в очереди или требующую проверки.');return
+        text=('Отменить загрузку №'+str(row['id'])+'? Это не удалит видео или черновик на YouTube. '
+              'Проверьте Studio и убедитесь, что загрузка этого видео не продолжается в Chrome. '
+              'Другие записи очереди НЕ отменятся и могут начать загружаться.')
+        if not messagebox.askyesno('YouTube: отмена загрузки',text):return
+        try:
+            self.service.youtube_queue.cancel_reviewed_or_queued(row['id'])
+            self.service.log('YouTube: отменена запись №'+str(row['id'])+' после проверки пользователем')
+        except ValueError as exc:messagebox.showerror('YouTube',str(exc))
+
     def youtube_confirm_existing(self):
         from tkinter import simpledialog
         from youtube_studio import video_from_url
@@ -366,7 +382,7 @@ class App:
         except Exception as exc: messagebox.showerror('История','Не удалось очистить историю: '+type(exc).__name__)
 
     def clear_queue(self):
-        if not messagebox.askyesno('Очистить очередь','Отменить ожидающие задания и задания, ожидающие повтора? Текущее задание продолжится. Мониторинг может добавить новые задания. Кэш и результаты сохранятся.'):
+        if not messagebox.askyesno('Очистить очередь','Отменить ожидающие задания нарезки и повторы? Текущее задание продолжится. Очередь YouTube не изменится. Мониторинг может добавить новые задания. Кэш и результаты сохранятся.'):
             return
         try:
             count=self.service.store.clear_queue()
@@ -549,9 +565,16 @@ class App:
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
             ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
-            for r in self.service.youtube_queue.list_uploads()[-200:]:
+            all_uploads=self.service.youtube_queue.list_uploads()
+            # Unresolved records must remain visible even when older than 200 rows.
+            recent=all_uploads[-200:]
+            recent_ids={r['id'] for r in recent}
+            visible=[r for r in all_uploads if r['state']=='needs_review' and r['id'] not in recent_ids]+recent
+            visible.sort(key=lambda r:(r['state']!='needs_review',r['id']))
+            for r in visible:
                 when=__import__('datetime').datetime.fromtimestamp(r['publish_at']).strftime('%d.%m.%Y %H:%M') if r['publish_at'] else 'Сразу'
-                detail=('https://youtu.be/'+r['video_id']) if r['video_id'] else r['detail']
+                info=('https://youtu.be/'+r['video_id']) if r['video_id'] else r['detail']
+                detail=r['title']+(' — '+info if info else '')
                 self.youtube_rows.insert('','end',iid=str(r['id']),values=(r['id'],r['profile'],ytlabels.get(r['state'],r['state']),when,detail))
             for item in ytselected:
                 if self.youtube_rows.exists(item):self.youtube_rows.selection_add(item)
