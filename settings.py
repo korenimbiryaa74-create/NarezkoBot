@@ -9,6 +9,7 @@ from proxy_setup import parse_proxy
 
 DEFAULTS={
  'twitch':{'client_id':'','client_secret':''},
+ 'youtube':{'enabled':False},
  'streamers':[], 'monitor':{'enabled':False,'interval':60,'profiles_imported':False},
  'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True,'groq':False},
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
@@ -25,6 +26,7 @@ def merge(base, override):
 
 def validate(config):
     result=merge(DEFAULTS,config)
+    if not isinstance(result.get('youtube'),dict) or not isinstance(result['youtube'].get('enabled'),bool): raise ValueError('Некорректная настройка YouTube')
     result['streamers']=list(dict.fromkeys(normalize_login(s) for s in result['streamers']))
     m=result['monitor']; m['interval']=int(m['interval'])
     if not 15<=m['interval']<=3600: raise ValueError('Интервал мониторинга: от 15 до 3600 секунд')

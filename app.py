@@ -14,6 +14,7 @@ import stream_cutter
 import manual_blur
 import windows_autostart
 import single_instance
+from youtube_queue import profile_key
 
 ROOT=Path(__file__).resolve().parent
 
@@ -26,7 +27,7 @@ class App:
             messagebox.showerror('Настройки',str(exc)); raise
         self.finder=ChatGPTFinder(ROOT); self.service=Service(ROOT,self.settings,self.finder)
         self.service.recover_interrupted()
-        self.variables={}; self._last_job=None
+        self.variables={}; self._last_job=None; self.yt_connect_event=None; self.yt_browser_opened=None
         self._build()
         self._load_controls()
         self._import_profiles_once()
@@ -111,6 +112,7 @@ class App:
         sub=ttk.Notebook(settings);sub.pack(fill='both',expand=True)
         common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8); speech=ttk.Frame(sub,padding=8)
         sub.add(common,text='Twitch и прокси');sub.add(processing,text='Обработка');sub.add(speech,text='Распознавание речи')
+        youtube=ttk.Frame(sub,padding=8);sub.add(youtube,text='YouTube');youtube.columnconfigure(1,weight=1)
         for f in (common,processing,speech):f.columnconfigure(1,weight=1)
         self._row(common,0,'Twitch Client ID','client_id')
         self._row(common,1,'Twitch Client Secret','client_secret',secret=True)
@@ -151,11 +153,30 @@ class App:
         ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)
         self._toggle(speech,3,'Прокси для Groq (дополнительно включите общий прокси)','proxy_groq')
         ttk.Label(speech,text='Аудио отправляется в Groq. Возможны лимиты и плата.\nБез ключа или при ошибке используется локальный Whisper.\nКлюч хранится в config.json открытым текстом; не делитесь этим файлом.').grid(row=4,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        self._toggle(youtube,0,'Включить автоматическую публичную загрузку YouTube','youtube_enabled')
+        self._row(youtube,1,'Профиль: Twitch-ник или __test__ для тестов','youtube_profile')
+        ttk.Label(youtube,text='Скорость для новых нарезок').grid(row=2,column=0,sticky='w',padx=8,pady=4)
+        ttk.Combobox(youtube,textvariable=self.var('youtube_speed','Быстро: 1 час'),values=['Быстро: 1 час','Медленно: 16 часов'],state='readonly').grid(row=2,column=1,sticky='w',padx=8)
+        ttk.Label(youtube,text='Аудитория видео на этом канале').grid(row=3,column=0,sticky='w',padx=8,pady=4)
+        ttk.Combobox(youtube,textvariable=self.var('youtube_audience','Выберите'),values=['Выберите','Не предназначено специально для детей','Предназначено для детей'],state='readonly',width=38).grid(row=3,column=1,sticky='w',padx=8)
+        ybar=ttk.Frame(youtube);ybar.grid(row=4,column=0,columnspan=2,sticky='w',padx=8,pady=6)
+        ttk.Button(ybar,text='Войти и привязать канал',command=self.youtube_connect).pack(side='left')
+        ttk.Button(ybar,text='Подтвердить выбранный канал',command=self.youtube_ready).pack(side='left',padx=5)
+        ttk.Button(ybar,text='Сохранить скорость / аудиторию',command=self.youtube_save_profile).pack(side='left')
+        ttk.Label(youtube,text='Войдите в Google, выберите нужный канал в YouTube Studio и нажмите «Подтвердить выбранный канал». Тестовый профиль — отдельный канал __test__.',wraplength=900).grid(row=5,column=0,columnspan=2,sticky='w',padx=8)
+        ttk.Label(youtube,text='Первая нарезка — публично сразу; остальные планируются на YouTube. Тестовые видео — все публично сразу. Разрешено только для контента, который вы вправе публиковать.',wraplength=900).grid(row=6,column=0,columnspan=2,sticky='w',padx=8,pady=4)
+        self.youtube_rows=ttk.Treeview(youtube,columns=('id','profile','state','time','detail'),show='headings',height=7)
+        for key,width,label in [('id',50,'№'),('profile',110,'Профиль'),('state',120,'Состояние'),('time',150,'Дата публикации'),('detail',420,'Информация')]:
+            self.youtube_rows.heading(key,text=label);self.youtube_rows.column(key,width=width,stretch=True)
+        self.youtube_rows.grid(row=7,column=0,columnspan=2,sticky='nsew',padx=8,pady=4);youtube.rowconfigure(7,weight=1)
+        yr=ttk.Frame(youtube);yr.grid(row=8,column=0,columnspan=2,sticky='w',padx=8)
+        ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
+        ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
         c=self.config; p=c['pipeline']; s=p['silence']; v=self.variables
-        values={'client_id':c['twitch']['client_id'],'client_secret':c['twitch']['client_secret'],
+        values={'youtube_enabled':c.get('youtube',{}).get('enabled',False),'client_id':c['twitch']['client_id'],'client_secret':c['twitch']['client_secret'],
           'streamers':', '.join(c['streamers']),'interval':c['monitor']['interval'],'monitor_enabled':c['monitor']['enabled'],
           'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],'proxy_groq':c['proxy']['groq'],
           'groq_enabled':p['speech']['groq_enabled'],'groq_api_key':p['speech']['groq_api_key'],
@@ -165,6 +186,7 @@ class App:
     def save(self):
         try:
             v=self.variables; c=copy.deepcopy(self.config)
+            c['youtube']['enabled']=v['youtube_enabled'].get()
             c['twitch']={'client_id':v['client_id'].get().strip(),'client_secret':v['client_secret'].get().strip()}
             c['streamers']=[x.strip() for x in v['streamers'].get().split(',') if x.strip()]
             c['monitor'].update(enabled=v['monitor_enabled'].get(),interval=v['interval'].get())
@@ -177,6 +199,86 @@ class App:
             return True
         except Exception as exc:
             messagebox.showerror('Ошибка настроек',str(exc));return False
+    def _youtube_options(self):
+        profile=profile_key(self.variables['youtube_profile'].get())
+        speed=self.variables['youtube_speed'].get()
+        if speed not in ('Быстро: 1 час','Медленно: 16 часов'): raise ValueError('Выберите скорость публикации')
+        audience={'Не предназначено специально для детей':'not_kids','Предназначено для детей':'kids'}.get(self.variables['youtube_audience'].get())
+        if not audience: raise ValueError('Укажите аудиторию видео для этого канала')
+        return profile,16 if speed.startswith('Медленно') else 1,audience
+
+    def youtube_connect(self):
+        try: profile,interval,audience=self._youtube_options()
+        except ValueError as exc: messagebox.showerror('YouTube',str(exc));return
+        if self.yt_connect_event is not None:
+            messagebox.showwarning('YouTube','Подключение уже выполняется.');return
+        if not messagebox.askyesno('YouTube','Откроется отдельное окно браузера. Войдите сами, выберите нужный канал в YouTube Studio и затем нажмите в приложении «Подтвердить выбранный канал». Продолжить?'):return
+        ready=threading.Event();opened=threading.Event();self.yt_connect_event=ready;self.yt_browser_opened=opened
+        self.status.set('YouTube: войдите, выберите канал и подтвердите его в приложении')
+        def work():
+            try:
+                channel=self.service.youtube_studio.connect(profile,ready,opened)
+                self.service.youtube_queue.bind(profile,channel,interval,audience=audience)
+                result=f'Профиль {profile} привязан к каналу {channel}. Проверьте, что это нужный канал.'
+                self.service.log('YouTube: '+result)
+                ok=True
+            except Exception as exc:
+                result=str(exc)[:400];ok=False
+                self.service.log('YouTube: не удалось привязать канал ('+type(exc).__name__+')')
+            def done():
+                self.yt_connect_event=None;self.yt_browser_opened=None
+                self.status.set('YouTube: подключение завершено' if ok else 'YouTube: ошибка подключения')
+                (messagebox.showinfo if ok else messagebox.showerror)('YouTube',result)
+            try:self.window.after(0,done)
+            except RuntimeError:pass
+        threading.Thread(target=work,daemon=True).start()
+
+    def youtube_ready(self):
+        if self.yt_connect_event is None:
+            messagebox.showinfo('YouTube','Сначала нажмите «Войти и привязать канал».');return
+        if not self.yt_browser_opened or not self.yt_browser_opened.is_set():
+            messagebox.showinfo('YouTube','Дождитесь открытия окна браузера и выберите канал.');return
+        self.yt_connect_event.set();self.status.set('YouTube: проверяю выбранный канал')
+
+    def youtube_save_profile(self):
+        try:
+            profile,interval,audience=self._youtube_options()
+            old=self.service.youtube_queue.get_profile(profile)
+            if not old:raise ValueError('Сначала войдите и привяжите канал.')
+            self.service.youtube_queue.bind(profile,old['channel_id'],interval,audience=audience)
+            messagebox.showinfo('YouTube','Сохранено для новых заданий. Уже запланированные публикации не изменятся.')
+        except ValueError as exc:messagebox.showerror('YouTube',str(exc))
+
+    def youtube_retry(self):
+        selected=self.youtube_rows.selection()
+        if not selected:messagebox.showinfo('YouTube','Выберите загрузку, требующую проверки.');return
+        text=('Проверьте YouTube Studio на выбранном канале. Если видео или черновик уже создан, удалите его или не повторяйте загрузку. '
+              'Вы подтверждаете, что такого видео и черновика на канале нет и повтор не создаст дубль?')
+        if not messagebox.askyesno('YouTube: проверка перед повтором',text):return
+        try:
+            self.service.youtube_queue.retry_reviewed(int(selected[0]))
+            self.service.log('YouTube: пользователь разрешил повтор после ручной проверки')
+        except ValueError as exc:messagebox.showerror('YouTube',str(exc))
+
+    def youtube_confirm_existing(self):
+        from tkinter import simpledialog
+        from youtube_studio import video_from_url
+        selected=self.youtube_rows.selection()
+        if not selected:messagebox.showinfo('YouTube','Выберите загрузку, требующую проверки.');return
+        row=next((r for r in self.service.youtube_queue.list_uploads() if str(r['id'])==selected[0]),None)
+        if not row or row['state']!='needs_review':messagebox.showerror('YouTube','Эта загрузка не ожидает проверки.');return
+        text=('В YouTube Studio проверьте именно канал '+row['channel_id']+', видео «'+row['title']+'», '
+              'публичный доступ или точную отложенную дату и время. Вы подтверждаете, что это видео действительно сохранено и настройки верны?')
+        if not messagebox.askyesno('YouTube: подтверждение',text):return
+        value=simpledialog.askstring('YouTube','Вставьте полную ссылку на подтверждённое видео:',parent=self.window)
+        if value is None:return
+        video_id=video_from_url(value.strip())
+        if not video_id:messagebox.showerror('YouTube','Не удалось прочитать ссылку на видео.');return
+        try:
+            self.service.youtube_queue.confirm_reviewed(row['id'],video_id)
+            self.service.log('YouTube: пользователь подтвердил видео '+video_id)
+        except ValueError as exc:messagebox.showerror('YouTube',str(exc))
+
     def import_groq_key(self):
         path=filedialog.askopenfilename(title='Выберите старый config.json',filetypes=[('JSON','*.json'),('Все файлы','*.*')])
         if not path: return
@@ -401,6 +503,15 @@ class App:
             # Keep it until the selection is cleared, then catch up on new events.
             if not self.events.tag_ranges('sel') and self.events.get('1.0','end-1c') != text:
                 self.events.configure(state='normal'); self.events.delete('1.0','end');self.events.insert('1.0',text);self.events.configure(state='disabled')
+            ytselected=self.youtube_rows.selection()
+            self.youtube_rows.delete(*self.youtube_rows.get_children())
+            ytlabels={'queued':'В очереди','uploading':'Загрузка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
+            for r in self.service.youtube_queue.list_uploads()[-200:]:
+                when=__import__('datetime').datetime.fromtimestamp(r['publish_at']).strftime('%d.%m.%Y %H:%M') if r['publish_at'] else 'Сразу'
+                detail=('https://youtu.be/'+r['video_id']) if r['video_id'] else r['detail']
+                self.youtube_rows.insert('','end',iid=str(r['id']),values=(r['id'],r['profile'],ytlabels.get(r['state'],r['state']),when,detail))
+            for item in ytselected:
+                if self.youtube_rows.exists(item):self.youtube_rows.selection_add(item)
             rows=self.service.store.notifications(200)
             notice_text='\n'.join(__import__('datetime').datetime.fromtimestamp(r['timestamp']).strftime('%d.%m %H:%M')+'  '+r['message'] for r in reversed(rows))
             if not self.notifications.tag_ranges('sel') and self.notifications.get('1.0','end-1c') != notice_text:
@@ -408,7 +519,7 @@ class App:
         except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
         self.window.after(3000,self.refresh)
     def close(self):
-        active=any(j['state']=='running' for j in self.service.store.list_jobs(1000))
+        active=any(j['state']=='running' for j in self.service.store.list_jobs(1000)) or any(j['state']=='uploading' for j in self.service.youtube_queue.list_uploads())
         if active and not messagebox.askyesno('Выход','Обработка ещё идёт. Выход прервёт её. Выйти?'):return
         self.service.request_stop()
         if not active:
