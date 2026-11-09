@@ -19,19 +19,19 @@ class YouTubeQueueTests(unittest.TestCase):
             self.files.append(p)
 
     def test_fast_slow_and_test_schedule(self):
-        self.queue.bind('kussia88', CHANNEL_A, 16)
+        self.queue.bind('kussia88', CHANNEL_A, 16, audience='not_kids')
         self.queue.enqueue(1, 'KUSSIA88', self.files, now=1000)
         rows = self.queue.list_uploads()
         self.assertEqual([r['publish_at'] for r in rows], [None, 58600, 116200, 173800, 231400])
-        self.queue.bind('fast', CHANNEL_B, 1)
+        self.queue.bind('fast', CHANNEL_B, 1, audience='not_kids')
         self.queue.enqueue(2, 'fast', self.files[:3], now=1000)
         self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[5:]], [None, 4600, 8200])
-        self.queue.bind('__test__', 'UC'+'c'*22, 16)
+        self.queue.bind('__test__', 'UC'+'c'*22, 16, audience='not_kids')
         self.queue.enqueue(3, 'ignored', self.files[:3], is_test=True, now=1000)
         self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[8:]], [None, None, None])
 
     def test_idempotency_and_changed_file(self):
-        self.queue.bind('a', CHANNEL_A)
+        self.queue.bind('a', CHANNEL_A, audience='not_kids')
         self.assertEqual(self.queue.enqueue(1, 'a', self.files[:2], now=1), 2)
         self.assertEqual(self.queue.enqueue(1, 'a', self.files[:2], now=2), 0)
         with self.assertRaises(ValueError):
@@ -42,7 +42,7 @@ class YouTubeQueueTests(unittest.TestCase):
         self.assertIsNone(self.queue.claim())
 
     def test_uncertain_cannot_auto_retry_or_overtake(self):
-        self.queue.bind('a', CHANNEL_A)
+        self.queue.bind('a', CHANNEL_A, audience='not_kids')
         self.queue.enqueue(1, 'a', self.files[:2], now=1)
         first = self.queue.claim()
         self.assertIsNone(self.queue.claim())
@@ -52,8 +52,22 @@ class YouTubeQueueTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.queue.confirm(first['id'], CHANNEL_A, 'a' * 11)
 
-    def test_verified_receipt_and_channel_protection(self):
+    def test_explicit_audience_and_manual_receipt_reconciliation(self):
         self.queue.bind('a', CHANNEL_A)
+        with self.assertRaises(ValueError): self.queue.enqueue(1,'a',self.files[:2])
+        self.queue.bind('a', CHANNEL_A, audience='not_kids')
+        self.queue.enqueue(1,'a',self.files[:2])
+        first=self.queue.claim();self.queue.mark_uncertain(first['id'],'timeout')
+        self.queue.confirm_reviewed(first['id'],'b'*11)
+        second=self.queue.claim()
+        self.assertEqual(second['clip_index'],2)
+        with self.assertRaises(ValueError):self.queue.confirm(second['id'],CHANNEL_A,'b'*11)
+        self.queue.mark_uncertain(second['id'],'needs check')
+        self.queue.retry_reviewed(second['id'])
+        self.assertEqual(self.queue.claim()['id'],second['id'])
+
+    def test_verified_receipt_and_channel_protection(self):
+        self.queue.bind('a', CHANNEL_A, audience='not_kids')
         with self.assertRaises(ValueError): self.queue.bind('b', CHANNEL_A)
         self.queue.enqueue(1, 'a', self.files[:2])
         with self.assertRaises(ValueError): self.queue.bind('a', CHANNEL_B)

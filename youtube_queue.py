@@ -52,6 +52,12 @@ class YouTubeQueue:
             CREATE INDEX IF NOT EXISTS ix_youtube_uploads_ready
                 ON youtube_uploads(state,id);
             ''')
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(youtube_profiles)')}
+            if 'audience' not in columns:
+                db.execute("ALTER TABLE youtube_profiles ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(youtube_uploads)')}
+            if 'audience' not in columns:
+                db.execute("ALTER TABLE youtube_uploads ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _connect(self):
@@ -62,13 +68,15 @@ class YouTubeQueue:
         finally:
             db.close()
 
-    def bind(self, profile, channel_id, interval_hours=1, now=None):
+    def bind(self, profile, channel_id, interval_hours=1, now=None, audience=''):
         """Bind only an independently verified Studio channel ID; never a login name."""
         profile = profile_key(profile)
         if not _CHANNEL.fullmatch(str(channel_id)):
             raise ValueError('Нужен проверенный ID канала YouTube')
         if isinstance(interval_hours, bool) or interval_hours not in (1, 16):
             raise ValueError('Интервал публикаций должен быть 1 или 16 часов')
+        if audience not in ('', 'kids', 'not_kids'):
+            raise ValueError('Укажите аудиторию YouTube')
         now = time.time() if now is None else float(now)
         if not math.isfinite(now):
             raise ValueError('Некорректное время')
@@ -81,10 +89,10 @@ class YouTubeQueue:
                     db.rollback()
                     raise ValueError('Нельзя менять канал, пока есть незавершённые публикации')
             try:
-                db.execute('''INSERT INTO youtube_profiles(profile,channel_id,interval_hours,updated_at)
-                    VALUES (?,?,?,?) ON CONFLICT(profile) DO UPDATE SET
-                    channel_id=excluded.channel_id,interval_hours=excluded.interval_hours,updated_at=excluded.updated_at''',
-                    (profile, channel_id, interval_hours, now))
+                db.execute('''INSERT INTO youtube_profiles(profile,channel_id,interval_hours,updated_at,audience)
+                    VALUES (?,?,?,?,?) ON CONFLICT(profile) DO UPDATE SET
+                    channel_id=excluded.channel_id,interval_hours=excluded.interval_hours,updated_at=excluded.updated_at,audience=excluded.audience''',
+                    (profile, channel_id, interval_hours, now, audience))
                 db.commit()
             except sqlite3.IntegrityError:
                 db.rollback()
@@ -125,6 +133,9 @@ class YouTubeQueue:
             if not binding:
                 db.rollback()
                 raise ValueError('Сначала привяжите канал YouTube к профилю')
+            if binding['audience'] not in ('kids', 'not_kids'):
+                db.rollback()
+                raise ValueError('Укажите аудиторию канала YouTube в настройках')
             existing = db.execute('SELECT * FROM youtube_uploads WHERE job_id=? ORDER BY clip_index', (job_id,)).fetchall()
             if existing:
                 same = len(existing) == len(prepared) and all(
@@ -140,18 +151,19 @@ class YouTubeQueue:
             for index, (path, size, mtime, title) in enumerate(prepared, 1):
                 publish_at = None if is_test or index == 1 else now + (index - 1) * binding['interval_hours'] * 3600
                 db.execute('''INSERT INTO youtube_uploads
-                    (job_id,clip_index,profile,channel_id,file_path,file_size,file_mtime_ns,title,publish_at,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-                    (job_id,index,profile,binding['channel_id'],path,size,mtime,title,publish_at,now,now))
+                    (job_id,clip_index,profile,channel_id,file_path,file_size,file_mtime_ns,title,publish_at,created_at,updated_at,audience)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (job_id,index,profile,binding['channel_id'],path,size,mtime,title,publish_at,now,now,binding['audience']))
             db.commit()
             return len(prepared)
 
-    def claim(self, now=None):
+    def claim(self, now=None, *, finished_only=False):
         """Claim next clip, blocking later clips of a batch on uncertain/active work."""
         now = time.time() if now is None else float(now)
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued'
+            ready = " AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=u.job_id AND j.state='done')" if finished_only else ''
+            row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued' ''' + ready + '''
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads prior
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index
                     AND prior.state NOT IN ('confirmed','cancelled'))
@@ -186,6 +198,8 @@ class YouTubeQueue:
             if row is None:
                 db.rollback()
                 raise ValueError('Публикация не выполняется или канал не совпадает')
+            if db.execute("SELECT 1 FROM youtube_uploads WHERE state='confirmed' AND video_id=? AND id<>?",(video_id,upload_id)).fetchone():
+                db.rollback();raise ValueError('Это видео уже привязано к другой загрузке')
             db.execute("UPDATE youtube_uploads SET state='confirmed',video_id=?,detail='',updated_at=? WHERE id=?", (video_id,now,upload_id))
             if row['clip_index'] == 1:
                 # Anchor delays to the first accepted publication, not render completion.
@@ -206,6 +220,36 @@ class YouTubeQueue:
             cur = db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE state='uploading'",
                              ('Прервано: проверьте YouTube Studio перед повтором',now))
             return cur.rowcount
+
+    def get_profile(self, profile):
+        with self._connect() as db:
+            row = db.execute('SELECT * FROM youtube_profiles WHERE profile=?', (profile_key(profile),)).fetchone()
+            return dict(row) if row else None
+
+    def confirm_reviewed(self, upload_id, video_id):
+        # This is a human attestation after checking channel, video and visibility.
+        if not _VIDEO_ID.fullmatch(str(video_id)):
+            raise ValueError('Нужен корректный ID видео YouTube')
+        now=time.time()
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute("SELECT job_id,clip_index FROM youtube_uploads WHERE id=? AND state='needs_review'",(upload_id,)).fetchone()
+            if row is None:
+                db.rollback();raise ValueError('Запись не ожидает проверки')
+            if db.execute("SELECT 1 FROM youtube_uploads WHERE state='confirmed' AND video_id=?",(video_id,)).fetchone():
+                db.rollback();raise ValueError('Это видео уже привязано к другой загрузке')
+            db.execute("UPDATE youtube_uploads SET state='confirmed',video_id=?,detail=?,updated_at=? WHERE id=?",(video_id,'Подтверждено пользователем после проверки Studio',now,upload_id))
+            if row['clip_index']==1:
+                # Conservative: remaining delay begins at user confirmation.
+                db.execute("UPDATE youtube_uploads SET publish_at=?+(publish_at-created_at),updated_at=? WHERE job_id=? AND clip_index>1 AND state='queued' AND publish_at IS NOT NULL",(now,now,row['job_id']))
+            db.commit()
+
+    def retry_reviewed(self, upload_id):
+        # Caller must explicitly confirm no upload/draft exists on YouTube.
+        with self._connect() as db:
+            cur = db.execute("UPDATE youtube_uploads SET state='queued',detail='',updated_at=? WHERE id=? AND state='needs_review'", (time.time(),upload_id))
+            if cur.rowcount != 1:
+                raise ValueError('Можно повторить только запись, требующую проверки')
 
     def list_uploads(self):
         with self._connect() as db:
