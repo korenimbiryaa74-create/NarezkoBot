@@ -24,6 +24,31 @@ class MomentsTests(unittest.TestCase):
         for text in ('reaction','discussion','может не быть','20–30 минут'):
             self.assertIn(text,prompt)
         self.assertEqual(seen[0][2],'reactions')
+    def test_prompt_requests_safe_metadata_and_preview_with_timing(self):
+        rows,seen,_=self.find([])
+        self.assertEqual(len(seen),1)
+        prompt=seen[0][0]
+        for text in ('только итоговый JSON без рассуждений', 'не цитируй речь',
+                     'Если момент нельзя описать безопасно, пропусти его',
+                     'живыми, конкретными и понятными', 'preview_text', 'start', 'end'):
+            self.assertIn(text,prompt)
+
+    def test_safety_block_never_retries_or_switches_account(self):
+        from chatgpt_errors import ChatGPTSafetyError
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'gpt_accounts'/'acc_02'/'profile').mkdir(parents=True)
+            attempts=[]
+            class Web:
+                def __init__(self,**kw):self.account=Path(kw['profile']).parent.name
+                def ask(self,*args,**kwargs):
+                    attempts.append(self.account);raise ChatGPTSafetyError('blocked')
+                def close(self):pass
+            finder=ChatGPTFinder(root,web_factory=Web)
+            with self.assertRaises(ChatGPTSafetyError):
+                finder('v.mp4',[{'start':0,'end':60,'text':'пример'}],60,'name',{'min_reaction_minutes':0},lambda *a:None)
+            self.assertEqual(attempts,['acc_01'])
+            self.assertFalse((root/'gpt_uploads'/'response_cache').exists())
+
     def test_both_categories_preserved_and_sorted(self):
         result,_,_=self.find([{'type':'discussion','start':1000,'end':1300,'title':'История'},
                               {'type':'reaction','start':100,'end':900,'title':'Ролик'}])
