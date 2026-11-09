@@ -80,6 +80,18 @@ class RealDonationRenderTest(unittest.TestCase):
             self.assertTrue(all(not (a<7 and b>9) for a,b in keeps));self.assertTrue(any(3 < a < 7 for a,b in keeps))
             self.assertGreater(len(keeps),2)
 
+    def test_discussion_keeps_donation_but_cuts_silence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'_work').mkdir();src=root/'input.mp4';out=root/'clip.mp4'
+            audio=r'aevalsrc=if(between(t\,3\,6)\,0\,0.5*sin(2*PI*440*t)):s=16000:d=12'
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=160x90:rate=10','-f','lavfi','-i',audio,'-t','12','-c:v','libx264','-c:a','aac','-y',str(src)],check=True,timeout=30)
+            row={'type':'discussion','start':0.,'end':12.,'title':'Ответ на донат','donation_cuts':[{'start':7.,'end':9.}]}
+            with patch.object(stream_cutter,'pick_encoder',return_value='libx264'):
+                keeps,duration=pipeline.render_clip(src,out,row,0,{'enabled':True,'min_cut':1.,'max_gap':1.})
+            self.assertLess(duration,11);self.assertGreater(duration,8)
+            self.assertTrue(any(a<=7 and b>=9 for a,b in keeps),keeps)
+            self.assertTrue(any(3<a<7 for a,b in keeps),keeps)
+
     def test_donation_removed_and_transcript_tracks_edit(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);folder=root/'test_input';folder.mkdir();src=folder/'test.mp4'

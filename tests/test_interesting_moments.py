@@ -66,11 +66,35 @@ class MomentsTests(unittest.TestCase):
             self.assertIn('Тип момента: Обсуждение',text)
             data=json.loads((out.parent.parent/'reactions.json').read_text(encoding='utf8'))
             self.assertEqual(data['reactions'][0]['type'],'discussion')
-    def test_donation_indices_match_mixed_types(self):
+    def test_donations_only_reactions_keep_original_indices(self):
         with tempfile.TemporaryDirectory() as d:
-            f=ChatGPTFinder(d);rows=[{'start':0.,'end':100.,'type':'reaction'},{'start':100.,'end':200.,'type':'discussion'}]
-            raw='{"donation_cuts":[{"reaction":2,"start":"00:02:00","end":"00:02:10","confidence":"high"}]}'
-            cuts=f.find_donations([{'start':0,'end':200,'text':'x'}],rows,lambda *a:None,manual=raw)
-            self.assertEqual(cuts,[{'reaction':2,'start':120.,'end':130.}])
+            f=ChatGPTFinder(d);rows=[{'start':0.,'end':100.,'type':'discussion'},{'start':100.,'end':200.,'type':'reaction'}]
+            segs=[{'start':0,'end':200,'text':'донат'}]
+            seen=[]
+            def ask(prompt,doc,fname,timeout,log,need):
+                seen.append(prompt)
+                return '{"donation_cuts":[{"reaction":2,"start":"00:02:00","end":"00:02:10","confidence":"high"}]}'
+            f._ask_document=ask
+            self.assertEqual(f.find_donations(segs,rows,lambda *a:None),[{'reaction':2,'start':120.,'end':130.}])
+            self.assertIn('2: 00:01:40',seen[0]); self.assertNotIn('1: 00:00:00',seen[0])
+            bad='{"donation_cuts":[{"reaction":1,"start":"00:00:10","end":"00:00:20","confidence":"high"}]}'
+            with self.assertRaises(reactions.ReactionsError):f.find_donations(segs,rows,lambda *a:None,manual=bad)
+            with self.assertRaises(pipeline.PipelineError):pipeline.validate_donation_cuts([{'reaction':1,'start':10,'end':20}],rows)
+    def test_only_discussions_no_donation_request_and_silence_setting_preserved(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);job={'vod_id':'123','streamer':'name'}; seen=[]
+            class Finder:
+                def __call__(self,*a):return [{'type':'discussion','start':1,'end':5,'title':'Ответ на донат'}]
+                def find_donations(self,*a,**kw):self.fail('donation search called')
+            def download(vod,quality,out,**kwargs):Path(out).write_bytes(b'x'*2000)
+            def speech(*a,**kw):return [{'start':1,'end':2,'text':'ответ'}],60
+            def render(src,out,row,offset,cfg):
+                seen.append((row,cfg));Path(out).write_bytes(b'x'*2000);return [(0,4)],4
+            with patch.object(pipeline,'media_duration',return_value=60):
+                pipeline.Pipeline(root,Finder(),download,render,speech).run(job,{'min_reaction_minutes':0,'remove_donations':True,'silence':{'enabled':True}})
+            self.assertTrue(seen[0][1]['enabled']);self.assertNotIn('donation_cuts',seen[0][0])
+    def test_prompt_allows_interesting_donation_reply(self):
+        _,seen,_=self.find([])
+        self.assertIn('ответ на донат',seen[0][0]);self.assertIn('не исключай их только потому',seen[0][0])
 
 if __name__=='__main__':unittest.main()
