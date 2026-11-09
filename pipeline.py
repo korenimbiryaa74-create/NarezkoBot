@@ -664,7 +664,7 @@ class Pipeline:
             preview_login=preview_cfg.get('test_streamer','') if local_name else login
             for i,(row,video) in enumerate(zip(rows,outputs),1):
                 if row.get('type')!='reaction': continue
-                target=Path(video).with_name(Path(video).stem+' — превью.jpg')
+                target=Path(video).with_name(Path(video).stem+' — ИИ-превью.jpg')
                 report=target.with_suffix('.json')
                 if target.exists() or report.exists():
                     progress('Превью',f'Нарезка {i}: ранее созданные файлы не перезаписываются; проверьте вручную')
