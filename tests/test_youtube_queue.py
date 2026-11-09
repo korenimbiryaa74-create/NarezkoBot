@@ -66,6 +66,22 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.retry_reviewed(second['id'])
         self.assertEqual(self.queue.claim()['id'],second['id'])
 
+    def test_uncertain_profile_blocks_other_jobs_not_other_profiles(self):
+        self.queue.bind('a', CHANNEL_A, audience='not_kids')
+        self.queue.bind('b', CHANNEL_B, audience='not_kids')
+        self.queue.enqueue(1,'a',self.files[:1])
+        self.queue.enqueue(2,'a',self.files[1:2])
+        self.queue.enqueue(3,'b',self.files[2:3])
+        first=self.queue.claim()
+        # An in-progress browser also blocks the same profile in another job.
+        other=self.queue.claim()
+        self.assertEqual(other['profile'],'b')
+        self.queue.confirm(other['id'],CHANNEL_B,'b'*11)
+        self.queue.mark_uncertain(first['id'],'check studio')
+        self.assertIsNone(self.queue.claim())
+        self.queue.confirm_reviewed(first['id'],'a'*11)
+        self.assertEqual(self.queue.claim()['job_id'],2)
+
     def test_verified_receipt_and_channel_protection(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')
         with self.assertRaises(ValueError): self.queue.bind('b', CHANNEL_A)

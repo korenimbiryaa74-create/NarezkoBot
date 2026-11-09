@@ -164,7 +164,7 @@ class YouTubeQueue:
             return len(prepared)
 
     def claim(self, now=None, *, finished_only=False):
-        """Claim next clip, blocking later clips of a batch on uncertain/active work."""
+        """Claim next clip only when its batch and browser profile are safe to use."""
         now = time.time() if now is None else float(now)
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -173,6 +173,8 @@ class YouTubeQueue:
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads prior
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index
                     AND prior.state NOT IN ('confirmed','cancelled'))
+                AND NOT EXISTS (SELECT 1 FROM youtube_uploads blocking
+                    WHERE blocking.profile=u.profile AND blocking.state IN ('uploading','needs_review'))
                 ORDER BY u.id LIMIT 1''').fetchone()
             if row is None:
                 db.commit()
