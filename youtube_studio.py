@@ -358,12 +358,34 @@ def local_schedule_timestamp(timestamp, tz_text, now=None):
     return intended
 
 
+_RU_MONTHS = ('янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек')
+_RU_MONTH_INPUT = ('янв.','февр.','мар.','апр.','мая','июн.','июл.','авг.','сент.','окт.','нояб.','дек.')
+_RU_MONTH_FULL = ('января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря')
+
+
 def parse_date(value):
     text=re.sub(r'\s+',' ',str(value).strip())
-    for fmt in ('%b %d, %Y','%B %d, %Y','%d %b %Y','%m/%d/%Y','%Y-%m-%d'):
+    russian=re.fullmatch(r'(\d{1,2})\s+([а-яё]+)\.?\s*,?\s*(\d{4})(?:\s*г\.?)?',text.lower())
+    if russian:
+        day,month,year=russian.groups()
+        month=month[:3]
+        if month=='май':month='мая'
+        if month in _RU_MONTHS:
+            try:return datetime(int(year),_RU_MONTHS.index(month)+1,int(day)).date()
+            except ValueError:return None
+    for fmt in ('%b %d, %Y','%B %d, %Y','%d %b %Y','%m/%d/%Y','%Y-%m-%d','%d.%m.%Y'):
         try:return datetime.strptime(text,fmt).date()
         except ValueError:pass
     return None
+
+
+def date_inputs(when):
+    # Formats are tried only in the picker, never submitted to YouTube without
+    # re-reading the resulting selected date and checking validation state.
+    d,m,y=when.day,when.month,when.year
+    return (f'{d} {_RU_MONTH_INPUT[m-1]} {y} г.',f'{d} {_RU_MONTH_FULL[m-1]} {y} г.',
+            f'{d:02d}.{m:02d}.{y}',when.strftime('%b %d, %Y'),
+            f'{m:02d}/{d:02d}/{y}',f'{y:04d}-{m:02d}-{d:02d}')
 
 
 def parse_time(value):
@@ -403,20 +425,55 @@ def open_schedule(tab):
     wait(tab,_SCHEDULE_OPEN,15,'Карточка расписания не открылась или поле времени не найдено')
 
 
+_DATE_STATE = r"""(()=>{
+  const visible=e=>!!e.getClientRects().length;
+  const triggers=[...document.querySelectorAll('ytcp-uploads-dialog #datepicker-trigger')].filter(visible);
+  const pickers=[...document.querySelectorAll('ytcp-date-picker')].filter(visible);
+  if(triggers.length!==1||pickers.length>1)return {ambiguous:true};
+  const label=triggers[0].querySelector('.dropdown-trigger-text');
+  const picker=pickers[0];
+  const inputs=picker?[...picker.querySelectorAll('input')].filter(visible):[];
+  if(inputs.length>1)return {ambiguous:true};
+  const input=inputs[0];
+  const messages=picker?[...picker.querySelectorAll('*')].filter(e=>visible(e)&&!e.children.length).map(e=>e.innerText||'').join(' '):'';
+  const invalid=!!(input&&(input.getAttribute('aria-invalid')==='true'||input.matches(':invalid')||input.closest('[invalid]'))) || /(?:недопустимая дата|invalid date)/i.test(messages);
+  return {date:label?label.innerText:triggers[0].innerText,open:!!input,invalid:invalid};
+})()"""
+
+
+def set_schedule_date(tab, when):
+    state=tab.js(_DATE_STATE) or {}
+    if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
+    if parse_date(state.get('date'))==when.date() and not state.get('invalid'):
+        return
+    for candidate in date_inputs(when):
+        state=tab.js(_DATE_STATE) or {}
+        if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
+        if not state.get('open'):
+            click(tab,'#datepicker-trigger',message='Не удалось открыть выбор даты публикации')
+            wait(tab,"!!document.querySelector('ytcp-date-picker input')",15,'Не найден выбор даты')
+        tab.fill('ytcp-date-picker input',candidate)
+        tab.key('Enter','Enter');time.sleep(1)
+        state=tab.js(_DATE_STATE) or {}
+        if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
+        if parse_date(state.get('date'))==when.date() and not state.get('invalid'):
+            return
+    raise StudioError('YouTube не принял дату публикации; отправьте скриншот открытого календаря и лог')
+
+
 def set_schedule(tab, timestamp):
     open_schedule(tab)
     tz=wait(tab,_SCHEDULE_ZONE,30,'Не удалось прочитать расписание YouTube')
     when=local_schedule_timestamp(timestamp,tz)
-    click(tab,'#datepicker-trigger',message='Не удалось открыть выбор даты публикации')
-    # Picker structure can change; ambiguity is an error, never guess.
-    date_sel='ytcp-date-picker input'
-    wait(tab,"!!document.querySelector('ytcp-date-picker input')",15,'Не найден выбор даты')
-    tab.fill(date_sel,when.strftime('%b %d, %Y'));tab.key('Enter','Enter');time.sleep(1)
+    # Set the future time first: today's date may be rejected while the default
+    # time is midnight in the past. Then select and verify the date.
     time_sel='ytcp-visibility-scheduler #time-of-day-container input'
     wait(tab,"!!document.querySelector('ytcp-visibility-scheduler #time-of-day-container input')",15,'Не найден выбор времени')
     tab.fill(time_sel,when.strftime('%H:%M'));tab.key('Enter','Enter');time.sleep(1)
-    actual=tab.js('''(()=>{const d=document.querySelector('#datepicker-trigger .dropdown-trigger-text');const t=document.querySelector('ytcp-visibility-scheduler #time-of-day-container input');return {date:d&&d.innerText,time:t&&t.value}})()''') or {}
-    if parse_date(actual.get('date')) != when.date() or parse_time(actual.get('time')) != when.time():
+    set_schedule_date(tab,when)
+    state=tab.js(_DATE_STATE) or {}
+    value=tab.js("(()=>{const t=document.querySelector('ytcp-visibility-scheduler #time-of-day-container input');return t&&t.value})()")
+    if state.get('ambiguous') or state.get('invalid') or parse_date(state.get('date')) != when.date() or parse_time(value) != when.time():
         raise StudioError('YouTube не подтвердил выбранные дату и время; проверьте черновик')
     tz2=tab.js(_SCHEDULE_ZONE)
     if local_schedule_timestamp(timestamp,tz2) != when:
