@@ -101,16 +101,28 @@ def choose_frame(video, destination, progress=lambda _:None):
         duration=float(p.stdout.strip())
         if not 0<duration<60*60*48: raise ValueError('duration')
     except (OSError,ValueError,subprocess.SubprocessError) as exc:raise PreviewError('Не удалось определить длительность видео.') from exc
-    cascade=cv2.CascadeClassifier(str(Path(cv2.data.haarcascades)/'haarcascade_frontalface_default.xml'))
+    # OpenCV 5's base wheel may not contain the Haar detector or its XML.
+    # Fall back to a representative frame; do not claim it contains a face.
+    cascade=None
+    try:
+        classifier=getattr(cv2,'CascadeClassifier',None)
+        cascade_dir=getattr(getattr(cv2,'data',None),'haarcascades',None)
+        cascade_path=Path(cascade_dir)/'haarcascade_frontalface_default.xml' if cascade_dir else None
+        if classifier and cascade_path and cascade_path.is_file():
+            candidate=classifier(str(cascade_path))
+            if not candidate.empty():cascade=candidate
+    except (AttributeError,OSError,cv2.error):pass
+    if cascade is None:progress('Распознавание лица недоступно в этой версии OpenCV; выбран кадр без поиска лица.')
     best=None;best_score=-1
-    for i,fraction in enumerate((.12,.27,.42,.57,.72,.87)):
+    fractions=(.12,.27,.42,.57,.72,.87) if cascade is not None else (.42,)
+    for i,fraction in enumerate(fractions):
         frame=Path(destination).with_name(f'frame-{i}.jpg')
         try:
             subprocess.run([ffmpeg,'-v','error','-ss',str(max(0,duration*fraction)),'-i',str(video),'-frames:v','1','-q:v','2','-y',str(frame)],capture_output=True,timeout=90,creationflags=flags,check=True)
             data=read_image(frame);
             if data is None:continue
-            gray=cv2.cvtColor(data,cv2.COLOR_BGR2GRAY)
-            faces=() if cascade.empty() else cascade.detectMultiScale(gray,scaleFactor=1.1,minNeighbors=5,minSize=(40,40))
+            gray=cv2.cvtColor(data,cv2.COLOR_BGR2GRAY) if cascade is not None else None
+            faces=() if cascade is None else cascade.detectMultiScale(gray,scaleFactor=1.1,minNeighbors=5,minSize=(40,40))
             score=max((int(w)*int(h) for x,y,w,h in faces),default=0)
             if score>best_score:best=frame;best_score=score
         except (OSError,subprocess.SubprocessError):continue
@@ -126,7 +138,7 @@ def choose_frame(video, destination, progress=lambda _:None):
     ok,encoded=cv2.imencode('.png',data)
     if not ok:raise PreviewError('Не удалось сохранить кадр для генерации.')
     encoded.tofile(str(destination))
-    if best_score<=0:progress('Лицо на выбранных кадрах не распознано; результат может быть неточным.')
+    if cascade is not None and best_score<=0:progress('Лицо на выбранных кадрах не распознано; результат может быть неточным.')
     return best_score>0
 
 
