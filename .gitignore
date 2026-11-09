@@ -36,3 +36,6 @@ youtube_accounts/
 
 # Local generated thumbnails and ComfyUI logs.
 preview_test/
+
+# User-provided transparent portraits
+thumbnail_assets/

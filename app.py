@@ -120,6 +120,7 @@ class App:
         common=ttk.Frame(sub,padding=8); processing=ttk.Frame(sub,padding=8); speech=ttk.Frame(sub,padding=8)
         sub.add(common,text='Twitch и прокси');sub.add(processing,text='Обработка');sub.add(speech,text='Распознавание речи')
         youtube=ttk.Frame(sub,padding=8);sub.add(youtube,text='YouTube');youtube.columnconfigure(1,weight=1)
+        previews=ttk.Frame(sub,padding=8);sub.add(previews,text='Превью реакций');previews.columnconfigure(1,weight=1)
         for f in (common,processing,speech):f.columnconfigure(1,weight=1)
         self._row(common,0,'Twitch Client ID','client_id')
         self._row(common,1,'Twitch Client Secret','client_secret',secret=True)
@@ -155,6 +156,9 @@ class App:
         self.banner_info=tk.StringVar(value='Области действуют на протяжении всей нарезки. Для каждого стримера настройте профиль или укажите «Без блюра».')
         ttk.Label(processing,textvariable=self.banner_info,wraplength=900).grid(row=14,column=0,columnspan=2,sticky='w',padx=8)
         ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск моментов: ChatGPT.\nПапка результатов создаётся в проекте автоматически.\nTwitchDownloaderCLI находится автоматически.').grid(row=15,column=0,columnspan=2,sticky='w',padx=8,pady=8)
+        self._toggle(previews,0,'Создавать превью реакций для проверки (без загрузки на YouTube)','preview_enabled')
+        self._row(previews,1,'Ник стримера для превью тестового видео','preview_test_streamer')
+        ttk.Label(previews,text='Вырезы PNG: thumbnail_assets/ник_стримера. Найденный источник и превью всегда требуют проверки.',wraplength=900).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=6)
         self._toggle(speech,0,'Использовать Groq; при ошибке — локальный Whisper','groq_enabled')
         self._row(speech,1,'Groq API key','groq_api_key',secret=True)
         ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)
@@ -196,7 +200,7 @@ class App:
           'proxy_enabled':c['proxy']['enabled'],'proxy_url':c['proxy']['url'],'proxy_twitch':c['proxy']['twitch_api'],'proxy_chatgpt':c['proxy']['chatgpt'],'proxy_groq':c['proxy']['groq'],
           'groq_enabled':p['speech']['groq_enabled'],'groq_api_key':p['speech']['groq_api_key'],
           'quality':p['quality'],'threads':p['download_threads'],'min_reaction':p['min_reaction_minutes'],'bridge':p['bridge_minutes'],
-          'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original'],'remove_donations':p['remove_donations'],'banner_blur':p['banner_blur']['enabled'],'banner_test_streamer':p['banner_blur'].get('test_streamer','')}
+          'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],'keep_original':p['keep_original'],'remove_donations':p['remove_donations'],'banner_blur':p['banner_blur']['enabled'],'banner_test_streamer':p['banner_blur'].get('test_streamer',''),'preview_enabled':p['preview']['enabled'],'preview_test_streamer':p['preview']['test_streamer']}
         for key,value in values.items(): v[key].set(value)
     def save(self):
         try:
@@ -208,6 +212,7 @@ class App:
             c['proxy']={'enabled':v['proxy_enabled'].get(),'url':v['proxy_url'].get().strip(),'twitch_api':v['proxy_twitch'].get(),'chatgpt':v['proxy_chatgpt'].get(),'groq':v['proxy_groq'].get()}
             p=c['pipeline'];p.update(quality=v['quality'].get().strip(),download_threads=v['threads'].get(),min_reaction_minutes=v['min_reaction'].get(),bridge_minutes=v['bridge'].get(),keep_original=v['keep_original'].get(),remove_donations=v['remove_donations'].get())
             p['banner_blur'].update(enabled=v['banner_blur'].get(),test_streamer=v['banner_test_streamer'].get().strip())
+            p['preview'].update(enabled=v['preview_enabled'].get(),test_streamer=v['preview_test_streamer'].get().strip())
             p['speech'].update(groq_enabled=v['groq_enabled'].get(),groq_api_key=v['groq_api_key'].get().strip())
             p['silence'].update(enabled=v['silence'].get(),min_cut=v['min_cut'].get(),max_gap=v['max_gap'].get(),onset_db=v['onset'].get(),max_height=v['height'].get())
             self.config=self.settings.save(c);self.service.settings_changed();self.status.set('Настройки сохранены')
