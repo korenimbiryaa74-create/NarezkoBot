@@ -173,7 +173,7 @@ class App:
         ypscroll=ttk.Scrollbar(yprofiles,orient='vertical',command=self.youtube_profiles.yview)
         self.youtube_profiles.configure(yscrollcommand=ypscroll.set);self.youtube_profiles.pack(side='left',fill='both',expand=True);ypscroll.pack(side='right',fill='y')
         self.youtube_profiles.bind('<<TreeviewSelect>>',self.youtube_profile_selected)
-        ttk.Label(youtube,text='Очередь загрузок (отдельно от списка каналов)').grid(row=9,column=0,columnspan=2,sticky='w',padx=8)
+        ttk.Label(youtube,text='Статус публикаций (загрузка начинается автоматически)').grid(row=9,column=0,columnspan=2,sticky='w',padx=8)
         yuploads=ttk.Frame(youtube);yuploads.grid(row=10,column=0,columnspan=2,sticky='nsew',padx=8,pady=2);youtube.rowconfigure(10,weight=1)
         self.youtube_rows=ttk.Treeview(yuploads,columns=('id','profile','state','time','detail'),show='headings',height=3)
         for key,width,label in [('id',50,'№'),('profile',110,'Профиль'),('state',120,'Состояние'),('time',150,'Дата публикации'),('detail',420,'Информация')]:
@@ -183,8 +183,6 @@ class App:
         yr=ttk.Frame(youtube);yr.grid(row=11,column=0,columnspan=2,sticky='w',padx=8)
         ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
         ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
-        ttk.Button(yr,text='Отменить выбранную загрузку',command=self.youtube_cancel).pack(side='left',padx=5)
-        ttk.Button(youtube,text='Очистить очередь загрузок YouTube',command=self.youtube_clear_queue).grid(row=12,column=0,columnspan=2,sticky='w',padx=8,pady=4)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
@@ -593,7 +591,7 @@ class App:
                 when=__import__('datetime').datetime.fromtimestamp(r['publish_at']).strftime('%d.%m.%Y %H:%M') if r['publish_at'] else 'Сразу'
                 info=('https://youtu.be/'+r['video_id']) if r['video_id'] else r['detail']
                 detail=r['title']+(' — '+info if info else '')
-                self.youtube_rows.insert('','end',iid=str(r['id']),values=(r['id'],r['profile'],ytlabels.get(r['state'],r['state']),when,detail))
+                self.youtube_rows.insert('','end',iid=str(r['id']),values=(r['id'],r['profile'],('Статус не подтверждён' if r['state']=='uploading' and not r.get('tracking',1) else ytlabels.get(r['state'],r['state'])),when,detail))
             for item in ytselected:
                 if self.youtube_rows.exists(item):self.youtube_rows.selection_add(item)
             rows=self.service.store.notifications(200)
@@ -603,7 +601,7 @@ class App:
         except Exception as exc:self.status.set('Не удалось обновить состояние: '+type(exc).__name__)
         self.window.after(3000,self.refresh)
     def close(self):
-        active=any(j['state']=='running' for j in self.service.store.list_jobs(1000)) or any(j['state']=='uploading' for j in self.service.youtube_queue.list_uploads())
+        active=any(j['state']=='running' for j in self.service.store.list_jobs(1000)) or any(j['state']=='uploading' and j.get('tracking',1) for j in self.service.youtube_queue.list_uploads())
         if active and not messagebox.askyesno('Выход','Обработка ещё идёт. Выход прервёт её. Выйти?'):return
         self.service.request_stop()
         if not active:
