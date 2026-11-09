@@ -655,4 +655,4 @@ class Pipeline:
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
         ready,outputs=organize_clips(folder,job,rows,bool(cfg.get('silence',{}).get('enabled',True)))
         progress('Готово',f'Найдено моментов: {len(rows)}; сохранено видео: {len(outputs)}')
-        return {'folder':str(ready),'outputs':outputs,'reactions':len(rows)}
+        return {'folder':str(ready),'outputs':outputs,'reactions':len(rows),'moments':rows}
