@@ -158,7 +158,7 @@ class App:
         ttk.Label(processing,text='Речь: Groq с резервом Whisper. Поиск моментов: ChatGPT.\nПапка результатов создаётся в проекте автоматически.\nTwitchDownloaderCLI находится автоматически.').grid(row=15,column=0,columnspan=2,sticky='w',padx=8,pady=8)
         self._toggle(previews,0,'Создавать превью реакций для проверки (без загрузки на YouTube)','preview_enabled')
         self._row(previews,1,'Ник стримера для превью тестового видео','preview_test_streamer')
-        ttk.Label(previews,text='Вырезы PNG: thumbnail_assets/ник_стримера. Найденный источник и превью всегда требуют проверки.',wraplength=900).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=6)
+        ttk.Label(previews,text='Вырезы: thumbnail_assets/ник_стримера; пример стиля: thumbnail_styles/ник_стримера.jpg. Модель, текст и источник требуют проверки.',wraplength=900).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=6)
         self._toggle(speech,0,'Использовать Groq; при ошибке — локальный Whisper','groq_enabled')
         self._row(speech,1,'Groq API key','groq_api_key',secret=True)
         ttk.Button(speech,text='Импортировать ключ из старого config.json',command=self.import_groq_key).grid(row=2,column=0,columnspan=2,sticky='w',padx=8,pady=5)
@@ -592,8 +592,8 @@ class App:
             elif kind=='done':
                 self._preview_running=False;self.preview_status.set('Превью готово: '+value['path'])
                 description=('Найдено готовое превью' if value.get('existing') else 'Превью сохранено')+':\n'+value['path']
-                description+='\n\nТекст на превью: '+(value.get('preview_text') or 'неизвестен, проверьте изображение')
-                description+='\nИсточник видео требует проверки.'
+                description+='\n\nТекст, переданный модели: '+(value.get('preview_text') or 'неизвестен')
+                description+='\nПроверьте надпись, лицо и источник: ИИ может их изменить.'
                 if value.get('warnings'):description+='\n'+('\n'.join(value['warnings']))
                 if messagebox.askyesno('Тест превью',description+'\n\nОткрыть превью?') and hasattr(os,'startfile'):os.startfile(value['path'])
             elif kind=='error':
