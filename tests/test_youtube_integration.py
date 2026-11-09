@@ -81,26 +81,18 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(rows[1]['publish_at']-rows[0]['updated_at'],16*3600)
         self.assertAlmostEqual(rows[2]['publish_at']-rows[0]['updated_at'],32*3600)
 
-    def test_test_account_all_immediate_and_uncertainty_stops_batch(self):
-        svc=self.make_service(local=True)
-        self.assertTrue(svc.worker_once())
-        self.assertEqual([r['publish_at'] for r in svc.youtube_queue.list_uploads()],[None]*3)
-        class Broken:
-            def upload(self,row,progress=None): raise RuntimeError('connection lost')
-        svc.youtube_studio=Broken()
-        self.assertTrue(svc.youtube_once())
-        self.assertFalse(svc.youtube_once())
-        self.assertEqual([r['state'] for r in svc.youtube_queue.list_uploads()],['needs_review','queued','queued'])
-
-    def test_blocked_queue_explains_why_once(self):
+    def test_uncertain_old_upload_does_not_require_manual_check(self):
         svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
-        row=svc.youtube_queue.claim(finished_only=True)
-        svc.youtube_queue.mark_uncertain(row['id'],'interrupted')
-        self.assertFalse(svc.youtube_once());self.assertFalse(svc.youtube_once())
-        messages=[msg for _,msg in svc.logs() if 'ожидает проверки загрузки' in msg]
-        self.assertEqual(len(messages),1);self.assertIn('№'+str(row['id']),messages[0])
-        svc.youtube_queue.cancel_reviewed_or_queued(row['id'])
-        self.assertEqual(svc.youtube_queue.waiting_reason(),'')
+        self.assertEqual([r['publish_at'] for r in svc.youtube_queue.list_uploads()],[None]*3)
+        first=svc.youtube_queue.claim(finished_only=True)
+        svc.youtube_queue.mark_uncertain(first['id'],'interrupted')
+        class Uploader:
+            def upload(self,row,progress=None):return ('a' if row['clip_index']==2 else 'b')*11
+        svc.youtube_studio=Uploader()
+        self.assertTrue(svc.youtube_once());self.assertTrue(svc.youtube_once())
+        self.assertFalse(svc.youtube_once())
+        self.assertEqual([r['state'] for r in svc.youtube_queue.list_uploads()],['needs_review','confirmed','confirmed'])
+        self.assertFalse(any('ожидает проверки загрузки' in m for _,m in svc.logs()))
 
     def test_service_restart_detaches_old_tracking_without_reupload(self):
         svc=self.make_service(local=True);self.assertTrue(svc.worker_once())

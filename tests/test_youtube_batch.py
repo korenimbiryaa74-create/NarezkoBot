@@ -45,20 +45,34 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([e[0] for e in self.events if e[0] in ('submit','monitor')],['submit']*3+['monitor']*3)
         self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed']*3)
         self.assertEqual(Browser.last.tabs,2);self.assertFalse(Browser.last.keep_open)
-    def test_failure_keeps_previously_submitted_id_without_retry(self):
+    def test_uncertain_upload_is_not_retried_and_later_clip_continues(self):
+        calls=[]
         def submit(tab,browser,row,progress=None):
-            browser.keep_open=True
+            calls.append(row['clip_index']);browser.keep_open=True
             if row['clip_index']==2:
                 browser.attempt_may_upload=True
                 raise studio.StudioError('connection lost')
-            return 'a'*11
-        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready') as monitor:
-            with self.assertRaises(studio.StudioError):self.batch()
-        rows=self.queue.list_uploads()
-        self.assertEqual([(r['state'],r['submitted']) for r in rows],[('confirmed',1),('needs_review',0),('queued',0)])
+            return ('a' if row['clip_index']==1 else 'b')*11
+        def progress(i,m):
+            if i==0:self.stop.stopped=True
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready'):
+            self.obj.upload_batch(self.queue,self.first,'test',CHANNEL,self.stop,progress,lambda *a:None)
+        self.assertEqual(calls,[1,2,3])
+        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','needs_review','confirmed'])
         self.assertTrue(Browser.last.keep_open)
-        monitor.assert_called_once()
-        self.assertEqual(self.queue.recover_interrupted(),0)
+
+    def test_error_before_file_selection_is_retried_automatically(self):
+        calls=[]
+        def submit(tab,browser,row,progress=None):
+            calls.append(row['clip_index'])
+            if len(calls)==1:raise studio.StudioError('dialog not ready')
+            browser.keep_open=True
+            return chr(96+row['clip_index'])*11
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready'):
+            self.batch()
+        self.assertEqual(calls,[1,1,2,3])
+        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed']*3)
+
     def test_processing_recovery_never_resubmits(self):
         self.queue.mark_submitted(self.first['id'],CHANNEL,'a'*11,now=10000)
         self.assertEqual(self.queue.recover_interrupted(),0)
@@ -85,7 +99,7 @@ class BatchTests(unittest.TestCase):
         def submit(tab,browser,row,progress=None):browser.keep_open=True;return 'a'*11
         with patch.object(studio,'Browser',BadBrowser),patch.object(studio,'channel_ready'),patch.object(self.obj,'submit',side_effect=submit),patch.object(studio,'monitor_status',return_value='ready'):
             with self.assertRaises(studio.StudioError):self.batch()
-        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','needs_review','queued'])
+        self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','needs_review','needs_review'])
         self.assertFalse(Browser.last.keep_open)
 
     def test_monitor_errors_do_not_stop_later_ready_clips(self):

@@ -39,15 +39,15 @@ class YouTubeQueueTests(unittest.TestCase):
         self.files[0].write_bytes(b'changed')
         self.assertIsNone(self.queue.claim())
         self.assertEqual(self.queue.list_uploads()[0]['state'], 'needs_review')
-        self.assertIsNone(self.queue.claim())
+        self.assertEqual(self.queue.claim()['clip_index'],2)
 
-    def test_uncertain_cannot_auto_retry_or_overtake(self):
+    def test_uncertain_not_retried_and_does_not_block_next(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')
         self.queue.enqueue(1, 'a', self.files[:2], now=1)
         first = self.queue.claim()
         self.assertIsNone(self.queue.claim())
         self.assertEqual(self.queue.recover_interrupted(), 1)
-        self.assertIsNone(self.queue.claim())
+        self.assertEqual(self.queue.claim()['clip_index'],2)
         self.assertEqual(self.queue.list_uploads()[0]['state'], 'needs_review')
         with self.assertRaises(ValueError):
             self.queue.confirm(first['id'], CHANNEL_A, 'a' * 11)
@@ -102,7 +102,7 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.enqueue(1,'a',self.files[:2])
         self.assertIn('отключена',self.queue.waiting_reason(False))
         first=self.queue.claim(); self.queue.mark_uncertain(first['id'],'interrupted')
-        self.assertIn('№'+str(first['id']),self.queue.waiting_reason())
+        self.assertEqual(self.queue.waiting_reason(),'')
         self.queue.cancel_reviewed_or_queued(first['id'])
         self.assertEqual(self.queue.waiting_reason(),'')
         second=self.queue.claim()
@@ -118,8 +118,8 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.enqueue(2,'b',self.files[2:3])
         self.queue.enqueue(3,'c',self.files[3:4])
         first=self.queue.claim();self.queue.mark_uncertain(first['id'],'uncertain')
-        second=self.queue.claim();self.queue.confirm(second['id'],CHANNEL_B,'a'*11)
-        third=self.queue.claim()
+        second=self.queue.claim(profile='b');self.queue.confirm(second['id'],CHANNEL_B,'a'*11)
+        third=self.queue.claim(profile='c')
         self.assertEqual(third['profile'],'c')
         self.assertEqual(self.queue.clear_pending_uploads(),2)
         rows=self.queue.list_uploads()
