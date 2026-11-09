@@ -140,6 +140,51 @@ class BrowserFlowTests(unittest.TestCase):
         for ambiguous in (False,True):
             with self.assertRaises(studio.StudioError):studio.wait_for_receipt(Tab(ambiguous),timeout=10)
 
+    def test_waits_for_processing_before_advancing(self):
+        class Tab:
+            def js(self,script):return {'links':[], 'warning':False}
+        class Browser:
+            def open_monitor(self,channel):return object()
+        messages=[]
+        with patch.object(studio,'monitor_status',side_effect=['processing','processing','ready']),patch.object(studio.time,'sleep'):
+            result=studio.wait_for_receipt(Tab(),progress=messages.append,timeout=10,browser=Browser(),channel_id=CHANNEL,candidate_id='a'*11)
+        self.assertEqual(result,'a'*11)
+        self.assertTrue(any('обработк' in msg for msg in messages))
+
+    def test_processing_error_leaves_browser_open(self):
+        class Browser:
+            last=None
+            def __init__(self,*args):self.keep_open=False;Browser.last=self
+            def __enter__(self):return Tab()
+            def __exit__(self,*args):pass
+        class Tab:
+            def fill(self,*args):pass
+        row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click'),patch.object(studio,'wait',return_value=True),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',side_effect=studio.StudioError('timeout')),patch.object(studio.time,'sleep'):
+            with self.assertRaises(studio.StudioError):studio.YouTubeStudio('/tmp').upload(row)
+        self.assertTrue(Browser.last.keep_open)
+
+    def test_browser_is_not_terminated_for_uncertain_upload(self):
+        class Proc:
+            terminated=False
+            def terminate(self):self.terminated=True
+        browser=studio.Browser('/tmp','test');proc=Proc();browser.proc=proc;browser.keep_open=True
+        browser.__exit__(None,None,None)
+        self.assertFalse(proc.terminated)
+
+    def test_temporary_monitor_reload_error_does_not_duplicate_upload(self):
+        class Tab:
+            def js(self,script):return {'links':None,'warning':False}
+        class Browser:
+            def open_monitor(self,channel):return object()
+        with patch.object(studio,'monitor_status',side_effect=[studio.StudioError('reloading'),'processing','ready']),patch.object(studio.time,'sleep'):
+            self.assertEqual(studio.wait_for_receipt(Tab(),timeout=10,browser=Browser(),channel_id=CHANNEL,candidate_id='a'*11),'a'*11)
+
+    def test_monitor_requires_matching_channel(self):
+        class Tab:
+            def js(self,script):return {'url':'https://studio.youtube.com/channel/UC'+'z'*22+'/videos/upload','state':'ready'}
+        self.assertEqual(studio.monitor_status(Tab(),CHANNEL,'a'*11,False),'unknown')
+
     def test_public_and_scheduled_go_through_distinct_visibility_steps(self):
         class Tab:
             def fill(self,*args): pass
@@ -149,7 +194,7 @@ class BrowserFlowTests(unittest.TestCase):
             return ['https://youtu.be/'+'a'*11] if 'ytcp-video-share-dialog' in expr else True
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
         obj=studio.YouTubeStudio('/tmp')
-        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
             self.assertEqual(obj.upload(row),'a'*11)
             self.assertIn('tp-yt-paper-radio-button[name="PUBLIC"]',calls)
             schedule.assert_not_called()
