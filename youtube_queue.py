@@ -182,7 +182,7 @@ class YouTubeQueue:
             row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued' ''' + ready + profile_filter + '''
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads prior
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index
-                    AND prior.state NOT IN ('confirmed','cancelled') AND NOT (prior.state='uploading' AND prior.submitted=1))
+                    AND prior.state NOT IN ('confirmed','cancelled','needs_review') AND NOT (prior.state='uploading' AND prior.submitted=1))
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads blocking WHERE blocking.profile=u.profile
                     AND blocking.state='uploading' AND blocking.submitted=0)
                 ORDER BY u.id LIMIT 1''',params).fetchone()
@@ -197,7 +197,7 @@ class YouTubeQueue:
                 valid = False
             if not valid:
                 db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE id=?",
-                           ('Файл отсутствует или изменился; проверьте перед публикацией',now,row['id']))
+                           ('Файл отсутствует или изменился; загрузка не выполнена',now,row['id']))
                 db.commit()
                 return None
             # Conservative: even a crash before upload requires manual verification.
@@ -262,7 +262,7 @@ class YouTubeQueue:
         now = time.time() if now is None else float(now)
         with self._connect() as db:
             cur = db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE state='uploading' AND submitted=0",
-                             ('Прервано: проверьте YouTube Studio перед повтором',now))
+                             ('Прервано: статус неизвестен; повторная загрузка не выполняется во избежание дубля',now))
             return cur.rowcount
 
     def detach_previous_submitted(self, *, now=None):
@@ -312,19 +312,11 @@ class YouTubeQueue:
                 raise ValueError('Можно повторить только запись, требующую проверки')
 
     def waiting_reason(self, enabled=True):
-        """Describe a concrete reason queued uploads cannot use a profile."""
+        """A failed record never asks the user for a manual approval."""
+        if enabled:return ''
         with self._connect() as db:
             queued=db.execute("SELECT 1 FROM youtube_uploads WHERE state='queued' LIMIT 1").fetchone()
-            if not queued:return ''
-            if not enabled:return 'YouTube: загрузка отключена в настройках; задания остаются в очереди'
-            blocked=db.execute("""SELECT b.id,b.profile FROM youtube_uploads b
-                WHERE b.state='needs_review' AND EXISTS
-                (SELECT 1 FROM youtube_uploads q WHERE q.job_id=b.job_id AND q.clip_index>b.clip_index AND q.state='queued')
-                ORDER BY b.id LIMIT 1""").fetchone()
-            if blocked:
-                return (f"YouTube: профиль {blocked['profile']} ожидает проверки загрузки №{blocked['id']}; "
-                    'откройте Настройки → YouTube → очередь загрузок')
-            return ''
+            return 'YouTube: загрузка отключена в настройках' if queued else ''
 
     def cancel_reviewed_or_queued(self, upload_id):
         # User explicitly verified uncertain transfers; never cancel active/confirmed uploads.

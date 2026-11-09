@@ -37,8 +37,8 @@ class Service:
         detached=self.youtube_queue.detach_previous_submitted()
         if detached:self.log(f'YouTube: прежних отправленных видео {detached}; статус после перезапуска не подтверждён, новые публикации не блокируются')
         if youtube_interrupted:
-            self.log(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором')
-            self.store.notify(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором.')
+            self.log(f'YouTube: прерванных загрузок {youtube_interrupted}; статус неизвестен, остальные нарезки продолжат загружаться')
+            self.store.notify(f'YouTube: прерванных загрузок {youtube_interrupted}; их результат неизвестен, автоматический повтор не выполняется во избежание дубля.')
         if interrupted:
             self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
             self.store.notify(f'После перезапуска восстановлено заданий: {interrupted}. Проверьте очередь: некоторые запросы могут требовать ручного повтора.')
@@ -319,7 +319,7 @@ class Service:
                     self.youtube_queue.mark_uncertain(row['id'],detail)
             self._youtube_batch_blocked.add(anchor['profile'])
             self.log('YouTube: пакет остановлен — '+detail+'; автоматический повтор приостановлен, чтобы не открывать новые окна Chrome')
-            self.store.notify('YouTube: пакет остановлен; проверьте Studio перед повтором.')
+            self.store.notify('YouTube: загрузчик остановлен из-за ошибки браузера; подробности в журнале.')
             self.stop_event.wait(15)
         return True
 
