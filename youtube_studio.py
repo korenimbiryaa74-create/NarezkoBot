@@ -121,7 +121,7 @@ class CDP:
 class Browser:
     def __init__(self, root, profile):
         self.profile=Path(root)/'youtube_accounts'/profile_key(profile)/'profile'
-        self.proc=None; self.tab=None; self.monitor_tab=None; self.port=None; self.keep_open=False; self.upload_tabs=[]
+        self.proc=None; self.tab=None; self.monitor_tab=None; self.port=None; self.keep_open=False; self.upload_tabs=[]; self.attempt_may_upload=False
     def __enter__(self):
         self.profile.mkdir(parents=True,exist_ok=True)
         # Reserve a random local port; Chrome refuses an already used port.
@@ -168,7 +168,7 @@ class Browser:
 
     def open_upload_tab(self,channel_id):
         # Each submitted upload stays open while its file is transferred.
-        result=self.tab.call('Target.createTarget',url=f'https://studio.youtube.com/channel/{channel_id}?hl=en',background=True)
+        result=self.tab.call('Target.createTarget',url=f'https://studio.youtube.com/channel/{channel_id}?hl=en',background=False)
         target=result.get('targetId')
         if not target:raise StudioError('Не удалось открыть вкладку следующей загрузки')
         deadline=time.monotonic()+30
@@ -178,7 +178,11 @@ class Browser:
                 page=next((p for p in pages if p.get('id')==target and p.get('webSocketDebuggerUrl')),None)
                 if page:
                     tab=CDP(page['webSocketDebuggerUrl']);tab.call('Runtime.enable');tab.call('DOM.enable')
-                    self.upload_tabs.append(tab);return tab
+                    self.upload_tabs.append(tab)
+                    # Studio menus can fail to initialise in a background page.
+                    # Activate only the new tab; earlier transfers stay open.
+                    tab.call('Page.bringToFront')
+                    return tab
             except (OSError,ValueError,KeyError):pass
             time.sleep(.5)
         raise StudioError('Не удалось подключиться к вкладке загрузки')
@@ -250,10 +254,10 @@ def channel_ready(tab, expected=None, timeout=45):
     raise StudioError('Войдите в Google и откройте нужный канал YouTube Studio')
 
 
-def click(tab, selector, timeout=30):
+def click(tab, selector, timeout=30, message=None):
     script='''(()=>{const es=[...document.querySelectorAll(%s)].filter(e=>e.getClientRects().length&&!e.disabled&&e.getAttribute('aria-disabled')!=='true');if(es.length!==1)return false;es[0].scrollIntoView({block:'center'});es[0].click();return true})()''' % json.dumps(selector)
     # A false return means no click was issued. A CDP error must never be replayed.
-    return wait(tab,script,timeout,'Не найден однозначный элемент YouTube Studio')
+    return wait(tab,script,timeout,message or 'Не найден однозначный элемент YouTube Studio')
 
 
 def selected(tab, selector):
@@ -475,12 +479,15 @@ class YouTubeStudio:
                 return channel_ready(tab,timeout=30)
     def submit(self,tab,browser,row,progress=None):
         expected=row['channel_id']; channel_ready(tab,expected)
-        click(tab,'ytcp-header .ytcpAppHeaderCreateIcon')
-        click(tab,'tp-yt-paper-item[test-id="upload"]')
+        if progress:progress('Открываю меню «Создать» в новой вкладке Studio')
+        click(tab,'ytcp-header .ytcpAppHeaderCreateIcon',message='Не удалось однозначно найти кнопку «Создать» в Studio; файл ещё не выбран')
+        if progress:progress('Выбираю пункт загрузки видео')
+        click(tab,'tp-yt-paper-item[test-id="upload"]',message='Не удалось однозначно найти пункт «Добавить видео» в меню Studio; файл ещё не выбран')
         wait(tab,"!!document.querySelector('ytcp-uploads-dialog input[type=file]')",30,'Не найден выбор видео')
         channel_ready(tab,expected,timeout=5)
         # Selecting the file creates a draft; queue must already say uploading.
         browser.keep_open=True  # a draft/upload may be created even if the next action fails
+        browser.attempt_may_upload=True
         attach_file(tab,row['file_path'])
         if progress:progress('Файл передан; ожидаю загрузку и настройки')
         title_selector=wait_for_title(tab,progress=progress)
@@ -514,10 +521,11 @@ class YouTubeStudio:
             # Already submitted videos must never be interrupted by an error.
             browser.keep_open=bool(queue.submitted_uploads(profile))
             with browser as tab:
-                current=first;used=False;monitor=None;last_report=0;last_refresh=time.monotonic()+30;monitor_errors=0
+                current=first;used=False;monitor=None;last_report=0;last_refresh=time.monotonic()+30;monitor_errors=0;failure=None;failure_may_upload=False
                 while not stop_event.is_set():
                     if current is not None:
                         progress(current['id'],'загрузка на канал '+channel_id)
+                        browser.attempt_may_upload=False
                         try:
                             upload_tab=tab if not used else browser.open_upload_tab(channel_id)
                             used=True
@@ -526,13 +534,22 @@ class YouTubeStudio:
                         except Exception as exc:
                             detail=str(exc)[:400] if isinstance(exc,StudioError) else 'Ошибка связи с браузером'
                             queue.mark_uncertain(current['id'],type(exc).__name__+': '+detail)
-                            raise
-                        progress(current['id'],'отправлено в Studio; обработка продолжится параллельно')
+                            failure=type(exc).__name__+': '+detail
+                            failure_may_upload=browser.attempt_may_upload
+                            progress(current['id'],'ошибка: '+failure+'; ранее отправленные ролики продолжают загружаться')
+                        else:
+                            progress(current['id'],'отправлено в Studio; обработка продолжится параллельно')
                         current=None
-                    current=queue.claim(finished_only=True,profile=profile)
+                    # A failed row blocks this profile; keep this same browser alive
+                    # to monitor earlier transfers instead of launching more Chromes.
+                    current=queue.claim(finished_only=True,profile=profile) if failure is None else None
                     if current is not None:continue
                     pending=queue.submitted_uploads(profile)
                     if not pending:
+                        if failure is not None:
+                            # The failed attempt may have created an unrecorded draft.
+                            browser.keep_open=failure_may_upload
+                            raise StudioError(failure)
                         browser.keep_open=False
                         return
                     if monitor is None:
