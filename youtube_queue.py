@@ -221,6 +221,13 @@ class YouTubeQueue:
                              ('Прервано: проверьте YouTube Studio перед повтором',now))
             return cur.rowcount
 
+    def list_profiles(self):
+        """Return locally saved channel bindings; this does not validate browser login."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT profile,channel_id,interval_hours,audience,updated_at
+                FROM youtube_profiles ORDER BY CASE WHEN profile='__test__' THEN 0 ELSE 1 END,profile""").fetchall()
+            return [dict(row) for row in rows]
+
     def get_profile(self, profile):
         with self._connect() as db:
             row = db.execute('SELECT * FROM youtube_profiles WHERE profile=?', (profile_key(profile),)).fetchone()
