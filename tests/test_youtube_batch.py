@@ -114,10 +114,32 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.queue.list_uploads()[0]['state'],'confirmed')
     def test_warning_then_submission_does_not_wait_for_processing(self):
         class Tab:
-            def __init__(self):self.states=iter([{'links':None,'warning':True},{'links':['https://youtu.be/'+'a'*11],'warning':False}])
-            def js(self,script):return 'clicked' if script==studio._CONFIRM_CHECKS_WARNING else next(self.states)
+            def __init__(self):
+                self.states=iter([{'links':None,'warning':True},{'links':None,'warning':True},
+                                  {'links':['https://youtu.be/'+'a'*11],'warning':False}]);self.clicks=0
+            def js(self,script):
+                if script==studio._CONFIRM_CHECKS_WARNING:self.clicks+=1;return 'clicked'
+                return next(self.states)
+        tab=Tab();messages=[]
         with patch.object(studio.time,'sleep'):
-            self.assertEqual(studio.wait_for_submission(Tab(),candidate_id='a'*11,timeout=5),'a'*11)
+            self.assertEqual(studio.wait_for_submission(tab,candidate_id='a'*11,progress=messages.append,timeout=5),'a'*11)
+        self.assertEqual(tab.clicks,1)
+        self.assertEqual(messages,['Подтверждено предупреждение о продолжающейся проверке'])
+
+    def test_warning_confirmation_alone_is_not_submission(self):
+        class Tab:
+            def js(self,script):
+                return 'clicked' if script==studio._CONFIRM_CHECKS_WARNING else {'links':None,'warning':True}
+        with patch.object(studio.time,'sleep'):
+            with self.assertRaisesRegex(studio.StudioError,'не подтвердила отправку'):
+                studio.wait_for_submission(Tab(),candidate_id='a'*11,timeout=.001)
+
+    def test_ambiguous_warning_button_stops_submission(self):
+        class Tab:
+            def js(self,script):
+                return 'ambiguous' if script==studio._CONFIRM_CHECKS_WARNING else {'links':None,'warning':True}
+        with self.assertRaisesRegex(studio.StudioError,'однозначно подтвердить'):
+            studio.wait_for_submission(Tab(),candidate_id='a'*11,timeout=5)
     def test_processing_dialog_requires_known_video_id(self):
         class Tab:
             def js(self,script):return {'links':None,'warning':False,'processing':True}
