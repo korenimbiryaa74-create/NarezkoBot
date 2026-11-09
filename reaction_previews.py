@@ -34,10 +34,11 @@ def queries(row,segs):
         if len(q)>=8 and q not in out:out.append(q)
     return out
 
-def find_candidates(row,segs,runner=None):
+def find_candidates(row,segs,runner=None,cancel=None):
     runner=runner or subprocess.run; collected={}; qs=queries(row,segs)
     if not qs: raise PreviewError('Недостаточно текста для поиска исходного видео')
     for q in qs:
+        if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
         cmd=[sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--flat-playlist','--dump-single-json','--extractor-args','youtube:lang=ru','--socket-timeout','15','ytsearch6:'+q]
         try:
             r=runner(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=80,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -143,7 +144,7 @@ def render_preview(background,cutout,label,destination):
         if os.path.exists(tmp):os.unlink(tmp)
     return dest
 
-def generate(root,login,row,segs,output):
+def generate(root,login,row,segs,output,cancel=None):
     if row.get('type')!='reaction':raise PreviewError('Превью пока только для реакций')
     label=row.get('preview_text') or ''
     if not label:raise PreviewError('Нет надписи для превью в ответе ChatGPT; проверьте ответ вручную')
@@ -151,11 +152,110 @@ def generate(root,login,row,segs,output):
     if len(label)>32 or len(label.split())>4:
         warnings.append('Надпись длиннее 4 слов или 32 символов: проверьте и сократите вручную')
     cutout=choose_cutout(root,login,row)
-    candidates,queries_used=find_candidates(row,segs)
+    candidates,queries_used=find_candidates(row,segs,cancel=cancel) if cancel else find_candidates(row,segs)
+    if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
     source=candidates[0];image,url=download_thumbnail(source['id'])
+    if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
     render_preview(image,cutout,label,output)
     # Candidate ranking is heuristic; never label it as a confirmed match.
     return {'status':'требует проверки','source_url':'https://www.youtube.com/watch?v='+source['id'],
             'image_url':url,'source_title':source['title'],'source_channel':source['channel'],
             'search_queries':queries_used,'candidates':candidates[:6],
             'cutout':cutout.name,'preview_text':label,'warnings':warnings}
+
+
+def _cached_label(root, row):
+    """Recover old rows only from one unambiguous cache match; never call GPT."""
+    import reactions
+    matches=[]
+    for path in (Path(root)/'gpt_uploads'/'response_cache').glob('*.json'):
+        try:
+            if path.is_symlink() or path.stat().st_size>5_000_000:continue
+            data=json.loads(path.read_text(encoding='utf-8-sig'))
+            answer=reactions.parse_reaction_answer(data['text'])
+            for r in answer['reactions']:
+                if not isinstance(r,dict) or r.get('type')!='reaction':continue
+                a,b=reactions.reaction_time(r.get('start')),reactions.reaction_time(r.get('end'))
+                if a is None or b is None:continue
+                if abs(a-float(row['start']))>.005 or abs(b-float(row['end']))>.005:continue
+                if reactions.tc.clean_title(r.get('title'))!=row.get('title'):continue
+                label=r.get('preview_text')
+                if isinstance(label,str) and label.strip():matches.append(label.strip())
+        except (OSError,ValueError,TypeError,KeyError,reactions.ReactionsError):continue
+    if len(matches)==1:return matches[0]
+    if len(matches)>1:raise PreviewError('Найдено несколько совпадающих ответов ChatGPT; нельзя надёжно выбрать надпись')
+    raise PreviewError('Для этой нарезки не найдена сохранённая надпись preview_text. Используйте нарезку, созданную с новой версией бота')
+
+
+def prepare_saved_clip(root, video, test_login=''):
+    """Resolve one original, unmodified pipeline clip and its saved transcript."""
+    root=Path(root).resolve(); video=Path(video)
+    if video.is_symlink() or not video.is_file() or video.suffix.lower()!='.mp4':
+        raise PreviewError('Выберите готовую MP4-нарезку бота')
+    video=video.resolve()
+    try:video.relative_to(root/'recordings')
+    except ValueError:raise PreviewError('Выберите исходный файл нарезки в папке recordings, не перемещённую копию') from None
+    directory=video.parent
+    job=directory.parent if directory.name in ('Готовые нарезки','Готовые без тишины') else directory
+    meta_path=job/(video.stem+'.pipeline.json'); index_path=job/'reactions.json'
+    try:
+        meta=json.loads(meta_path.read_text(encoding='utf-8-sig'))
+        index=json.loads(index_path.read_text(encoding='utf-8-sig'))
+        row=meta['reaction']; rows=index['reactions']
+        if not isinstance(row,dict) or not isinstance(rows,list) or rows.count(row)!=1 or meta['vod_id']!=index['vod_id']:
+            raise ValueError('mismatch')
+        if row.get('type')!='reaction':raise PreviewError('Эта нарезка не отмечена как реакция; превью пока только для реакций')
+        a,b=float(row['start']),float(row['end']); duration=float(meta['duration'])
+        if not all(math.isfinite(x) for x in (a,b,duration)) or b<=a or duration<=0:raise ValueError('time')
+        if not isinstance(row.get('title'),str) or not row['title']:raise ValueError('title')
+    except PreviewError:raise
+    except (OSError,ValueError,TypeError,KeyError):
+        raise PreviewError('Метаданные этой нарезки не найдены или не совпадают. Выберите файл в исходной папке recordings') from None
+    label=row.get('preview_text')
+    if not isinstance(label,str) or not label.strip():label=_cached_label(root,row)
+    login_match=re.fullmatch(r'([a-z0-9_]{1,25}) VOD (\d+)',job.name)
+    if login_match and login_match.group(2)==str(meta['vod_id']):login=login_match.group(1)
+    else:login=str(test_login or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9_]{1,25}',login):
+        raise PreviewError('Для тестового видео укажите логин стримера в настройках «Превью реакций»')
+    text_path=directory/(video.stem+'.txt')
+    try:
+        if text_path.is_symlink() or text_path.stat().st_size>20_000_000:raise ValueError()
+        text=text_path.read_text(encoding='utf-8-sig')
+    except (OSError,ValueError):raise PreviewError('Рядом с нарезкой не найден её транскрипт .txt') from None
+    segs=[]
+    for line in text.splitlines():
+        match=re.match(r'^\[(\d{2,}):(\d{2}):(\d{2})\]\s*(.+)$',line)
+        if match:
+            h,m,s=map(int,match.group(1,2,3));t=h*3600+m*60+s
+            if m<60 and s<60 and t<=duration:segs.append({'start':t,'text':match.group(4)})
+    if not segs:raise PreviewError('В транскрипте нарезки не найдены реплики с таймкодами')
+    local_row=dict(row,start=0.0,end=duration+1,preview_text=label.strip())
+    target=video.with_name(video.stem+' — превью.jpg')
+    return {'video':video,'login':login,'row':local_row,'segs':segs,'target':target,'report':target.with_suffix('.json')}
+
+
+def generate_saved_clip(root, video, test_login='', cancel=None, status=None):
+    """Generate an on-demand preview without retranscription or ChatGPT."""
+    status=status or (lambda _:None)
+    data=prepare_saved_clip(root,video,test_login); target=data['target'];report=data['report']
+    if target.exists():
+        status('Ранее созданное превью найдено; не перезаписываю')
+        label=''
+        try:
+            saved=json.loads(report.read_text(encoding='utf-8-sig'))
+            if isinstance(saved,dict) and isinstance(saved.get('preview_text'),str):label=saved['preview_text']
+        except (OSError,ValueError,TypeError):pass
+        return {'path':str(target),'preview_text':label,'existing':True}
+    if report.exists():raise PreviewError('Найден отчёт без превью; не перезаписываю существующий файл')
+    if cancel and cancel.is_set():raise PreviewError('Тест превью отменён')
+    status('Ищу исходное видео и собираю превью; надпись взята из сохранённого ответа')
+    info=generate(root,data['login'],data['row'],data['segs'],target,cancel=cancel)
+    fd,tmp=tempfile.mkstemp(prefix='.preview-report-',suffix='.json',dir=report.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf8') as f:json.dump(info,f,ensure_ascii=False,indent=2);f.flush();os.fsync(f.fileno())
+        if os.name=='nt':os.rename(tmp,report)
+        else:os.link(tmp,report)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    return {'path':str(target),'preview_text':data['row']['preview_text'],'existing':False,'source_url':info['source_url'],'warnings':info['warnings']}

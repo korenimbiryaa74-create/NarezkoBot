@@ -107,4 +107,58 @@ class Tests(unittest.TestCase):
     def test_no_preview_for_discussion(self):
         with self.assertRaises(rp.PreviewError):rp.generate('/unused','name',{'type':'discussion'},[],Path('/tmp/a.jpg'))
 
+class SavedClipTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.vod='test-'+'a'*32
+        self.job=self.root/'recordings'/'Тест один';self.ready=self.job/'Готовые нарезки'
+        self.ready.mkdir(parents=True)
+        self.clip=self.ready/'01 Тест.mp4';self.clip.write_bytes(b'video')
+        self.row={'type':'reaction','start':542.412,'end':1742.240,'title':'Тест', 'preview_text':'ВЗЛОМАЛИ ДВЕРЬ'}
+        self.write_metadata()
+        self.clip.with_suffix('.txt').write_text('Транскрипт\n[00:00:05] Как взломали дверь\n',encoding='utf-8-sig')
+    def write_metadata(self):
+        (self.job/'reactions.json').write_text(json.dumps({'vod_id':self.vod,'reactions':[self.row]},ensure_ascii=False),encoding='utf-8')
+        (self.job/'01 Тест.pipeline.json').write_text(json.dumps({'vod_id':self.vod,'reaction':self.row,'duration':1200},ensure_ascii=False),encoding='utf-8')
+    def cache(self,filename='answer.json'):
+        cache=self.root/'gpt_uploads'/'response_cache';cache.mkdir(parents=True,exist_ok=True)
+        row=dict(self.row,start='00:09:02.412',end='00:29:02.240',preview_text='ВЗЛОМАЛИ ДВЕРЬ')
+        (cache/filename).write_text(json.dumps({'text':json.dumps({'reactions':[row]},ensure_ascii=False)},ensure_ascii=False),encoding='utf-8')
+    def test_generate_uses_saved_text_and_clip_transcript_without_chatgpt(self):
+        prepared=rp.prepare_saved_clip(self.root,self.clip,'Kussia88')
+        self.assertEqual(prepared['login'],'kussia88')
+        self.assertEqual(prepared['row']['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+        self.assertEqual(prepared['row']['start'],0)
+        self.assertEqual(prepared['segs'][0]['start'],5)
+        def generate(root,login,row,segs,target,cancel=None):
+            self.assertEqual(login,'kussia88');self.assertEqual(row['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+            target.write_bytes(b'jpg')
+            return {'source_url':'https://example.org/test','preview_text':row['preview_text'],'warnings':[]}
+        with patch.object(rp,'generate',side_effect=generate) as mocked:
+            result=rp.generate_saved_clip(self.root,self.clip,'kussia88')
+            self.assertFalse(result['existing']);self.assertEqual(result['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+            self.assertEqual(json.loads(Path(result['path']).with_suffix('.json').read_text(encoding='utf8'))['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+            result2=rp.generate_saved_clip(self.root,self.clip,'kussia88')
+            self.assertTrue(result2['existing']);self.assertEqual(result2['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+            self.assertEqual(Path(result2['path']).read_bytes(),b'jpg');self.assertEqual(mocked.call_count,1)
+    def test_old_row_can_recover_only_exact_unique_cached_answer(self):
+        self.row.pop('preview_text');self.write_metadata();self.cache()
+        self.assertEqual(rp.prepare_saved_clip(self.root,self.clip,'kussia88')['row']['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
+        self.cache('other.json')
+        with self.assertRaisesRegex(rp.PreviewError,'несколько'):rp.prepare_saved_clip(self.root,self.clip,'kussia88')
+    def test_missing_data_and_other_moment_fail_safely(self):
+        self.row.pop('preview_text');self.write_metadata()
+        with self.assertRaisesRegex(rp.PreviewError,'не найдена сохранённая надпись'):rp.prepare_saved_clip(self.root,self.clip,'kussia88')
+        self.row.update(type='discussion',preview_text='НЕ НАДО');self.write_metadata()
+        with self.assertRaisesRegex(rp.PreviewError,'не отмечена как реакция'):rp.prepare_saved_clip(self.root,self.clip,'kussia88')
+    def test_existing_without_report_does_not_claim_text(self):
+        target=self.clip.with_name(self.clip.stem+' — превью.jpg');target.write_bytes(b'previous')
+        with patch.object(rp,'generate') as generate:
+            result=rp.generate_saved_clip(self.root,self.clip,'kussia88')
+        generate.assert_not_called();self.assertEqual(result['preview_text'],'');self.assertEqual(target.read_bytes(),b'previous')
+    def test_report_alone_is_not_overwritten(self):
+        report=self.clip.with_name(self.clip.stem+' — превью.json');report.write_text('{}',encoding='utf8')
+        with self.assertRaisesRegex(rp.PreviewError,'отчёт без превью'):rp.generate_saved_clip(self.root,self.clip,'kussia88')
+        self.assertEqual(report.read_text(encoding='utf8'),'{}')
+
 if __name__=='__main__':unittest.main()
