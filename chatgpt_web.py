@@ -527,7 +527,7 @@ class ChatGPTWeb:
                 self._status('подготовка отправки: '+reason)
                 self._log('отправка: ' + reason)
                 next_log = time.monotonic() + 10
-            can_click = stable >= 3 and (clicks == 0 or (clicks == 1 and time.monotonic() - last_click >= 15))
+            can_click = stable >= 3 and clicks == 0
             if can_click:
                 previous_uncertainty = getattr(self, '_send_uncertain', False)
                 self._send_uncertain = True
@@ -566,13 +566,13 @@ class ChatGPTWeb:
             self._quota_blocked = True
             raise ChatGPTQuotaError('ChatGPT: обнаружен лимит загрузки файлов')
 
-    def _wait_attached(self, name: str, image: bool, seconds: int=45) -> bool:
+    def _wait_attached(self, name: str, image: bool, seconds: int=300) -> bool:
         deadline = time.monotonic() + self._remaining(seconds)
         stable = 0
         next_status = time.monotonic()+15
         while time.monotonic() < deadline:
             if time.monotonic() >= next_status:
-                self._status('ожидаю подтверждения прикреплённого файла')
+                self._status('ожидаю подтверждения прикреплённого файла (до 5 минут; запрос ещё не отправлен)')
                 next_status=time.monotonic()+15
             self._check_upload_quota()
             try:
@@ -632,14 +632,17 @@ class ChatGPTWeb:
             self._log('файл готов; ввожу критерии поиска')
             if not self._type_prompt(prompt):
                 last = 'текст не вводится в поле'
+                if files: raise ChatGPTWebError(last + '; файл повторно не загружается, проверьте чат вручную')
                 continue
             if self._page_id() != page:
                 last = 'страница перезагрузилась во время ввода'
+                if files: raise ChatGPTWebError(last + '; файл повторно не загружается, проверьте чат вручную')
                 self._log(last + ' — заново')
                 continue
             self._status('проверяю готовность файла и отправку запроса')
             if not self._send():
                 last = 'файл или кнопка отправки не готовы; Enter не используется'
+                if files: raise ChatGPTWebError(last + '; файл повторно не загружается, проверьте чат вручную')
                 continue
             self._status('отправка подтверждена; ожидаю ответ')
             self._log(f'отправил запрос: {prompt[:80]!r}')

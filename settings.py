@@ -15,7 +15,7 @@ DEFAULTS={
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
-             'keep_original':False,'remove_donations':True,'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
+             'keep_original':False,'remove_donations':True,'preview':{'enabled':False,'test_streamer':''},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
 
 def merge(base, override):
     result=copy.deepcopy(base)
@@ -38,6 +38,11 @@ def validate(config):
         q[key]=float(q[key])
         if not 0<=q[key]<=180: raise ValueError('Время реакции: от 0 до 180 минут')
     if not isinstance(q['remove_donations'],bool): raise ValueError('Некорректная настройка удаления донатов')
+    preview=q.get('preview')
+    if not isinstance(preview,dict) or not isinstance(preview.get('enabled'),bool): raise ValueError('Некорректная настройка превью')
+    test_login=preview.get('test_streamer','')
+    if not isinstance(test_login,str): raise ValueError('Некорректный ник для теста превью')
+    preview['test_streamer']=normalize_login(test_login) if test_login.strip() else ''
     if not isinstance(q['banner_blur'],dict) or not isinstance(q['banner_blur'].get('enabled'),bool): raise ValueError('Некорректная настройка блюра баннеров')
     q['banner_blur']['interval']=int(q['banner_blur']['interval'])
     if not 1<=q['banner_blur']['interval']<=60: raise ValueError('Интервал поиска баннеров: от 1 до 60 секунд')

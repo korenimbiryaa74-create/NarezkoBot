@@ -230,7 +230,7 @@ class Service:
             def progress(stage,detail=''):
                 detail=clean(detail)
                 self.store.update_stage(job['id'],stage,detail)
-                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов'): self.log(f"VOD {job['vod_id']}: {detail}")
+                if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов','Превью'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             count=len(outcome['outputs'])
             if cfg.get('youtube',{}).get('enabled') and count:
