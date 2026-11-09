@@ -58,6 +58,8 @@ class YouTubeQueue:
             columns = {r['name'] for r in db.execute('PRAGMA table_info(youtube_uploads)')}
             if 'audience' not in columns:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
+            if 'submitted' not in columns:
+                db.execute("ALTER TABLE youtube_uploads ADD COLUMN submitted INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _connect(self):
@@ -163,19 +165,21 @@ class YouTubeQueue:
             db.commit()
             return len(prepared)
 
-    def claim(self, now=None, *, finished_only=False):
+    def claim(self, now=None, *, finished_only=False, profile=None):
         """Claim next clip only when its batch and browser profile are safe to use."""
         now = time.time() if now is None else float(now)
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             ready = " AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=u.job_id AND j.state='done')" if finished_only else ''
-            row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued' ''' + ready + '''
+            profile_filter=" AND u.profile=?" if profile is not None else ''
+            params=(profile_key(profile),) if profile is not None else ()
+            row = db.execute('''SELECT u.* FROM youtube_uploads u WHERE u.state='queued' ''' + ready + profile_filter + '''
                 AND NOT EXISTS (SELECT 1 FROM youtube_uploads prior
                     WHERE prior.job_id=u.job_id AND prior.clip_index<u.clip_index
-                    AND prior.state NOT IN ('confirmed','cancelled'))
-                AND NOT EXISTS (SELECT 1 FROM youtube_uploads blocking
-                    WHERE blocking.profile=u.profile AND blocking.state IN ('uploading','needs_review'))
-                ORDER BY u.id LIMIT 1''').fetchone()
+                    AND prior.state NOT IN ('confirmed','cancelled') AND NOT (prior.state='uploading' AND prior.submitted=1))
+                AND NOT EXISTS (SELECT 1 FROM youtube_uploads blocking WHERE blocking.profile=u.profile
+                    AND (blocking.state='needs_review' OR (blocking.state='uploading' AND blocking.submitted=0)))
+                ORDER BY u.id LIMIT 1''',params).fetchone()
             if row is None:
                 db.commit()
                 return None
@@ -196,20 +200,46 @@ class YouTubeQueue:
             db.commit()
             return result
 
+    def mark_submitted(self, upload_id, channel_id, video_id, *, now=None):
+        """Save a positively observed publication receipt before accepting another clip."""
+        if not _CHANNEL.fullmatch(str(channel_id)) or not _VIDEO_ID.fullmatch(str(video_id)):
+            raise ValueError('Некорректное подтверждение YouTube')
+        now=time.time() if now is None else float(now)
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute("SELECT job_id,clip_index FROM youtube_uploads WHERE id=? AND channel_id=? AND state='uploading' AND submitted=0",(upload_id,channel_id)).fetchone()
+            if not row:
+                db.rollback();raise ValueError('Загрузка не выполняется или канал не совпадает')
+            if db.execute("SELECT 1 FROM youtube_uploads WHERE video_id=? AND id<>? AND state IN ('uploading','confirmed')",(video_id,upload_id)).fetchone():
+                db.rollback();raise ValueError('Видео уже привязано к другой загрузке')
+            db.execute("UPDATE youtube_uploads SET submitted=1,video_id=?,detail=?,updated_at=? WHERE id=?",(video_id,'Отправлено в Studio; ожидается обработка',now,upload_id))
+            if row['clip_index']==1:
+                db.execute("UPDATE youtube_uploads SET publish_at=?+(publish_at-created_at),updated_at=? WHERE job_id=? AND clip_index>1 AND state='queued' AND publish_at IS NOT NULL",(now,now,row['job_id']))
+            db.commit()
+
+    def submitted_uploads(self, profile=None):
+        with self._connect() as db:
+            where="state='uploading' AND submitted=1 AND video_id IS NOT NULL"
+            params=()
+            if profile is not None:where+=' AND profile=?';params=(profile_key(profile),)
+            return [dict(r) for r in db.execute('SELECT * FROM youtube_uploads WHERE '+where+' ORDER BY id',params)]
+
     def confirm(self, upload_id, channel_id, video_id, *, now=None):
         if not _CHANNEL.fullmatch(str(channel_id)) or not _VIDEO_ID.fullmatch(str(video_id)):
             raise ValueError('Некорректное подтверждение YouTube')
         now = time.time() if now is None else float(now)
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT job_id,clip_index FROM youtube_uploads WHERE id=? AND state='uploading' AND channel_id=?", (upload_id,channel_id)).fetchone()
+            row = db.execute("SELECT job_id,clip_index,submitted,video_id FROM youtube_uploads WHERE id=? AND state='uploading' AND channel_id=?", (upload_id,channel_id)).fetchone()
             if row is None:
                 db.rollback()
                 raise ValueError('Публикация не выполняется или канал не совпадает')
+            if row['submitted'] and row['video_id']!=video_id:
+                db.rollback();raise ValueError('ID видео не совпадает с отправленной загрузкой')
             if db.execute("SELECT 1 FROM youtube_uploads WHERE state='confirmed' AND video_id=? AND id<>?",(video_id,upload_id)).fetchone():
                 db.rollback();raise ValueError('Это видео уже привязано к другой загрузке')
             db.execute("UPDATE youtube_uploads SET state='confirmed',video_id=?,detail='',updated_at=? WHERE id=?", (video_id,now,upload_id))
-            if row['clip_index'] == 1:
+            if row['clip_index'] == 1 and not row['submitted']:
                 # Anchor delays to the first accepted publication, not render completion.
                 db.execute("UPDATE youtube_uploads SET publish_at=?+(publish_at-created_at),updated_at=? WHERE job_id=? AND clip_index>1 AND state='queued' AND publish_at IS NOT NULL", (now,now,row['job_id']))
             db.commit()
@@ -225,7 +255,7 @@ class YouTubeQueue:
     def recover_interrupted(self, *, now=None):
         now = time.time() if now is None else float(now)
         with self._connect() as db:
-            cur = db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE state='uploading'",
+            cur = db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE state='uploading' AND submitted=0",
                              ('Прервано: проверьте YouTube Studio перед повтором',now))
             return cur.rowcount
 
