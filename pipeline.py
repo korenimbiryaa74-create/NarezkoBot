@@ -589,7 +589,8 @@ class Pipeline:
             manual=load_json(manual_answer_path(self.root,job['id']))
             if isinstance(manual,dict) and manual.get('job')==job_identity(job) and isinstance(manual.get('text'),str):
                 finder_cfg=dict(cfg,_manual_reactions=manual['text'])
-        rows=validate_intervals(self.finder(str(src),segs,duration,login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
+        finder_login=(cfg.get('preview',{}).get('test_streamer','') if local_name else login)
+        rows=validate_intervals(self.finder(str(src),segs,duration,finder_login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
         check_local()
         if cfg.get('remove_donations',False) and any(r.get('type','reaction')=='reaction' for r in rows):
             if not hasattr(self.finder,'find_donations'): raise PipelineError('Поиск донатов недоступен у текущего поставщика')
@@ -673,6 +674,7 @@ class Pipeline:
                     info=reaction_previews.generate(self.root,preview_login,row,segs,target)
                     atomic_json(report,info)
                     progress('Превью',f'Нарезка {i}: превью сохранено, источник требует проверки')
+                    for warning in info.get('warnings',[]): progress('Превью',f'Нарезка {i}: {warning}')
                 except Exception as exc:
                     progress('Превью',f'Нарезка {i}: превью не готово ({type(exc).__name__}): {str(exc)[:250]}')
         progress('Готово',f'Найдено моментов: {len(rows)}; сохранено видео: {len(outputs)}')

@@ -147,6 +147,9 @@ def generate(root,login,row,segs,output):
     if row.get('type')!='reaction':raise PreviewError('Превью пока только для реакций')
     label=row.get('preview_text') or ''
     if not label:raise PreviewError('Нет надписи для превью в ответе ChatGPT; проверьте ответ вручную')
+    warnings=[]
+    if len(label)>32 or len(label.split())>4:
+        warnings.append('Надпись длиннее 4 слов или 32 символов: проверьте и сократите вручную')
     cutout=choose_cutout(root,login,row)
     candidates,queries_used=find_candidates(row,segs)
     source=candidates[0];image,url=download_thumbnail(source['id'])
@@ -155,4 +158,4 @@ def generate(root,login,row,segs,output):
     return {'status':'требует проверки','source_url':'https://www.youtube.com/watch?v='+source['id'],
             'image_url':url,'source_title':source['title'],'source_channel':source['channel'],
             'search_queries':queries_used,'candidates':candidates[:6],
-            'cutout':cutout.name,'preview_text':label}
+            'cutout':cutout.name,'preview_text':label,'warnings':warnings}
