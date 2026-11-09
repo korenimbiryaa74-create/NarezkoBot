@@ -107,6 +107,39 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([r['state'] for r in self.queue.list_uploads()],['confirmed','cancelled','cancelled','confirmed'])
         self.assertGreaterEqual(len(attempts),14)
 
+    def test_access_prompt_refreshes_once_before_file_is_selected(self):
+        class Tab:
+            def __init__(self):self.states=iter([
+                {'popup':1,'safe':True,'ready':True,'origin':100},
+                {'popup':0,'safe':False,'ready':True,'origin':200},
+                {'popup':0,'safe':False,'ready':True,'origin':200}]);self.reloads=0
+            def js(self,script):
+                if script==studio._PRE_UPLOAD_STATE:return next(self.states)
+                if script==studio._PRE_UPLOAD_RELOAD:self.reloads+=1;return 'refreshing'
+                return {'origin':200,'ready':'complete'}
+        clock=iter(range(100));tab=Tab();messages=[]
+        with patch.object(studio,'channel_ready') as ready,patch.object(studio,'click') as click,patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)):
+            studio.prepare_upload_dialog(tab,CHANNEL,progress=messages.append)
+        self.assertEqual(tab.reloads,1);self.assertEqual(ready.call_count,2);self.assertEqual(click.call_count,4)
+        self.assertTrue(any('до выбора файла' in m for m in messages))
+
+    def test_access_prompt_never_refreshes_unsafe_upload_or_repeats(self):
+        class Tab:
+            def __init__(self,unsafe=False):self.unsafe=unsafe;self.reloads=0;self.calls=0
+            def js(self,script):
+                if script==studio._PRE_UPLOAD_STATE:
+                    self.calls+=1
+                    return {'popup':1,'safe':not self.unsafe,'origin':100}
+                if script==studio._PRE_UPLOAD_RELOAD:self.reloads+=1;return 'refreshing'
+                return {'origin':200,'ready':'complete'}
+        with patch.object(studio,'channel_ready'),patch.object(studio,'click'),patch.object(studio.time,'sleep'):
+            t=Tab(True)
+            with self.assertRaises(studio.UnsafeUploadState):studio.prepare_upload_dialog(t,CHANNEL)
+            self.assertEqual(t.reloads,0)
+            t=Tab()
+            with self.assertRaises(studio.StudioError):studio.prepare_upload_dialog(t,CHANNEL)
+            self.assertEqual(t.reloads,1)
+
     def test_new_upload_tab_is_foregrounded_without_closing_old_tab(self):
         calls=[]
         class OldTab:

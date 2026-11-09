@@ -25,6 +25,7 @@ VIDEO = re.compile(r'^[A-Za-z0-9_-]{11}$')
 _LOCK = threading.Lock()
 
 class StudioError(RuntimeError): pass
+class UnsafeUploadState(StudioError): pass
 
 
 def channel_from_url(url):
@@ -260,6 +261,67 @@ def click(tab, selector, timeout=30, message=None):
     return wait(tab,script,timeout,message or 'Не найден однозначный элемент YouTube Studio')
 
 
+
+# Read only the precise Studio message shown when access already exists and
+# Studio itself asks for a reload.  Never reload an active/ambiguous upload.
+_PRE_UPLOAD_STATE = r"""(()=>{
+ const visible=e=>!!e.getClientRects().length;
+ const access=/(?:у вас уже есть доступ к этой функции|you already have access to this feature)/i;
+ const refresh=/(?:попробуйте обновить страницу|try refreshing (?:the )?page)/i;
+ const ds=[...document.querySelectorAll('ytcp-dialog,ytcp-confirm-dialog,tp-yt-paper-dialog,[role="dialog"]')]
+  .filter(e=>visible(e)&&access.test(e.innerText||'')&&refresh.test(e.innerText||''));
+ const leaf=ds.filter(e=>!ds.some(x=>x!==e&&e.contains(x)));
+ const uploads=[...document.querySelectorAll('ytcp-uploads-dialog')].filter(visible);
+ const inputs=[...document.querySelectorAll('input[type="file"]')];
+ const files=inputs.some(e=>e.files&&e.files.length);
+ const links=uploads.some(d=>[...d.querySelectorAll('a[href]')].some(a=>
+   /(?:youtu\.be\/[A-Za-z0-9_-]{11}|\/video\/[A-Za-z0-9_-]{11}(?:\/|$)|[?&]v=[A-Za-z0-9_-]{11})/.test(a.href)));
+ return {popup:leaf.length, safe:leaf.length===1&&uploads.length===1&&!files&&!links,
+         ready:uploads.length===1&&!!uploads[0].querySelector('input[type="file"]'), origin:performance.timeOrigin};
+})()"""
+_PRE_UPLOAD_RELOAD = """(()=>{const s=__STATE__;if(!s.popup||!s.safe)return 'unsafe';
+ setTimeout(()=>{const next=__STATE__;if(next.safe)location.reload()},50);return 'refreshing'})()""".replace('__STATE__',_PRE_UPLOAD_STATE)
+
+
+def prepare_upload_dialog(tab, expected, progress=None, timeout=30):
+    """Recover one exact pre-file Studio prompt by refreshing only this tab."""
+    refreshed=False
+    while True:
+        channel_ready(tab,expected)
+        if progress:progress('Открываю меню «Создать» в новой вкладке Studio')
+        click(tab,'ytcp-header .ytcpAppHeaderCreateIcon',message='Не удалось однозначно найти кнопку «Создать» в Studio; файл ещё не выбран')
+        if progress:progress('Выбираю пункт загрузки видео')
+        click(tab,'tp-yt-paper-item[test-id="upload"]',message='Не удалось однозначно найти пункт «Добавить видео» в меню Studio; файл ещё не выбран')
+        deadline=time.monotonic()+timeout;ready_since=None;restart=False
+        while time.monotonic()<deadline:
+            state=tab.js(_PRE_UPLOAD_STATE) or {}
+            if state.get('popup'):
+                if not state.get('safe'):
+                    raise UnsafeUploadState('Studio просит обновить страницу, но текущая вкладка может содержать загрузку; проверьте Studio')
+                if refreshed:
+                    raise StudioError('Studio повторно просит обновить страницу; файл не выбран')
+                if tab.js(_PRE_UPLOAD_RELOAD)!='refreshing':
+                    raise UnsafeUploadState('Не удалось безопасно обновить вкладку Studio; проверьте текущую загрузку')
+                refreshed=True;restart=True
+                if progress:progress('Studio попросила обновить страницу; обновляю только вкладку до выбора файла')
+                old_origin=state.get('origin');load_deadline=time.monotonic()+45
+                while time.monotonic()<load_deadline:
+                    try:
+                        info=tab.js('({origin:performance.timeOrigin,ready:document.readyState})') or {}
+                        if old_origin is not None and info.get('origin')!=old_origin and info.get('ready')=='complete':break
+                    except StudioError:
+                        pass  # navigation can destroy the old execution context
+                    time.sleep(.5)
+                else:raise StudioError('Вкладка Studio не обновилась; файл не выбран')
+                break
+            if state.get('ready'):
+                if ready_since is None:ready_since=time.monotonic()
+                if time.monotonic()-ready_since>=2:return
+            else:ready_since=None
+            time.sleep(.5)
+        if not restart:raise StudioError('Не найден выбор видео или его закрыло сообщение Studio; файл не выбран')
+
+
 def selected(tab, selector):
     return tab.js('''(()=>{const es=[...document.querySelectorAll(%s)];return es.length===1&&es[0].getAttribute('aria-checked')==='true'})()''' % json.dumps(selector))
 
@@ -478,12 +540,11 @@ class YouTubeStudio:
                     raise StudioError('Время входа истекло; повторите подключение')
                 return channel_ready(tab,timeout=30)
     def submit(self,tab,browser,row,progress=None):
-        expected=row['channel_id']; channel_ready(tab,expected)
-        if progress:progress('Открываю меню «Создать» в новой вкладке Studio')
-        click(tab,'ytcp-header .ytcpAppHeaderCreateIcon',message='Не удалось однозначно найти кнопку «Создать» в Studio; файл ещё не выбран')
-        if progress:progress('Выбираю пункт загрузки видео')
-        click(tab,'tp-yt-paper-item[test-id="upload"]',message='Не удалось однозначно найти пункт «Добавить видео» в меню Studio; файл ещё не выбран')
-        wait(tab,"!!document.querySelector('ytcp-uploads-dialog input[type=file]')",30,'Не найден выбор видео')
+        expected=row['channel_id']
+        try:prepare_upload_dialog(tab,expected,progress=progress)
+        except UnsafeUploadState:
+            browser.keep_open=True;browser.attempt_may_upload=True
+            raise
         channel_ready(tab,expected,timeout=5)
         # Selecting the file creates a draft; queue must already say uploading.
         browser.keep_open=True  # a draft/upload may be created even if the next action fails
