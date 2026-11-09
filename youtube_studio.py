@@ -555,7 +555,7 @@ _CONFIRM_CHECKS_WARNING = r"""(()=>{
   const dialogs=[...document.querySelectorAll('ytcp-dialog,ytcp-confirm-dialog,tp-yt-paper-dialog,[role="dialog"]')].filter(e=>visible(e)&&!e.matches('ytcp-uploads-dialog')&&pattern.test(e.innerText||''));
   if(!dialogs.length)return 'none';
   const candidates=[...new Set(dialogs.flatMap(d=>[...d.querySelectorAll('button,ytcp-button,tp-yt-paper-button,[role="button"]')]))]
-    .filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&/^(?:publish|опубликовать)$/i.test((e.innerText||'').trim()));
+    .filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&/^(?:publish|опубликовать|[oо][kк])$/i.test((e.innerText||'').trim()));
   // Prefer the actual innermost clickable element; never click if ambiguous.
   const leaves=candidates.filter(e=>!candidates.some(other=>other!==e&&e.contains(other)));
   if(leaves.length!==1)return 'ambiguous';
@@ -616,7 +616,7 @@ def wait_for_receipt(tab, progress=None, timeout=7200, *, browser=None, channel_
             result=tab.js(_CONFIRM_CHECKS_WARNING)
             if result=='ambiguous':raise StudioError('Не удалось однозначно подтвердить предупреждение о проверке; проверьте Studio')
             if result not in ('clicked','none'):raise StudioError('Не удалось подтвердить публикацию; проверьте Studio')
-            if result=='clicked' and progress:progress('Подтверждена публикация до завершения проверки; ожидаю обработку')
+            if result=='clicked' and progress:progress('Подтверждено предупреждение о продолжающейся проверке; ожидаю обработку')
         # Production requires a positive content-list status for the exact video.
         if video_id and browser is not None:
             if monitor is None:
@@ -656,7 +656,7 @@ def wait_for_submission(tab, candidate_id=None, progress=None, timeout=300):
             if not attempted:
                 attempted=True;result=tab.js(_CONFIRM_CHECKS_WARNING)
                 if result!='clicked':raise StudioError('Не удалось однозначно подтвердить предупреждение; проверьте Studio')
-                if progress:progress('Подтверждена публикация до завершения проверки')
+                if progress:progress('Подтверждено предупреждение о продолжающейся проверке')
             time.sleep(1);continue
         if state.get('links') is not None:
             ids={video_from_url(x) for x in state['links']};ids.discard(None)
