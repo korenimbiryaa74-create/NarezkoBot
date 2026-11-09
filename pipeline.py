@@ -140,7 +140,12 @@ def validate_intervals(rows,duration,min_seconds=0):
         if not math.isfinite(a+b) or a<0 or b<=a or b>duration+.5:
             raise PipelineError('Модель вернула границы за пределами записи')
         if b-a<min_seconds: continue
-        clean.append({'start':a,'end':min(b,duration),'title':str(item.get('title') or 'Реакция')[:100]})
+        row={'start':a,'end':min(b,duration),'title':str(item.get('title') or 'Момент')[:100]}
+        if 'type' in item:
+            if item['type'] not in ('reaction','discussion'): raise PipelineError('Неизвестный тип момента')
+            row['type']=item['type']
+        if item.get('confidence') in ('high','medium','low'): row['confidence']=item['confidence']
+        clean.append(row)
     clean.sort(key=lambda x:x['start'])
     if any(b['start']<a['end'] for a,b in zip(clean,clean[1:])):
         raise PipelineError('Модель вернула пересекающиеся интервалы')
@@ -575,7 +580,7 @@ class Pipeline:
         check_local()
         segs,duration=self.speech(src,cache,cfg.get('speech',{}),progress,duration=duration)
         check_local()
-        progress('Поиск реакций','Анализируется полный транскрипт')
+        progress('Поиск реакций','Поиск реакций и интересных моментов по полному транскрипту')
         finder_cfg=cfg
         if isinstance(job.get('id'),int) and not isinstance(job['id'],bool) and job['id']>0:
             manual=load_json(manual_answer_path(self.root,job['id']))
@@ -596,7 +601,7 @@ class Pipeline:
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]
         for i,row in enumerate(rows,1):
-            progress('Нарезка',f'{i}/{len(rows)} · {timestamp(row["start"])}–{timestamp(row["end"])}')
+            progress('Нарезка',f"{i}/{len(rows)} · {('Реакция' if row.get('type')=='reaction' else 'Обсуждение/момент' if row.get('type')=='discussion' else 'Момент')} · {timestamp(row['start'])}–{timestamp(row['end'])}")
             stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
             old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
             hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
@@ -635,7 +640,9 @@ class Pipeline:
             # A partial render is never presented as completed.
             os.replace(rendered,output)
             warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
-            txt.write_text('Транскрипт готовой нарезки; времена от начала видео.\n\n'+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
+            category={'reaction':'Реакция на видео','discussion':'Обсуждение / другой интересный момент'}.get(row.get('type'))
+            heading=('Тип момента: '+category+'\n' if category else '')+'Транскрипт готовой нарезки; времена от начала видео.\n\n'
+            txt.write_text(heading+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
             banner_scan=getattr(keeps,'banner_scan',None)
             if banner_scan is not None:
                 banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
@@ -644,5 +651,5 @@ class Pipeline:
             outputs.append(str(output))
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
         ready,outputs=organize_clips(folder,job,rows,bool(cfg.get('silence',{}).get('enabled',True)))
-        progress('Готово',f'Найдено реакций: {len(rows)}; сохранено видео: {len(outputs)}')
+        progress('Готово',f'Найдено моментов: {len(rows)}; сохранено видео: {len(outputs)}')
         return {'folder':str(ready),'outputs':outputs,'reactions':len(rows)}
