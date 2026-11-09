@@ -12,6 +12,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
+import publication_guard
 
 _LOGIN = re.compile(r'^[a-z0-9_]{1,25}$')
 _CHANNEL = re.compile(r'^UC[A-Za-z0-9_-]{22}$')
@@ -62,6 +63,8 @@ class YouTubeQueue:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN submitted INTEGER NOT NULL DEFAULT 0")
             if 'tracking' not in columns:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN tracking INTEGER NOT NULL DEFAULT 1")
+            if 'source_reviewed' not in columns:
+                db.execute("ALTER TABLE youtube_uploads ADD COLUMN source_reviewed INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _connect(self):
@@ -200,6 +203,11 @@ class YouTubeQueue:
                            ('Файл отсутствует или изменился; загрузка не выполнена',now,row['id']))
                 db.commit()
                 return None
+            kind, warning = publication_guard.assess_file(p)
+            if kind == 'block' or (kind == 'review' and not row['source_reviewed']):
+                db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE id=?", (warning,now,row['id']))
+                db.commit()
+                return None
             # Conservative: even a crash before upload requires manual verification.
             db.execute("UPDATE youtube_uploads SET state='uploading',updated_at=? WHERE id=?", (now,row['id']))
             result = dict(db.execute('SELECT * FROM youtube_uploads WHERE id=?', (row['id'],)).fetchone())
@@ -293,9 +301,11 @@ class YouTubeQueue:
         now=time.time()
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row=db.execute("SELECT job_id,clip_index FROM youtube_uploads WHERE id=? AND state='needs_review'",(upload_id,)).fetchone()
+            row=db.execute("SELECT job_id,clip_index,detail FROM youtube_uploads WHERE id=? AND state='needs_review'",(upload_id,)).fetchone()
             if row is None:
                 db.rollback();raise ValueError('Запись не ожидает проверки')
+            if row['detail'].startswith((publication_guard.BLOCK,publication_guard.REVIEW)):
+                db.rollback();raise ValueError('Это отметка до загрузки, а не подтверждение видео в Studio')
             if db.execute("SELECT 1 FROM youtube_uploads WHERE state='confirmed' AND video_id=?",(video_id,)).fetchone():
                 db.rollback();raise ValueError('Это видео уже привязано к другой загрузке')
             db.execute("UPDATE youtube_uploads SET state='confirmed',video_id=?,detail=?,updated_at=? WHERE id=?",(video_id,'Подтверждено пользователем после проверки Studio',now,upload_id))
@@ -305,11 +315,17 @@ class YouTubeQueue:
             db.commit()
 
     def retry_reviewed(self, upload_id):
-        # Caller must explicitly confirm no upload/draft exists on YouTube.
+        # Caller explicitly confirms the corresponding manual review.
         with self._connect() as db:
-            cur = db.execute("UPDATE youtube_uploads SET state='queued',detail='',updated_at=? WHERE id=? AND state='needs_review'", (time.time(),upload_id))
-            if cur.rowcount != 1:
-                raise ValueError('Можно повторить только запись, требующую проверки')
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute("SELECT detail FROM youtube_uploads WHERE id=? AND state='needs_review'",(upload_id,)).fetchone()
+            if not row:
+                db.rollback();raise ValueError('Можно повторить только запись, требующую проверки')
+            if row['detail'].startswith(publication_guard.BLOCK):
+                db.rollback();raise ValueError('Эта передача отмечена «не публиковать»; повтор запрещён')
+            approved=int(row['detail'].startswith(publication_guard.REVIEW))
+            db.execute("UPDATE youtube_uploads SET state='queued',detail='',source_reviewed=CASE WHEN ? THEN 1 ELSE source_reviewed END,updated_at=? WHERE id=?",(approved,time.time(),upload_id))
+            db.commit()
 
     def waiting_reason(self, enabled=True):
         """A failed record never asks the user for a manual approval."""
