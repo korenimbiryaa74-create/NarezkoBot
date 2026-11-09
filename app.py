@@ -180,9 +180,6 @@ class App:
             self.youtube_rows.heading(key,text=label);self.youtube_rows.column(key,width=width,stretch=True)
         yuscroll=ttk.Scrollbar(yuploads,orient='vertical',command=self.youtube_rows.yview)
         self.youtube_rows.configure(yscrollcommand=yuscroll.set);self.youtube_rows.pack(side='left',fill='both',expand=True);yuscroll.pack(side='right',fill='y')
-        yr=ttk.Frame(youtube);yr.grid(row=11,column=0,columnspan=2,sticky='w',padx=8)
-        ttk.Button(yr,text='Повторить после проверки Studio',command=self.youtube_retry).pack(side='left')
-        ttk.Button(yr,text='Подтвердить уже загруженное видео',command=self.youtube_confirm_existing).pack(side='left',padx=5)
         ttk.Button(settings,text='Сохранить настройки',command=self.save).pack(anchor='w',pady=8)
         ttk.Label(settings,text='Настройки применяются к новым заданиям. Секреты хранятся локально в config.json.').pack(anchor='w')
     def _load_controls(self):
@@ -579,7 +576,7 @@ class App:
             self.refresh_youtube_profiles()
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
-            ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
+            ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Не подтверждено','cancelled':'Отменено'}
             # Keep cancelled rows in storage for deduplication, but hide them from the queue.
             all_uploads=[r for r in self.service.youtube_queue.list_uploads() if r['state']!='cancelled']
             # Unresolved records must remain visible even when older than 200 rows.
