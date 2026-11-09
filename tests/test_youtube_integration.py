@@ -54,7 +54,9 @@ class ServiceIntegrationTests(unittest.TestCase):
                 for i in range(3):
                     p=root/f'clip {i}.mp4';p.write_bytes(b'video'+bytes([i]));files.append(str(p))
                 return {'outputs':files,'folder':str(root)}
-        svc=self.service.Service(root,FakeSettings(),object(),pipeline_factory=Engine)
+        class Finder:
+            def youtube_titles(self,job,outcome,progress):return [f'Название {i}' for i in range(len(outcome['outputs']))]
+        svc=self.service.Service(root,FakeSettings(),Finder(),pipeline_factory=Engine)
         profile='__test__' if local else 'kussia88'
         svc.youtube_queue.bind(profile,CHANNEL,16,audience='not_kids')
         if local: svc.store.add_local('source.mp4',42,1)
@@ -67,6 +69,7 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(svc.store.list_jobs()[0]['state'],'done')
         uploads=svc.youtube_queue.list_uploads()
         self.assertEqual([u['profile'] for u in uploads],['kussia88']*3)
+        self.assertEqual([u['title'] for u in uploads],['Название 0','Название 1','Название 2'])
         calls=[]
         class Uploader:
             def upload(self,row):calls.append(row);return 'a'*11

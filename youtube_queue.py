@@ -98,7 +98,7 @@ class YouTubeQueue:
                 db.rollback()
                 raise ValueError('Этот канал уже привязан к другому профилю') from None
 
-    def enqueue(self, job_id, streamer, files, *, is_test=False, now=None):
+    def enqueue(self, job_id, streamer, files, *, is_test=False, now=None, titles=None):
         """Atomically plan one job; no files are uploaded or made public here.
 
         The first clip is immediate; following clips get 1h/16h increments.
@@ -111,15 +111,21 @@ class YouTubeQueue:
         now = time.time() if now is None else float(now)
         if not math.isfinite(now):
             raise ValueError('Некорректное время')
+        files=list(files)
+        if titles is not None and (not isinstance(titles,list) or len(titles)!=len(files)):
+            raise ValueError('Число названий не совпадает с числом файлов')
         prepared = []
-        for item in files:
+        for index,item in enumerate(files):
             p = Path(item).resolve(strict=True)
             if not p.is_file() or p.suffix.lower() != '.mp4':
                 raise ValueError('Для YouTube нужен готовый MP4-файл')
             stat = p.stat()
             if stat.st_size <= 0:
                 raise ValueError('Пустой MP4-файл')
-            title = p.stem.strip()[:100]
+            title = titles[index] if titles is not None else p.stem.strip()[:100]
+            if not isinstance(title,str) or not title.strip() or '<' in title or '>' in title or len(title.encode('utf-16-le'))//2>100:
+                raise ValueError('Некорректное название YouTube')
+            title=title.strip()
             if not title:
                 raise ValueError('Пустое название нарезки')
             prepared.append((str(p), stat.st_size, stat.st_mtime_ns, title))
