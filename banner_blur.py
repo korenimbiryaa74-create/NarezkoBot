@@ -582,7 +582,7 @@ def filter_for_chunk(regions, strength=20):
         # FFmpeg can shrink a crop at frame edges and chroma is often subsampled.
         radius=max(1,min(40,int(max(strength,min(w,h)//6))))
         parts.append(f'{prev}split=2[b{i}][s{i}]')
-        parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur=luma_radius='min({radius},min(w,h)/2)':luma_power=3:chroma_radius='min({max(1,radius//2)},min(cw,ch)/2)':chroma_power=3[r{i}]")
+        parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur=luma_radius='min({radius},floor((min(w,h)-1)/2))':luma_power=3:chroma_radius='min({max(1,radius//2)},floor((min(cw,ch)-1)/2))':chroma_power=3[r{i}]")
         enabled = '+'.join(f'between(t,{a:.3f},{b:.3f})' for a, b in times)
         out = f'[o{i}]' if i < len(regions) - 1 else '[bout]'
         parts.append(f"[b{i}][r{i}]overlay={x}:{y}:enable='{enabled}'{out}")

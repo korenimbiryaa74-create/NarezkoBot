@@ -229,6 +229,58 @@ def set_schedule(tab, timestamp):
     return when
 
 
+# Recognise only the specific "checks still running" prompt the user approved.
+# Never approve copyright claims, strikes, age restrictions, or other warnings.
+_RECEIPT_STATE = r"""(()=>{
+  const share=document.querySelector('ytcp-video-share-dialog');
+  if(share&&share.getClientRects().length)
+    return {links:[...share.querySelectorAll('a[href]')].map(a=>a.href),warning:false};
+  const visible=e=>!!e.getClientRects().length;
+  const dialogs=[...document.querySelectorAll('ytcp-dialog,ytcp-confirm-dialog,tp-yt-paper-dialog,[role="dialog"]')];
+  const warning=dialogs.some(e=>visible(e)&&!e.matches('ytcp-uploads-dialog')&&
+    /(?:проверка видео ещ[её] продолжается|проверки видео ещ[её] продолжаются|your video is still being checked|video.{0,30}still.{0,20}(?:being checked|checking)|checks?.{0,25}still.{0,20}(?:running|in progress))/i.test(e.innerText||''));
+  return {links:null,warning};
+})()"""
+
+_CONFIRM_CHECKS_WARNING = r"""(()=>{
+  const visible=e=>!!e.getClientRects().length;
+  const pattern=/(?:проверка видео ещ[её] продолжается|проверки видео ещ[её] продолжаются|your video is still being checked|video.{0,30}still.{0,20}(?:being checked|checking)|checks?.{0,25}still.{0,20}(?:running|in progress))/i;
+  const dialogs=[...document.querySelectorAll('ytcp-dialog,ytcp-confirm-dialog,tp-yt-paper-dialog,[role="dialog"]')].filter(e=>visible(e)&&!e.matches('ytcp-uploads-dialog')&&pattern.test(e.innerText||''));
+  if(!dialogs.length)return 'none';
+  const candidates=[...new Set(dialogs.flatMap(d=>[...d.querySelectorAll('button,ytcp-button,tp-yt-paper-button,[role="button"]')]))]
+    .filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&/^(?:publish|опубликовать)$/i.test((e.innerText||'').trim()));
+  // Prefer the actual innermost clickable element; never click if ambiguous.
+  const leaves=candidates.filter(e=>!candidates.some(other=>other!==e&&e.contains(other)));
+  if(leaves.length!==1)return 'ambiguous';
+  leaves[0].click();return 'clicked';
+})()"""
+
+
+def wait_for_receipt(tab, progress=None, timeout=1800):
+    """Wait for the unique video receipt, confirming only the approved modal once."""
+    deadline=time.monotonic()+timeout
+    attempted=False
+    next_report=time.monotonic()+60
+    while time.monotonic()<deadline:
+        state=tab.js(_RECEIPT_STATE) or {}
+        if state.get('links') is not None:
+            ids={video_from_url(x) for x in state['links']};ids.discard(None)
+            if len(ids)!=1:raise StudioError('Не удалось проверить идентификатор видео; проверьте Studio')
+            return ids.pop()
+        if state.get('warning') and not attempted:
+            # Set before dispatch: do not replay a possibly delivered browser action.
+            attempted=True
+            result=tab.js(_CONFIRM_CHECKS_WARNING)
+            if result=='ambiguous':raise StudioError('Не удалось однозначно подтвердить предупреждение о проверке; проверьте Studio')
+            if result not in ('clicked','none'):raise StudioError('Не удалось подтвердить публикацию; проверьте Studio')
+            if result=='clicked' and progress:progress('Подтверждена публикация до завершения проверки; ожидаю ответ Studio')
+        if progress and time.monotonic()>=next_report:
+            progress('Ожидаю подтверждение Studio; если появилось другое окно, проверьте его вручную')
+            next_report=time.monotonic()+60
+        time.sleep(1)
+    raise StudioError('YouTube не подтвердил публикацию; проверьте видео или черновик в Studio перед повтором')
+
+
 class YouTubeStudio:
     def __init__(self,root): self.root=Path(root)
     def connect(self,profile,ready_event,opened_event=None,timeout=600):
@@ -238,7 +290,7 @@ class YouTubeStudio:
                 if not ready_event.wait(timeout):
                     raise StudioError('Время входа истекло; повторите подключение')
                 return channel_ready(tab,timeout=30)
-    def upload(self,row):
+    def upload(self,row,progress=None):
         with _LOCK:
             with Browser(self.root,row['profile']) as tab:
                 expected=row['channel_id']; channel_ready(tab,expected)
@@ -248,6 +300,7 @@ class YouTubeStudio:
                 channel_ready(tab,expected,timeout=5)
                 # Selecting the file creates a draft; queue must already say uploading.
                 attach_file(tab,row['file_path'])
+                if progress:progress('Файл передан; ожидаю загрузку и настройки')
                 wait(tab,"!!document.querySelector('ytcp-uploads-dialog #title-textarea #textbox')",90,'Не найдено название видео')
                 tab.fill('ytcp-uploads-dialog #title-textarea #textbox',row['title'])
                 audience={'kids':'VIDEO_MADE_FOR_KIDS_MFK','not_kids':'VIDEO_MADE_FOR_KIDS_NOT_MFK'}.get(row['audience'])
@@ -266,9 +319,7 @@ class YouTubeStudio:
                 else:
                     set_schedule(tab,row['publish_at'])
                 channel_ready(tab,expected,timeout=5)
-                # Require the button to be enabled; wait for upload/checks.
+                # The enabled button can precede upload/check completion.
                 click(tab,'ytcp-uploads-dialog #done-button button',timeout=1800)
-                result=wait(tab,'''(()=>{const d=document.querySelector('ytcp-video-share-dialog');if(!d||!d.getClientRects().length)return null;return [...d.querySelectorAll('a[href]')].map(a=>a.href)})()''',600,'Подтверждение YouTube не получено; проверьте Studio перед повтором')
-                ids={video_from_url(x) for x in result};ids.discard(None)
-                if len(ids)!=1:raise StudioError('Не удалось проверить идентификатор видео; проверьте Studio')
-                return ids.pop()
+                if progress:progress('Запрос публикации отправлен; ожидаю подтверждение Studio')
+                return wait_for_receipt(tab,progress=progress)
