@@ -92,6 +92,16 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertFalse(svc.youtube_once())
         self.assertEqual([r['state'] for r in svc.youtube_queue.list_uploads()],['needs_review','queued','queued'])
 
+    def test_blocked_queue_explains_why_once(self):
+        svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
+        row=svc.youtube_queue.claim(finished_only=True)
+        svc.youtube_queue.mark_uncertain(row['id'],'interrupted')
+        self.assertFalse(svc.youtube_once());self.assertFalse(svc.youtube_once())
+        messages=[msg for _,msg in svc.logs() if 'ожидает проверки загрузки' in msg]
+        self.assertEqual(len(messages),1);self.assertIn('№'+str(row['id']),messages[0])
+        svc.youtube_queue.cancel_reviewed_or_queued(row['id'])
+        self.assertEqual(svc.youtube_queue.waiting_reason(),'')
+
     def test_failed_job_is_never_uploaded(self):
         svc=self.make_service()
         job=svc.store.claim()

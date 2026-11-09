@@ -82,6 +82,19 @@ class YouTubeQueueTests(unittest.TestCase):
         self.queue.confirm_reviewed(first['id'],'a'*11)
         self.assertEqual(self.queue.claim()['job_id'],2)
 
+    def test_wait_reason_and_explicit_cancel(self):
+        self.queue.bind('a',CHANNEL_A,audience='not_kids')
+        self.queue.enqueue(1,'a',self.files[:2])
+        self.assertIn('отключена',self.queue.waiting_reason(False))
+        first=self.queue.claim(); self.queue.mark_uncertain(first['id'],'interrupted')
+        self.assertIn('№'+str(first['id']),self.queue.waiting_reason())
+        self.queue.cancel_reviewed_or_queued(first['id'])
+        self.assertEqual(self.queue.waiting_reason(),'')
+        second=self.queue.claim()
+        with self.assertRaises(ValueError):self.queue.cancel_reviewed_or_queued(second['id'])
+        self.queue.confirm(second['id'],CHANNEL_A,'a'*11)
+        with self.assertRaises(ValueError):self.queue.cancel_reviewed_or_queued(second['id'])
+
     def test_verified_receipt_and_channel_protection(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')
         with self.assertRaises(ValueError): self.queue.bind('b', CHANNEL_A)

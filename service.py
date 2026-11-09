@@ -24,7 +24,7 @@ class Service:
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
         self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
-        self._watch_state={}; self._watch_generation=0
+        self._watch_state={}; self._watch_generation=0; self._youtube_wait_message=''
 
     def log(self,text):
         with self._lock: self._logs.append((time.time(),str(text)))
@@ -44,7 +44,7 @@ class Service:
     def start(self):
         if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
         self.recover_interrupted()
-        self.stop_event.clear()
+        self.stop_event.clear(); self._youtube_wait_message=''
         with self._lock:
             self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
@@ -273,10 +273,14 @@ class Service:
             self.stop_event.wait(5)
 
     def youtube_once(self):
-        if not self.settings.load().get('youtube',{}).get('enabled'):
+        enabled=self.settings.load().get('youtube',{}).get('enabled')
+        row=self.youtube_queue.claim(finished_only=True) if enabled else None
+        if not row:
+            message=self.youtube_queue.waiting_reason(enabled=bool(enabled))
+            if message and message!=self._youtube_wait_message:self.log(message)
+            self._youtube_wait_message=message
             return False
-        row=self.youtube_queue.claim(finished_only=True)
-        if not row: return False
+        self._youtube_wait_message=''
         try:
             self.log(f"YouTube №{row['id']}: загрузка на канал {row['channel_id']}")
             video_id=self.youtube_studio.upload(row,progress=lambda message:self.log(f"YouTube №{row['id']}: {message}"))

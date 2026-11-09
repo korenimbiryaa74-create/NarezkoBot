@@ -266,6 +266,28 @@ class YouTubeQueue:
             if cur.rowcount != 1:
                 raise ValueError('Можно повторить только запись, требующую проверки')
 
+    def waiting_reason(self, enabled=True):
+        """Describe a concrete reason queued uploads cannot use a profile."""
+        with self._connect() as db:
+            queued=db.execute("SELECT 1 FROM youtube_uploads WHERE state='queued' LIMIT 1").fetchone()
+            if not queued:return ''
+            if not enabled:return 'YouTube: загрузка отключена в настройках; задания остаются в очереди'
+            blocked=db.execute("""SELECT b.id,b.profile FROM youtube_uploads b
+                WHERE b.state='needs_review' AND EXISTS
+                (SELECT 1 FROM youtube_uploads q WHERE q.profile=b.profile AND q.state='queued')
+                ORDER BY b.id LIMIT 1""").fetchone()
+            if blocked:
+                return (f"YouTube: профиль {blocked['profile']} ожидает проверки загрузки №{blocked['id']}; "
+                    'откройте Настройки → YouTube → очередь загрузок')
+            return ''
+
+    def cancel_reviewed_or_queued(self, upload_id):
+        # User explicitly verified uncertain transfers; never cancel active/confirmed uploads.
+        with self._connect() as db:
+            cur=db.execute("UPDATE youtube_uploads SET state='cancelled',detail=?,updated_at=? WHERE id=? AND state IN ('queued','needs_review')",
+                ('Отменено пользователем после проверки Studio',time.time(),upload_id))
+            if cur.rowcount != 1:raise ValueError('Можно отменить только ожидающую или требующую проверки запись')
+
     def list_uploads(self):
         with self._connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM youtube_uploads ORDER BY id')]
