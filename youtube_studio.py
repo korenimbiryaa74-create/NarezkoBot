@@ -582,7 +582,7 @@ class YouTubeStudio:
             # Already submitted videos must never be interrupted by an error.
             browser.keep_open=bool(queue.submitted_uploads(profile))
             with browser as tab:
-                current=first;used=False;monitor=None;last_report=0;last_refresh=time.monotonic()+30;monitor_errors=0;failure=None;failure_may_upload=False
+                current=first;used=False;monitor=None;last_report=0;last_refresh=time.monotonic()+30;monitor_errors=0;failure=None;failure_may_upload=False;attempts={};consecutive_failures=0;failure_reported=False
                 while not stop_event.is_set():
                     if current is not None:
                         progress(current['id'],'загрузка на канал '+channel_id)
@@ -594,23 +594,39 @@ class YouTubeStudio:
                             queue.mark_submitted(current['id'],channel_id,video_id)
                         except Exception as exc:
                             detail=str(exc)[:400] if isinstance(exc,StudioError) else 'Ошибка связи с браузером'
-                            queue.mark_uncertain(current['id'],type(exc).__name__+': '+detail)
                             failure=type(exc).__name__+': '+detail
-                            failure_may_upload=browser.attempt_may_upload
-                            progress(current['id'],'ошибка: '+failure+'; ранее отправленные ролики продолжают загружаться')
+                            # Only failures known to precede file selection can be retried.
+                            attempts[current['id']]=attempts.get(current['id'],0)+1
+                            if not browser.attempt_may_upload and attempts[current['id']]<2:
+                                progress(current['id'],'ошибка до выбора файла; повторяю автоматически один раз')
+                                stop_event.wait(2)
+                                continue
+                            queue.mark_uncertain(current['id'],failure)
+                            failure_may_upload=failure_may_upload or browser.attempt_may_upload
+                            consecutive_failures+=1
+                            progress(current['id'],'не подтверждено: '+failure+'; повтор этой нарезки не выполняется во избежание дубля')
                         else:
+                            consecutive_failures=0
                             progress(current['id'],'отправлено в Studio; обработка продолжится параллельно')
                         current=None
-                    # A failed row blocks this profile; keep this same browser alive
-                    # to monitor earlier transfers instead of launching more Chromes.
-                    current=queue.claim(finished_only=True,profile=profile) if failure is None else None
+                    # A single uncertain clip does not prevent later clips from starting.
+                    # Multiple consecutive errors indicate the browser is unusable.
+                    current=queue.claim(finished_only=True,profile=profile) if consecutive_failures<2 else None
                     if current is not None:continue
                     pending=queue.submitted_uploads(profile)
                     if not pending:
-                        if failure is not None:
-                            # The failed attempt may have created an unrecorded draft.
+                        if consecutive_failures>=2:
                             browser.keep_open=failure_may_upload
-                            raise StudioError(failure)
+                            raise StudioError('Несколько ошибок подряд; загрузчик остановлен: '+failure)
+                        if failure_may_upload:
+                            # Unknown transfer must not be aborted or re-submitted.
+                            # Keep the session available for any later clips.
+                            if not failure_reported:
+                                progress(0,'Статус одной загрузки неизвестен; Chrome остаётся открыт, новые нарезки продолжат загружаться')
+                                failure_reported=True
+                            browser.keep_open=True
+                            stop_event.wait(5)
+                            continue
                         browser.keep_open=False
                         return
                     if monitor is None:
