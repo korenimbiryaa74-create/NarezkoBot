@@ -359,8 +359,6 @@ def local_schedule_timestamp(timestamp, tz_text, now=None):
 
 
 _RU_MONTHS = ('янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек')
-_RU_MONTH_INPUT = ('янв.','февр.','мар.','апр.','мая','июн.','июл.','авг.','сент.','окт.','нояб.','дек.')
-_RU_MONTH_FULL = ('января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря')
 
 
 def parse_date(value):
@@ -377,15 +375,6 @@ def parse_date(value):
         try:return datetime.strptime(text,fmt).date()
         except ValueError:pass
     return None
-
-
-def date_inputs(when):
-    # Formats are tried only in the picker, never submitted to YouTube without
-    # re-reading the resulting selected date and checking validation state.
-    d,m,y=when.day,when.month,when.year
-    return (f'{d} {_RU_MONTH_INPUT[m-1]} {y} г.',f'{d} {_RU_MONTH_FULL[m-1]} {y} г.',
-            f'{d:02d}.{m:02d}.{y}',when.strftime('%b %d, %Y'),
-            f'{m:02d}/{d:02d}/{y}',f'{y:04d}-{m:02d}-{d:02d}')
 
 
 def parse_time(value):
@@ -428,7 +417,7 @@ def open_schedule(tab):
 _DATE_STATE = r"""(()=>{
   const visible=e=>!!e.getClientRects().length;
   const triggers=[...document.querySelectorAll('ytcp-uploads-dialog #datepicker-trigger')].filter(visible);
-  const pickers=[...document.querySelectorAll('ytcp-date-picker')].filter(visible);
+  const pickers=[...document.querySelectorAll('ytcp-date-picker')].filter(p=>visible(p)||[...p.querySelectorAll('input')].some(visible));
   if(triggers.length!==1||pickers.length>1)return {ambiguous:true};
   const label=triggers[0].querySelector('.dropdown-trigger-text');
   const picker=pickers[0];
@@ -441,24 +430,88 @@ _DATE_STATE = r"""(()=>{
 })()"""
 
 
+
+def parse_calendar_month(value):
+    text=re.sub(r'\s+',' ',str(value).lower()).strip()
+    year=re.search(r'\b(\d{4})\b',text)
+    words=re.findall(r'[a-zа-яё]+',text)
+    if not year:return None
+    en=('jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec')
+    for word in words:
+        prefix=word[:3]
+        if prefix=='май':prefix='мая'
+        if prefix in _RU_MONTHS:return int(year.group(1)),_RU_MONTHS.index(prefix)+1
+        if prefix in en:return int(year.group(1)),en.index(prefix)+1
+    return None
+
+
+_CALENDAR_MONTHS = r"""(()=>{
+ const visible=e=>!!e.getClientRects().length;
+ const labels=[...document.querySelectorAll('ytcp-date-picker .calendar-month-label')].filter(visible);
+ return labels.map(e=>e.innerText.trim());
+})()"""
+# The label's month container must contain one unique enabled day. Do not guess
+# by number alone: the calendar can contain several months at once.
+def calendar_day_click_script(label, day):
+    return r"""(()=>{
+      const visible=e=>!!e.getClientRects().length;
+      const label=__LABEL__,day=__DAY__;
+      const labels=[...document.querySelectorAll('ytcp-date-picker .calendar-month-label')]
+        .filter(e=>visible(e)&&e.innerText.trim()===label);
+      if(labels.length!==1)return 'ambiguous-month';
+      let block=labels[0].closest('.calendar-month')||labels[0].parentElement;
+      // Some builds wrap the month heading in an additional div.
+      for(let i=0;i<3&&block&&!block.querySelector('.calendar-day');i++)block=block.parentElement;
+      if(!block||block.querySelectorAll('.calendar-month-label').length!==1)return 'ambiguous-month';
+      const days=[...block.querySelectorAll('.calendar-day')].filter(e=>
+        visible(e)&&(e.innerText||e.textContent||'').trim()===String(day)&&
+        !e.disabled&&!e.hasAttribute('disabled')&&e.getAttribute('aria-disabled')!=='true'&&
+        !e.classList.contains('disabled')&&!e.classList.contains('invisible')&&
+        !e.closest('[disabled],[aria-disabled="true"],.disabled,.invisible'));
+      if(days.length!==1)return days.length?'ambiguous-day':'missing-day';
+      days[0].scrollIntoView({block:'center'});days[0].click();return 'clicked';
+    })()""".replace('__LABEL__',json.dumps(label,ensure_ascii=False)).replace('__DAY__',str(day))
+
+
+_CALENDAR_SCROLL = r"""(()=>{
+  const all=[...document.querySelectorAll('ytcp-date-picker #calendar-main')].filter(e=>e.getClientRects().length);
+  if(all.length!==1)return false;
+  all[0].scrollBy(0,__DELTA__);return true;
+})()"""
+
+
 def set_schedule_date(tab, when):
     state=tab.js(_DATE_STATE) or {}
     if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
-    if parse_date(state.get('date'))==when.date() and not state.get('invalid'):
-        return
-    for candidate in date_inputs(when):
-        state=tab.js(_DATE_STATE) or {}
-        if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
-        if not state.get('open'):
-            click(tab,'#datepicker-trigger',message='Не удалось открыть выбор даты публикации')
-            wait(tab,"!!document.querySelector('ytcp-date-picker input')",15,'Не найден выбор даты')
-        tab.fill('ytcp-date-picker input',candidate)
-        tab.key('Enter','Enter');time.sleep(1)
-        state=tab.js(_DATE_STATE) or {}
-        if state.get('ambiguous'):raise StudioError('Неоднозначный выбор даты в YouTube Studio')
-        if parse_date(state.get('date'))==when.date() and not state.get('invalid'):
-            return
-    raise StudioError('YouTube не принял дату публикации; отправьте скриншот открытого календаря и лог')
+    if parse_date(state.get('date'))==when.date() and not state.get('invalid'):return
+    if not state.get('open'):
+        click(tab,'#datepicker-trigger',message='Не удалось открыть календарь публикации')
+        wait(tab,"[...document.querySelectorAll('ytcp-date-picker .calendar-month-label')].some(e=>e.getClientRects().length)",15,'Не открылся календарь публикации')
+    target=(when.year,when.month)
+    for _ in range(80):
+        labels=tab.js(_CALENDAR_MONTHS) or []
+        matched=[label for label in labels if parse_calendar_month(label)==target]
+        if len(matched)>1:raise StudioError('Найдено несколько одинаковых месяцев в календаре')
+        if matched:
+            result=tab.js(calendar_day_click_script(matched[0],when.day))
+            if result!='clicked':raise StudioError('Не удалось однозначно выбрать день в календаре ('+str(result)+')')
+            time.sleep(1)
+            state=tab.js(_DATE_STATE) or {}
+            # If the picker remains open, close it after choosing a day; then
+            # require Studio to show the committed date on the scheduler.
+            if state.get('open'):
+                tab.key('Escape','Escape');time.sleep(.5)
+                state=tab.js(_DATE_STATE) or {}
+            if not state.get('ambiguous') and not state.get('invalid') and parse_date(state.get('date'))==when.date():return
+            raise StudioError('YouTube не подтвердил дату после выбора дня в календаре')
+        months=[x for x in (parse_calendar_month(label) for label in labels) if x]
+        if not months:raise StudioError('Не удалось прочитать месяц в календаре YouTube')
+        if min(months)<=target<=max(months):raise StudioError('Нужный месяц не найден в календаре')
+        direction=-350 if target<min(months) else 350
+        if not tab.js(_CALENDAR_SCROLL.replace('__DELTA__',str(direction))):
+            raise StudioError('Не удалось прокрутить календарь YouTube')
+        time.sleep(.25)
+    raise StudioError('Нужный месяц не найден в календаре YouTube')
 
 
 def set_schedule(tab, timestamp):
