@@ -308,7 +308,7 @@ class App:
         row=next((r for r in self.service.youtube_queue.list_uploads() if str(r['id'])==selected[0]),None)
         if not row or row['state']!='needs_review':messagebox.showerror('YouTube','Эта загрузка не ожидает проверки.');return
         text=('В YouTube Studio проверьте именно канал '+row['channel_id']+', видео «'+row['title']+'», '
-              'публичный доступ или точную отложенную дату и время. Вы подтверждаете, что это видео действительно сохранено и настройки верны?')
+              'завершение загрузки и обработки SD, публичный доступ или точную отложенную дату и время. Вы подтверждаете, что видео сохранено и настройки верны?')
         if not messagebox.askyesno('YouTube: подтверждение',text):return
         value=simpledialog.askstring('YouTube','Вставьте полную ссылку на подтверждённое видео:',parent=self.window)
         if value is None:return
@@ -546,7 +546,7 @@ class App:
             self.refresh_youtube_profiles()
             ytselected=self.youtube_rows.selection()
             self.youtube_rows.delete(*self.youtube_rows.get_children())
-            ytlabels={'queued':'В очереди','uploading':'Загрузка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
+            ytlabels={'queued':'В очереди','uploading':'Загрузка / обработка','confirmed':'Подтверждено','needs_review':'Проверить','cancelled':'Отменено'}
             for r in self.service.youtube_queue.list_uploads()[-200:]:
                 when=__import__('datetime').datetime.fromtimestamp(r['publish_at']).strftime('%d.%m.%Y %H:%M') if r['publish_at'] else 'Сразу'
                 detail=('https://youtu.be/'+r['video_id']) if r['video_id'] else r['detail']
