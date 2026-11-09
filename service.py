@@ -285,7 +285,7 @@ class Service:
             # Even selecting a file can create a draft. Never retry blindly.
             detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
             self.youtube_queue.mark_uncertain(row['id'],detail)
-            self.store.notify(f"YouTube №{row['id']}: требуется проверка YouTube Studio перед повтором.")
+            self.store.notify(f"YouTube №{row['id']}: требуется проверка YouTube Studio перед повтором. Если браузер остался открыт, дождитесь завершения загрузки.")
             self.log(f"YouTube №{row['id']}: остановлено — {detail}")
             return True
         # A notification failure must not undo or misclassify a confirmed upload.
