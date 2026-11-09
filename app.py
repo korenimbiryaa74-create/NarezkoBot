@@ -566,29 +566,18 @@ class App:
         except Exception as exc:messagebox.showerror('Уведомления','Не удалось очистить уведомления: '+type(exc).__name__)
 
     def test_preview(self):
-        from tkinter import simpledialog
-        import preview_local
+        import reaction_previews
         if self._preview_running:
             messagebox.showinfo('Тест превью','Генерация уже идёт. Дождитесь её завершения.');return
-        try:
-            preview_local.check_install(ROOT)
-            import PIL
-        except Exception as exc:
-            messagebox.showerror('Тест превью',str(exc)+'\nУстановите генератор через INSTALL.bat.');return
-        path=filedialog.askopenfilename(title='Выберите готовую нарезку',filetypes=[('Видео','*.mp4 *.mkv *.mov *.webm *.avi'),('Все файлы','*.*')])
+        path=filedialog.askopenfilename(title='Выберите готовую нарезку бота',filetypes=[('Нарезка MP4','*.mp4')])
         if not path:return
-        style=messagebox.askyesnocancel('Стиль превью','Выберите стиль: Да — Каша, Нет — Никс.\nОтмена — не запускать.')
-        if style is None:return
-        title=simpledialog.askstring('Надпись на превью','Короткая надпись (до 90 символов):',initialvalue=Path(path).stem[:90],parent=self.window)
-        if title is None:return
-        try:title=preview_local.safe_label(title)
-        except Exception as exc:messagebox.showerror('Тест превью',str(exc));return
+        login=self.variables['preview_test_streamer'].get().strip().lower()
         self._preview_running=True;self._preview_cancel=threading.Event();self._preview_close_requested=False
         self.preview_status.set('Превью: подготовка…')
         def work():
             try:
-                result=preview_local.generate_test(ROOT,path,title,'Каша' if style else 'Никс',lambda msg:self._preview_events.put(('status',msg)),cancel=self._preview_cancel)
-                self._preview_events.put(('done',str(result)))
+                result=reaction_previews.generate_saved_clip(ROOT,path,login,cancel=self._preview_cancel,status=lambda msg:self._preview_events.put(('status',msg)))
+                self._preview_events.put(('done',result))
             except Exception as exc:self._preview_events.put(('error',str(exc)))
         threading.Thread(target=work,daemon=True).start()
         self.window.after(500,self._poll_preview)
@@ -601,8 +590,12 @@ class App:
             except queue.Empty:break
             if kind=='status':self.preview_status.set('Превью: '+value)
             elif kind=='done':
-                self._preview_running=False;self.preview_status.set('Превью готово: '+value)
-                if messagebox.askyesno('Тест превью','Превью сохранено:\n'+value+'\n\nОткрыть папку?') and hasattr(os,'startfile'):os.startfile(str(Path(value).parent))
+                self._preview_running=False;self.preview_status.set('Превью готово: '+value['path'])
+                description=('Найдено готовое превью' if value.get('existing') else 'Превью сохранено')+':\n'+value['path']
+                description+='\n\nТекст на превью: '+(value.get('preview_text') or 'неизвестен, проверьте изображение')
+                description+='\nИсточник видео требует проверки.'
+                if value.get('warnings'):description+='\n'+('\n'.join(value['warnings']))
+                if messagebox.askyesno('Тест превью',description+'\n\nОткрыть превью?') and hasattr(os,'startfile'):os.startfile(value['path'])
             elif kind=='error':
                 self._preview_running=False;self.preview_status.set('Ошибка генерации превью')
                 if not self._preview_close_requested:messagebox.showerror('Тест превью',value)
