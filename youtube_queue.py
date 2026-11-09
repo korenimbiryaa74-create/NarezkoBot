@@ -106,7 +106,7 @@ class YouTubeQueue:
         """Atomically plan one job; no files are uploaded or made public here.
 
         The first clip is immediate; following clips get 1h/16h increments.
-        For local tests every clip is immediate on the dedicated test channel.
+        Local tests use the dedicated test channel with the same schedule rules.
         Replaying exactly the same batch is idempotent; a mismatch is rejected.
         """
         if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
@@ -159,7 +159,7 @@ class YouTubeQueue:
                 db.commit()
                 return 0
             for index, (path, size, mtime, title) in enumerate(prepared, 1):
-                publish_at = None if is_test or index == 1 else now + (index - 1) * binding['interval_hours'] * 3600
+                publish_at = None if index == 1 else now + (index - 1) * binding['interval_hours'] * 3600
                 db.execute('''INSERT INTO youtube_uploads
                     (job_id,clip_index,profile,channel_id,file_path,file_size,file_mtime_ns,title,publish_at,created_at,updated_at,audience)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',

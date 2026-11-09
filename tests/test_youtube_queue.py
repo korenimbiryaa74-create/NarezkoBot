@@ -28,7 +28,21 @@ class YouTubeQueueTests(unittest.TestCase):
         self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[5:]], [None, 4600, 8200])
         self.queue.bind('__test__', 'UC'+'c'*22, 16, audience='not_kids')
         self.queue.enqueue(3, 'ignored', self.files[:3], is_test=True, now=1000)
-        self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[8:]], [None, None, None])
+        self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[8:]], [None, 58600, 116200])
+        self.queue.bind('__test__', 'UC'+'c'*22, 1, audience='not_kids')
+        self.queue.enqueue(4, 'ignored', self.files[:3], is_test=True, now=1000)
+        self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()[11:]], [None, 4600, 8200])
+
+    def test_test_schedule_anchored_to_first_submission(self):
+        channel='UC'+'c'*22
+        self.queue.bind('__test__',channel,1,audience='not_kids')
+        self.queue.enqueue(1,'ignored',self.files[:3],is_test=True,now=1000)
+        first=self.queue.claim(profile='__test__')
+        self.queue.mark_submitted(first['id'],channel,'a'*11,now=10037)
+        rows=self.queue.list_uploads()
+        self.assertEqual([r['publish_at'] for r in rows],[None,13637,17237])
+        self.queue.confirm(first['id'],channel,'a'*11,now=10500)
+        self.assertEqual([r['publish_at'] for r in self.queue.list_uploads()],[None,13637,17237])
 
     def test_idempotency_and_changed_file(self):
         self.queue.bind('a', CHANNEL_A, audience='not_kids')

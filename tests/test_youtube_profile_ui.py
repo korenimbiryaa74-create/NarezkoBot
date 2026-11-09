@@ -57,7 +57,7 @@ class YouTubeProfileUITests(unittest.TestCase):
         self.app.refresh_youtube_profiles()
         tree=self.app.youtube_profiles
         self.assertEqual(tree.order,['__test__','test'])
-        self.assertEqual(tree.rows['__test__'],('__test__ (тестовый)','UC'+'b'*22,'Все сразу','Не специально для детей'))
+        self.assertEqual(tree.rows['__test__'],('__test__ (тестовый)','UC'+'b'*22,'16 часов','Не специально для детей'))
         self.assertEqual(tree.rows['test'][2:],('1 час','Для детей'))
         tree.selected=['test'];self.app.youtube_profile_selected()
         self.assertEqual(self.app.variables['youtube_profile'].get(),'test')

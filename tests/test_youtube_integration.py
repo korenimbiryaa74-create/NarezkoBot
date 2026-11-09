@@ -83,7 +83,10 @@ class ServiceIntegrationTests(unittest.TestCase):
 
     def test_uncertain_old_upload_does_not_require_manual_check(self):
         svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
-        self.assertEqual([r['publish_at'] for r in svc.youtube_queue.list_uploads()],[None]*3)
+        rows=svc.youtube_queue.list_uploads()
+        self.assertIsNone(rows[0]['publish_at'])
+        self.assertAlmostEqual(rows[1]['publish_at']-rows[0]['created_at'],16*3600)
+        self.assertAlmostEqual(rows[2]['publish_at']-rows[0]['created_at'],32*3600)
         first=svc.youtube_queue.claim(finished_only=True)
         svc.youtube_queue.mark_uncertain(first['id'],'interrupted')
         class Uploader:
@@ -165,6 +168,13 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertEqual(str(studio.parse_time('1:15 PM')),'13:15:00')
         with self.assertRaises(studio.StudioError):studio.local_schedule_timestamp(9999999999,'no timezone',now=1)
         with self.assertRaises(studio.StudioError):studio.local_schedule_timestamp(100,'UTC+00:00',now=99)
+        timestamp=1800000037
+        offset=studio.datetime.fromtimestamp(timestamp).astimezone().utcoffset()
+        minutes=int(offset.total_seconds()//60)
+        tz='UTC{}{:02d}:{:02d}'.format('+' if minutes>=0 else '-',abs(minutes)//60,abs(minutes)%60)
+        result=studio.local_schedule_timestamp(timestamp,tz,now=timestamp-3600)
+        self.assertEqual(result.second,0)
+        self.assertEqual(result.timestamp(),timestamp-timestamp%60)
 
     def test_check_prompt_is_confirmed_only_once_then_receipt(self):
         messages=[]
