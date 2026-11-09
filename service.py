@@ -5,6 +5,8 @@ import threading
 import time
 from collections import deque
 from job_store import JobStore
+from youtube_queue import YouTubeQueue
+from youtube_studio import YouTubeStudio
 from monitor import Monitor,TwitchClient
 from pipeline import Pipeline, atomic_json, manual_answer_path, manual_donation_path, job_identity, organize_completed
 import reactions
@@ -17,6 +19,8 @@ class Service:
         self.root=root; self.settings=settings; self.finder=finder
         self.api_factory=api_factory; self.pipeline_factory=pipeline_factory
         self.store=JobStore(root/'state'/'jobs.sqlite3')
+        self.youtube_queue=YouTubeQueue(root/'state'/'jobs.sqlite3')
+        self.youtube_studio=YouTubeStudio(root)
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
         self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
@@ -29,6 +33,10 @@ class Service:
     def recover_interrupted(self):
         if any(t.is_alive() for t in self._threads): return 0
         interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов','Готово'))
+        youtube_interrupted=self.youtube_queue.recover_interrupted()
+        if youtube_interrupted:
+            self.log(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором')
+            self.store.notify(f'YouTube: прерванных загрузок {youtube_interrupted}; проверьте Studio перед повтором.')
         if interrupted:
             self.log(f'Восстановлено прерванных заданий: {interrupted}; проверьте ошибки в очереди.')
             self.store.notify(f'После перезапуска восстановлено заданий: {interrupted}. Проверьте очередь: некоторые запросы могут требовать ручного повтора.')
@@ -40,7 +48,8 @@ class Service:
         with self._lock:
             self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
-                       threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True)]
+                       threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True),
+                       threading.Thread(target=self._youtube_loop,name='youtube-worker',daemon=True)]
         for t in self._threads:t.start()
         self.log('Служба запущена')
         return True
@@ -222,6 +231,10 @@ class Service:
                 if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             count=len(outcome['outputs'])
+            if cfg.get('youtube',{}).get('enabled') and count:
+                progress('Очередь YouTube','Добавление готовых видео в очередь YouTube')
+                added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')))
+                self.log(f"VOD {job['vod_id']}: в очередь YouTube добавлено {added}")
             name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
             notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих моментов не найдено.'
             self.store.finish(job['id'],'done',f"Видео: {count}; {outcome['folder']}",notification=notice)
@@ -251,4 +264,36 @@ class Service:
             try:
                 if self.worker_once(): continue
             except Exception as exc:self.log(f'Ошибка очереди ({type(exc).__name__})')
+            self.stop_event.wait(5)
+
+    def youtube_once(self):
+        if not self.settings.load().get('youtube',{}).get('enabled'):
+            return False
+        row=self.youtube_queue.claim(finished_only=True)
+        if not row: return False
+        try:
+            self.log(f"YouTube №{row['id']}: загрузка на канал {row['channel_id']}")
+            video_id=self.youtube_studio.upload(row)
+            self.youtube_queue.confirm(row['id'],row['channel_id'],video_id)
+        except Exception as exc:
+            # Even selecting a file can create a draft. Never retry blindly.
+            detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
+            self.youtube_queue.mark_uncertain(row['id'],detail)
+            self.store.notify(f"YouTube №{row['id']}: требуется проверка YouTube Studio перед повтором.")
+            self.log(f"YouTube №{row['id']}: остановлено — {detail}")
+            return True
+        # A notification failure must not undo or misclassify a confirmed upload.
+        try:
+            self.store.notify(f"YouTube: нарезка №{row['id']} принята: https://youtu.be/{video_id}")
+        except Exception:
+            self.log(f"YouTube №{row['id']}: не удалось сохранить уведомление")
+        self.log(f"YouTube №{row['id']}: подтверждено https://youtu.be/{video_id}")
+        return True
+
+    def _youtube_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                if self.youtube_once(): continue
+            except Exception as exc:
+                self.log('Ошибка очереди YouTube ('+type(exc).__name__+')')
             self.stop_event.wait(5)
