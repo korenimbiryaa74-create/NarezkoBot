@@ -578,10 +578,11 @@ def filter_for_chunk(regions, strength=20):
     # these precise single-range chunks start at zero.
     parts = []; prev = '[bin]'
     for i, (x, y, w, h, times) in enumerate(regions):
-        # Strong enough for large logos, bounded by the chroma plane size.
-        radius = max(1, min(w // 4, h // 4, max(strength, min(w, h) // 6)))
+        # Calculate radii from the actual cropped planes, not the requested crop:
+        # FFmpeg can shrink a crop at frame edges and chroma is often subsampled.
+        radius=max(1,min(40,int(max(strength,min(w,h)//6))))
         parts.append(f'{prev}split=2[b{i}][s{i}]')
-        parts.append(f'[s{i}]crop={w}:{h}:{x}:{y},boxblur={radius}:3[r{i}]')
+        parts.append(f"[s{i}]crop={w}:{h}:{x}:{y},boxblur=luma_radius='min({radius},min(w,h)/2)':luma_power=3:chroma_radius='min({max(1,radius//2)},min(cw,ch)/2)':chroma_power=3[r{i}]")
         enabled = '+'.join(f'between(t,{a:.3f},{b:.3f})' for a, b in times)
         out = f'[o{i}]' if i < len(regions) - 1 else '[bout]'
         parts.append(f"[b{i}][r{i}]overlay={x}:{y}:enable='{enabled}'{out}")

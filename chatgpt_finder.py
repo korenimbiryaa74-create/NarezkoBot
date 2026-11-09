@@ -58,15 +58,20 @@ class ChatGPTFinder:
                 time.sleep(3)
             return False
 
-    def _ask_document(self,instructions,document,filename,timeout,log=None,need='reactions'):
+    def _ask_document(self,instructions,document,filename,timeout,log=None,need='reactions',validate_response=None):
         with self._lock:
             prompt=instructions+'\n\nПроанализируй приложенный файл с транскриптом.'
             key=full_cycle.response_key(prompt,document,filename)
             cache=self.root/'gpt_uploads'/'response_cache'/f'{key}.json'
             predicate=lambda text:(isinstance(reactions.tc.parse_answer(text).get('donation_cuts'),list) if need=='donation_cuts' else reactions.answer_has(text,need))
-            cached=full_cycle.cached_response(str(cache),key,predicate)
+            def valid_cache(text):
+                if not predicate(text): return False
+                if validate_response is None: return True
+                try: validate_response(text); return True
+                except (ValueError,TypeError): return False
+            cached=full_cycle.cached_response(str(cache),key,valid_cache)
             if cached:
-                if log: log('ChatGPT: использован проверенный кэш ответа')
+                if log: log('ChatGPT: использован проверенный кэш ответа'+(' о донатах' if need=='donation_cuts' else ''))
                 return cached
             folder=self.root/'gpt_uploads'/hashlib.sha256(document.encode('utf8')).hexdigest()[:16]
             folder.mkdir(parents=True,exist_ok=True)
@@ -99,6 +104,7 @@ class ChatGPTFinder:
             else:
                 raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
+            if validate_response is not None: validate_response(text)
             cache.parent.mkdir(parents=True,exist_ok=True)
             full_cycle.atomic_json(str(cache),{'key':key,'text':text})
             return text
@@ -112,6 +118,21 @@ class ChatGPTFinder:
             extra={'chatgpt_doc':self._ask_document},who=streamer, manual_answer=manual,
             log=lambda message:progress('Поиск реакций',message))
         return result['reactions']
+
+    def youtube_titles(self, job, outcome, progress):
+        import youtube_titles as yt
+        moments=outcome.get('moments')
+        if not isinstance(moments,list):raise ValueError('Нет данных о типах готовых нарезок')
+        doc=yt.document(outcome['outputs'],moments)
+        name=yt.streamer_name(job)
+        if not name: progress('Названия YouTube','Стример тестового файла не определён; название будет без имени')
+        progress('Названия YouTube','ChatGPT: подготовка названий по готовым нарезкам')
+        validate=lambda raw:yt.format_titles(raw,moments,name)
+        raw=self._ask_document(yt.PROMPT,doc,'youtube_clips.txt',self.timeout,
+            log=lambda msg:progress('Названия YouTube',msg),need='youtube_titles',validate_response=validate)
+        titles=validate(raw)
+        progress('Названия YouTube',f'Подготовлено названий: {len(titles)}; проверьте их в YouTube Studio')
+        return titles
 
     def find_donations(self, segs, rows, progress, manual=None):
         """One separate request; existing reaction response and speech caches stay valid."""
