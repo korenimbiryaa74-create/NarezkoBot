@@ -182,30 +182,37 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertEqual(str(studio.parse_date('1 мая 2026 г.')),'2026-05-01')
         self.assertIsNone(studio.parse_date('31 февраля 2026 г.'))
 
-    def test_date_selection_retries_only_until_picker_confirms_correct_date(self):
-        when=studio.datetime(2026,11,9,17,55)
-        class Tab:
-            def __init__(self):self.value='';self.attempts=[];self.open=False
-            def js(self,script):
-                ok=self.value=='09.11.2026'
-                return {'date':'9 нояб. 2026 г.' if ok else '10 нояб. 2026 г.',
-                        'open':self.open,'invalid':self.open and not ok}
-            def fill(self,selector,value):self.value=value;self.attempts.append(value)
-            def key(self,*args):pass
-        tab=Tab()
-        def open_picker(*args,**kwargs):tab.open=True
-        with patch.object(studio,'click',side_effect=open_picker),patch.object(studio,'wait'),patch.object(studio.time,'sleep'):
-            studio.set_schedule_date(tab,when)
-        self.assertEqual(tab.attempts,list(studio.date_inputs(when)[:3]))
+    def test_calendar_month_parsing(self):
+        for label in ('НОЯБ. 2026 Г.','Ноябрь 2026','Nov 2026','November 2026'):
+            self.assertEqual(studio.parse_calendar_month(label),(2026,11))
+        self.assertEqual(studio.parse_calendar_month('МАЙ 2027 г.'),(2027,5))
+        self.assertIsNone(studio.parse_calendar_month('9 ноября'))
 
-    def test_date_selection_never_succeeds_on_invalid_or_wrong_date(self):
+    def test_date_selection_uses_calendar_and_verifies_committed_date(self):
         when=studio.datetime(2026,11,9,17,55)
         class Tab:
-            def js(self,script):return {'date':'9 нояб. 2026 г.','open':True,'invalid':True}
-            def fill(self,*args):pass
-            def key(self,*args):pass
-        with patch.object(studio.time,'sleep'):
-            with self.assertRaisesRegex(studio.StudioError,'не принял дату'):studio.set_schedule_date(Tab(),when)
+            def __init__(self):self.clicked=False;self.esc=False
+            def js(self,script):
+                if script==studio._DATE_STATE:
+                    return {'date':'9 нояб. 2026 г.' if self.esc else '10 нояб. 2026 г.',
+                            'open':self.clicked and not self.esc,'invalid':False}
+                if script==studio._CALENDAR_MONTHS:return ['НОЯБ. 2026 Г.','ДЕК. 2026 Г.']
+                self.clicked=True;return 'clicked'
+            def key(self,key,code):self.esc=True
+        tab=Tab()
+        with patch.object(studio,'click'),patch.object(studio,'wait'),patch.object(studio.time,'sleep'):
+            studio.set_schedule_date(tab,when)
+        self.assertTrue(tab.clicked);self.assertTrue(tab.esc)
+
+    def test_calendar_does_not_guess_duplicate_month(self):
+        when=studio.datetime(2026,11,9,17,55)
+        class Tab:
+            def js(self,script):
+                if script==studio._DATE_STATE:return {'date':'10 нояб. 2026 г.','open':False,'invalid':False}
+                if script==studio._CALENDAR_MONTHS:return ['НОЯБ. 2026 Г.','Ноябрь 2026']
+                raise AssertionError('Must not click ambiguous day')
+        with patch.object(studio,'click'),patch.object(studio,'wait'):
+            with self.assertRaisesRegex(studio.StudioError,'несколько одинаковых месяцев'):studio.set_schedule_date(Tab(),when)
 
     def test_open_schedule_waits_for_visible_controls_and_refuses_ambiguity(self):
         class Tab:
