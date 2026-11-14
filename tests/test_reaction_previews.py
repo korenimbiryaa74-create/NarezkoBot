@@ -16,14 +16,23 @@ class Tests(unittest.TestCase):
         calls=[]
         def ask(instr,doc,fname,timeout,log,need):
             calls.append(instr)
-            return json.dumps({'reactions':[{'type':'reaction','start':1,'end':20,'title':'ИВАНА ЗОЛО ЗАДЕРЖАЛИ','preview_text':'ИВАНА ЗОЛО ЗАДЕРЖАЛИ','confidence':'high'},{'type':'discussion','start':21,'end':30,'title':'Разговор','preview_text':'НЕ ДОЛЖНО БЫТЬ'}]},ensure_ascii=False)
+            return json.dumps({'reactions':[{'type':'reaction','start':1,'end':20,'title':'ИВАНА ЗОЛО ЗАДЕРЖАЛИ','preview_text':'ИВАНА ЗОЛО ЗАДЕРЖАЛИ','confidence':'high'},{'type':'discussion','start':21,'end':30,'title':'Разговор','preview_text':'НЕ ДОЛЖНО БЫТЬ','video_title':'Вывернули спину! Никс про лечение'}]},ensure_ascii=False)
         with tempfile.TemporaryDirectory() as d:
             rows=reactions.find_reactions_whole(str(Path(d)/'x.mp4'),[{'start':0,'end':30,'text':'текст'}],30,{'reactions':{'min_minutes':0}},extra={'chatgpt_doc':ask},log=lambda *_:None)['reactions']
         self.assertEqual(len(calls),1);self.assertIn('preview_text',calls[0]);self.assertEqual(rows[0]['preview_text'],'ИВАНА ЗОЛО ЗАДЕРЖАЛИ');self.assertEqual(rows[1]['preview_text'],'')
         clean=pipeline.validate_intervals(rows,30);self.assertEqual(clean[0]['preview_text'],rows[0]['preview_text'])
+        self.assertEqual(clean[1]['video_title'],'Вывернули спину! Никс про лечение')
+        import youtube_titles
+        self.assertEqual(youtube_titles.title_from_moment(clean[0],'Каша'),'КАША СМОТРИТ: ИВАНА ЗОЛО ЗАДЕРЖАЛИ')
+        self.assertEqual(youtube_titles.title_from_moment(clean[1],'Никс'),'Вывернули спину! Никс про лечение')
+    def test_title_limits_do_not_cut_words(self):
+        import youtube_titles
+        self.assertEqual(reactions._word_limit('Полицейские разбирают необычные вызовы', 25),'Полицейские разбирают')
+        self.assertEqual(youtube_titles._limit('Полицейские разбирают необычные вызовы',25),'Полицейские разбирают')
+
     def test_prompt_requests_short_clickable_labels_not_generic_streamer(self):
         prompt=reactions.WHOLE_PROMPT
-        for text in ('максимум 4 слова и 32 символа', 'ВЗЛОМАЛИ ДВЕРЬ',
+        for text in ('строго 2–3 слова', 'ВЗЛОМАЛИ ДВЕРЬ',
                      'ПОПАЛИСЬ ГОЛУБЧИКИ', '«стример смотрит»', 'не выдумывай'):
             self.assertIn(text,prompt)
 
@@ -31,7 +40,7 @@ class Tests(unittest.TestCase):
         label='ПОЛИЦИЯ РАЗБИРАЕТСЯ С БЫТОВЫМИ ВЫЗОВАМИ'
         with (patch.object(pl,'check_install'),patch.object(rp,'choose_cutout',return_value=Path('x.png')),
              patch.object(rp,'choose_style',return_value=Path('style.jpg')),
-             patch.object(rp,'find_candidates',return_value=([{'id':'6EH2wmSPbMA','title':'x','channel':'y'}],[])),
+             patch.object(rp,'resolve_source',return_value=([{'id':'6EH2wmSPbMA','title':'x','channel':'y'}],[])),
              patch.object(rp,'download_thumbnail',return_value=(object(),'https://example.com')),
              patch.object(pl,'generate_reaction') as render):
             info=rp.generate('/unused','name',{'type':'reaction','preview_text':label},[],Path('/unused/x.jpg'))
@@ -40,11 +49,11 @@ class Tests(unittest.TestCase):
 
     def test_search_uses_only_relevant_snippets_not_entire_stream(self):
         row={'start':10.,'end':30.,'title':'НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}
-        segs=[{'start':0,'text':'НЕ ПОПАДЁТ В ПОИСК'}, {'start':12,'text':'Посмотрим ролик про потерю человечности в тик токе'}]
+        segs=[{'start':0,'text':'НЕ ПОПАДЁТ В ПОИСК'}, {'start':12,'text':'Посмотрим ролик про потерю человечности в тик токе современного мира'}]
         calls=[]
         class Run:
             returncode=0
-            stdout=json.dumps({'entries':[{'id':'6EH2wmSPbMA','title':'НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}, {'id':'EjMf14a8SnU','title':'КАША СМОТРИТ: НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}]}).encode()
+            stdout=json.dumps({'entries':[{'id':'6EH2wmSPbMA','title':'НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ СОВРЕМЕННОГО МИРА'}, {'id':'EjMf14a8SnU','title':'КАША СМОТРИТ: НЕТ ЧЕЛОВЕЧНОСТИ В ТИК ТОКЕ'}]}).encode()
         def runner(cmd,**kw):calls.append(cmd);return Run()
         results,qs=rp.find_candidates(row,segs,runner)
         self.assertEqual(results[0]['id'],'6EH2wmSPbMA');self.assertEqual(len(results),1)
@@ -55,6 +64,17 @@ class Tests(unittest.TestCase):
             stdout=json.dumps({'entries':[{'id':'6EH2wmSPbMA','title':'ТИК ТОК другой ролик'}]}).encode()
         with self.assertRaises(rp.PreviewError):
             rp.find_candidates({'start':0,'end':3,'title':'НЕОБЫЧНЫЙ ЭКСПЕРИМЕНТ'}, [{'start':1,'text':'смотрим какой то ролик'}],lambda *a,**k:Run())
+    def test_unknown_source_creates_labeled_synthetic_image_without_gpt(self):
+        row={'type':'reaction','title':'Почему реакции стали популярны','preview_text':'РЕАКЦИИ ПОМОЙКА'}
+        with (patch.object(pl,'check_install'),patch.object(rp,'choose_cutout',return_value=Path('x.png')),
+              patch.object(rp,'choose_style',return_value=Path('style.jpg')),
+              patch.object(rp,'resolve_source',side_effect=rp.SourceUncertain('нет источника')),
+              patch.object(rp,'download_thumbnail') as download,patch.object(pl,'generate_reaction') as render):
+            info=rp.generate('/unused','name',row,[],Path('/unused/x.jpg'))
+        self.assertTrue(info['source_generated']);self.assertIsNone(info['source_url']);download.assert_not_called()
+        self.assertEqual(render.call_args.kwargs['context'],row['title']);self.assertIsNone(render.call_args.args[3])
+        self.assertTrue(any('не оригинальное превью' in x for x in info['warnings']))
+
     def test_old_settings_are_compatible_and_test_login_normalized(self):
         cfg=settings.validate({'pipeline':{'preview':{'enabled':True,'test_streamer':'Kussia88'}}})
         self.assertTrue(cfg['pipeline']['preview']['enabled'])
@@ -86,12 +106,34 @@ class Tests(unittest.TestCase):
                 return {'status':'требует проверки','source_url':'https://www.youtube.com/watch?v=6EH2wmSPbMA'}
             engine=pipeline.Pipeline(root,finder,download=download,renderer=renderer,speech=speech)
             cfg={'min_reaction_minutes':0,'preview':{'enabled':True},'silence':{'enabled':False}}
-            with patch.object(pipeline,'media_duration',return_value=60),patch.object(rp,'generate',side_effect=generate):
+            source={'id':'6EH2wmSPbMA','title':'ПОДТВЕРЖДЁННОЕ НАЗВАНИЕ','channel':'Автор','evidence':{'matches':120,'sections':3}}
+            with (patch.object(pipeline,'media_duration',return_value=60),patch.object(rp,'generate',side_effect=generate),
+                  patch.object(rp,'resolve_source',return_value=([source],['поиск'])) as resolve):
                 result=engine.run({'vod_id':'123','streamer':'kussia88'},cfg,lambda *a:progress.append(a))
+            resolve.assert_called_once()
+            self.assertEqual(result['moments'][0]['video_title'],'КАША СМОТРИТ: ПОДТВЕРЖДЁННОЕ НАЗВАНИЕ')
+            self.assertEqual(len(list(Path(result['folder']).glob('* — источник.json'))),1)
             self.assertEqual(len(result['outputs']),2);self.assertEqual(seen,[('kussia88','reaction')])
             self.assertEqual(len(list(Path(result['folder']).glob('* — ИИ-превью.jpg'))),1)
             self.assertEqual(len(list(Path(result['folder']).glob('* — ИИ-превью.json'))),1)
             self.assertTrue(any('требует проверки' in x[1] for x in progress))
+
+    def test_source_title_also_resolves_when_preview_disabled_for_upload(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            def download(vod,quality,out,**kw):Path(out).write_bytes(b'x'*2000)
+            def speech(*a,**kw):return ([{'start':1,'end':2,'text':'пример'}],60.)
+            def finder(*a):return [{'start':1,'end':5,'title':'ОПИСАНИЕ','type':'reaction','preview_text':'ТЕСТ'}]
+            def renderer(src,out,row,offset,cfg):Path(out).write_bytes(b'x'*2000);return [(0,4)],4.
+            source={'id':'6EH2wmSPbMA','title':'Точное название','channel':'Автор','evidence':{'matches':120,'sections':3}}
+            engine=pipeline.Pipeline(root,finder,download=download,renderer=renderer,speech=speech)
+            cfg={'min_reaction_minutes':0,'preview':{'enabled':False},'silence':{'enabled':False},'_resolve_youtube_sources':True}
+            with (patch.object(pipeline,'media_duration',return_value=60),
+                  patch.object(rp,'resolve_source',return_value=([source],[])),patch.object(rp,'generate') as generate):
+                result=engine.run({'vod_id':'123','streamer':'stintik'},cfg,lambda *a:None)
+            generate.assert_not_called()
+            self.assertEqual(result['moments'][0]['video_title'],'СТИНТ СМОТРИТ: Точное название')
+            self.assertEqual(len(list(Path(result['folder']).glob('* — источник.json'))),1)
 
     def test_local_test_passes_configured_streamer_not_test_placeholder(self):
         with tempfile.TemporaryDirectory() as d:
@@ -143,6 +185,17 @@ class SavedClipTests(unittest.TestCase):
             result2=rp.generate_saved_clip(self.root,self.clip,'kussia88')
             self.assertTrue(result2['existing']);self.assertEqual(result2['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
             self.assertEqual(Path(result2['path']).read_bytes(),b'jpg');self.assertEqual(mocked.call_count,1)
+    def test_new_copy_does_not_overwrite_existing_image_or_report(self):
+        target=self.clip.with_name(self.clip.stem+' — ИИ-превью.jpg')
+        target.write_bytes(b'previous');target.with_suffix('.json').write_text('old',encoding='utf8')
+        def generate_copy(root,login,row,segs,out,**kw):
+            out.write_bytes(b'new');return {'preview_text':row['preview_text'],'warnings':[],'source_url':'https://example.org'}
+        with patch.object(rp,'generate',side_effect=generate_copy):
+            result=rp.generate_saved_clip(self.root,self.clip,'kussia88',new_copy=True)
+        self.assertFalse(result['existing']);self.assertEqual(target.read_bytes(),b'previous')
+        self.assertEqual(target.with_suffix('.json').read_text(encoding='utf8'),'old')
+        self.assertTrue(result['path'].endswith(' (2).jpg'));self.assertEqual(Path(result['path']).read_bytes(),b'new')
+
     def test_old_row_can_recover_only_exact_unique_cached_answer(self):
         self.row.pop('preview_text');self.write_metadata();self.cache()
         self.assertEqual(rp.prepare_saved_clip(self.root,self.clip,'kussia88')['row']['preview_text'],'ВЗЛОМАЛИ ДВЕРЬ')
@@ -209,7 +262,11 @@ class LocalModelGraphTests(unittest.TestCase):
             Image.new('RGBA',(300,404),(240,10,10,150)).save(assets/'01.png')
             styles=root/'thumbnail_styles';styles.mkdir()
             Image.new('RGB',(720,404),(50,10,10)).save(styles/'kussia88.jpg')
-            buf=io.BytesIO();Image.new('RGB',(1024,576),'navy').save(buf,'PNG');saved_graph=[]
+            from PIL import ImageDraw
+            buf=io.BytesIO();model=Image.new('RGB',(1024,576),'navy')
+            ImageDraw.Draw(model).rectangle((40,390,520,465),fill='yellow')
+            ImageDraw.Draw(model).rectangle((50,480,500,540),fill='white')
+            model.save(buf,'PNG');saved_graph=[]
             class Reply:
                 ok=True;content=buf.getvalue()
                 def __init__(self,obj=None):self.obj=obj or {}
@@ -233,7 +290,7 @@ class LocalModelGraphTests(unittest.TestCase):
             source=Image.new('RGB',(1280,720),'blue')
             with (patch.object(pl.requests,'Session',Session),patch.object(pl.subprocess,'Popen',Process),
                   patch.object(pl,'_save_caption',side_effect=AssertionError('overlay used')),
-                  patch.object(rp,'find_candidates',return_value=([{'id':'6EH2wmSPbMA','title':'полиция тест','channel':'x'}],['полиция тест'])),
+                  patch.object(rp,'resolve_source',return_value=([{'id':'6EH2wmSPbMA','title':'полиция тест','channel':'x'}],['полиция тест'])),
                   patch.object(rp,'download_thumbnail',return_value=(source,'https://example.com/thumbnail.jpg'))):
                 info=rp.generate(root,'kussia88',row,[{'start':1,'text':'полиция тест'}],output)
             self.assertTrue(output.is_file());self.assertTrue(info['text_unverified']);self.assertEqual(len(saved_graph),1)

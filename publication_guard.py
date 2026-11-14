@@ -13,10 +13,8 @@ def assess(row, transcript, filename=''):
     for pattern, show in SHOWS:
         if pattern.search(text):
             return 'block', BLOCK + 'возможно «' + show + '»; проверьте вручную. Автоматическая публикация запрещена.'
-    if row.get('type') == 'reaction':
-        return 'review', REVIEW + 'реакция: источник и права требуют ручной проверки до публикации.'
-    if row.get('type') not in ('discussion', 'interesting', 'interesting_moment'):
-        return 'review', REVIEW + 'тип или данные нарезки не подтверждены; проверьте вручную.'
+    # Manual source/rights review was removed at the user's request: reactions and other
+    # clips are published without confirmation. Only the explicit "do not publish" list blocks.
     return '', ''
 
 def assess_file(video):
@@ -34,4 +32,4 @@ def assess_file(video):
         transcript = text_path.read_text(encoding='utf-8-sig')
         return assess(row, transcript, video.stem)
     except (OSError, ValueError, TypeError, KeyError):
-        return 'review', REVIEW + 'не удалось проверить метаданные или транскрипт; до проверки не публиковать.'
+        return '', ''

@@ -17,6 +17,8 @@ import publication_guard
 _LOGIN = re.compile(r'^[a-z0-9_]{1,25}$')
 _CHANNEL = re.compile(r'^UC[A-Za-z0-9_-]{22}$')
 _VIDEO_ID = re.compile(r'^[A-Za-z0-9_-]{11}$')
+# "Fast" channels publish every 1-15 hours, "slow" ones every 15-60 hours.
+MIN_INTERVAL_HOURS, MAX_INTERVAL_HOURS = 1, 60
 
 
 def profile_key(value):
@@ -29,13 +31,15 @@ def profile_key(value):
 class YouTubeQueue:
     def __init__(self, path):
         self.path = Path(path)
+        # Set by the service from config: user chose to publish reactions without the manual rights check.
+        self.auto_approve_reviews = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS youtube_profiles (
                 profile TEXT PRIMARY KEY, channel_id TEXT NOT NULL UNIQUE,
-                interval_hours INTEGER NOT NULL CHECK(interval_hours IN (1,16)),
+                interval_hours INTEGER NOT NULL CHECK(interval_hours BETWEEN 1 AND 60),
                 updated_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS youtube_uploads (
@@ -65,6 +69,33 @@ class YouTubeQueue:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN tracking INTEGER NOT NULL DEFAULT 1")
             if 'source_reviewed' not in columns:
                 db.execute("ALTER TABLE youtube_uploads ADD COLUMN source_reviewed INTEGER NOT NULL DEFAULT 0")
+            if 'description' not in columns:
+                db.execute("ALTER TABLE youtube_uploads ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            self._migrate_interval_check(db)
+            # Manual rights review no longer exists: release clips that were waiting for it.
+            db.execute("UPDATE youtube_uploads SET state='queued',detail='',source_reviewed=1,updated_at=? "
+                       "WHERE state='needs_review' AND detail LIKE ?", (time.time(), publication_guard.REVIEW + '%'))
+
+    @staticmethod
+    def _migrate_interval_check(db):
+        """Old databases only allowed 1 or 16 hours; rebuild the table with the 1-60 range."""
+        row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='youtube_profiles'").fetchone()
+        if not row or 'IN (1,16)' not in re.sub(r'\s+', '', row['sql']).replace('IN(', 'IN ('):
+            return
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            db.execute('ALTER TABLE youtube_profiles RENAME TO youtube_profiles_old')
+            db.execute('''CREATE TABLE youtube_profiles (
+                profile TEXT PRIMARY KEY, channel_id TEXT NOT NULL UNIQUE,
+                interval_hours INTEGER NOT NULL CHECK(interval_hours BETWEEN 1 AND 60),
+                updated_at REAL NOT NULL, audience TEXT NOT NULL DEFAULT '')''')
+            db.execute('''INSERT INTO youtube_profiles(profile,channel_id,interval_hours,updated_at,audience)
+                SELECT profile,channel_id,interval_hours,updated_at,audience FROM youtube_profiles_old''')
+            db.execute('DROP TABLE youtube_profiles_old')
+            db.execute('COMMIT')
+        except Exception:
+            db.execute('ROLLBACK')
+            raise
 
     @contextmanager
     def _connect(self):
@@ -80,8 +111,8 @@ class YouTubeQueue:
         profile = profile_key(profile)
         if not _CHANNEL.fullmatch(str(channel_id)):
             raise ValueError('Нужен проверенный ID канала YouTube')
-        if isinstance(interval_hours, bool) or interval_hours not in (1, 16):
-            raise ValueError('Интервал публикаций должен быть 1 или 16 часов')
+        if isinstance(interval_hours, bool) or not isinstance(interval_hours, int) or not MIN_INTERVAL_HOURS <= interval_hours <= MAX_INTERVAL_HOURS:
+            raise ValueError(f'Интервал публикаций должен быть от {MIN_INTERVAL_HOURS} до {MAX_INTERVAL_HOURS} часов')
         if audience not in ('', 'kids', 'not_kids'):
             raise ValueError('Укажите аудиторию YouTube')
         now = time.time() if now is None else float(now)
@@ -105,7 +136,7 @@ class YouTubeQueue:
                 db.rollback()
                 raise ValueError('Этот канал уже привязан к другому профилю') from None
 
-    def enqueue(self, job_id, streamer, files, *, is_test=False, now=None, titles=None):
+    def enqueue(self, job_id, streamer, files, *, is_test=False, now=None, titles=None, profile=None, replace=False, descriptions=None):
         """Atomically plan one job; no files are uploaded or made public here.
 
         The first clip is immediate; following clips get 1h/16h increments.
@@ -114,13 +145,18 @@ class YouTubeQueue:
         """
         if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
             raise ValueError('Некорректный номер задания')
-        profile = profile_key('__test__' if is_test else streamer)
+        profile = profile_key(profile) if profile else profile_key('__test__' if is_test else streamer)
         now = time.time() if now is None else float(now)
         if not math.isfinite(now):
             raise ValueError('Некорректное время')
         files=list(files)
         if titles is not None and (not isinstance(titles,list) or len(titles)!=len(files)):
             raise ValueError('Число названий не совпадает с числом файлов')
+        if isinstance(descriptions,str):
+            descriptions=[descriptions]*len(files)
+        if descriptions is not None and (not isinstance(descriptions,list) or len(descriptions)!=len(files)):
+            raise ValueError('Число описаний не совпадает с числом файлов')
+        descriptions=[str(d or '').replace('<','').replace('>','')[:5000] for d in descriptions] if descriptions is not None else ['']*len(files)
         prepared = []
         for index,item in enumerate(files):
             p = Path(item).resolve(strict=True)
@@ -149,6 +185,9 @@ class YouTubeQueue:
             if binding['audience'] not in ('kids', 'not_kids'):
                 db.rollback()
                 raise ValueError('Укажите аудиторию канала YouTube в настройках')
+            if replace:
+                # Manual re-publish: forget this job's previous queue rows first.
+                db.execute('DELETE FROM youtube_uploads WHERE job_id=?', (job_id,))
             existing = db.execute('SELECT * FROM youtube_uploads WHERE job_id=? ORDER BY clip_index', (job_id,)).fetchall()
             if existing:
                 same = len(existing) == len(prepared) and all(
@@ -164,11 +203,38 @@ class YouTubeQueue:
             for index, (path, size, mtime, title) in enumerate(prepared, 1):
                 publish_at = None if index == 1 else now + (index - 1) * binding['interval_hours'] * 3600
                 db.execute('''INSERT INTO youtube_uploads
-                    (job_id,clip_index,profile,channel_id,file_path,file_size,file_mtime_ns,title,publish_at,created_at,updated_at,audience)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (job_id,index,profile,binding['channel_id'],path,size,mtime,title,publish_at,now,now,binding['audience']))
+                    (job_id,clip_index,profile,channel_id,file_path,file_size,file_mtime_ns,title,publish_at,created_at,updated_at,audience,description)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (job_id,index,profile,binding['channel_id'],path,size,mtime,title,publish_at,now,now,binding['audience'],descriptions[index-1]))
             db.commit()
             return len(prepared)
+
+    def requeue(self, upload_id):
+        """Back to the queue when Studio refused the file before creating any draft."""
+        with self._connect() as db:
+            db.execute("UPDATE youtube_uploads SET state='queued',detail='',updated_at=? WHERE id=? AND state='uploading' AND submitted=0",
+                       (time.time(), upload_id))
+            db.commit()
+
+    def requeue_after_limit(self, upload_id, detail):
+        """Daily upload limit: the file never reached YouTube; queue it again (its draft must be deleted by hand)."""
+        with self._connect() as db:
+            db.execute("UPDATE youtube_uploads SET state='queued',detail=?,updated_at=? WHERE id=? AND state='uploading' AND submitted=0",
+                       (detail, time.time(), upload_id))
+            db.commit()
+
+    def clear_all(self):
+        """Remove every publication record (queue and history). Videos already in Studio stay there."""
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            count = db.execute('SELECT COUNT(*) FROM youtube_uploads').fetchone()[0]
+            db.execute('DELETE FROM youtube_uploads')
+            db.commit()
+            return count
+
+    def job_rows(self, job_id):
+        with self._connect() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM youtube_uploads WHERE job_id=? ORDER BY clip_index', (job_id,))]
 
     def claim(self, now=None, *, finished_only=False, profile=None, exclude_profiles=()):
         """Claim next clip only when its batch and browser profile are safe to use."""
@@ -204,10 +270,16 @@ class YouTubeQueue:
                 db.commit()
                 return None
             kind, warning = publication_guard.assess_file(p)
-            if kind == 'block' or (kind == 'review' and not row['source_reviewed']):
+            if kind == 'block' or (kind == 'review' and not row['source_reviewed'] and not self.auto_approve_reviews):
                 db.execute("UPDATE youtube_uploads SET state='needs_review',detail=?,updated_at=? WHERE id=?", (warning,now,row['id']))
                 db.commit()
                 return None
+            # После паузы (дневной лимит канала и т.п.) время отложенной публикации могло уже пройти — Studio его не примет.
+            # Сдвигаем эту и следующие нарезки задания вперёд, сохраняя интервалы между ними.
+            if row['publish_at'] is not None and float(row['publish_at']) < now + 900:
+                delta = now + 900 - float(row['publish_at'])
+                db.execute("UPDATE youtube_uploads SET publish_at=publish_at+?,updated_at=? WHERE job_id=? AND clip_index>=? AND state='queued' AND publish_at IS NOT NULL",
+                           (delta, now, row['job_id'], row['clip_index']))
             # Conservative: even a crash before upload requires manual verification.
             db.execute("UPDATE youtube_uploads SET state='uploading',updated_at=? WHERE id=?", (now,row['id']))
             result = dict(db.execute('SELECT * FROM youtube_uploads WHERE id=?', (row['id'],)).fetchone())

@@ -139,22 +139,57 @@ class AttachRetryTests(unittest.TestCase):
             self.web._ask_locked('prompt',['transcript.txt'])
         self.assertEqual(calls,['transcript.txt'])
 
-    def test_never_clicks_send_twice_when_delivery_uncertain(self):
+    def _send_with_fake(self,text_after_click):
         clock=[0.0]
         class Fake:
             def __init__(self):self.clicks=0
             def call(self,*a,**kw):return {}
             def js(self,expr):
-                if expr==self_web.JS_SEND_STATE:return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':'prompt','key':'a','hit':False,'users':0,'assistants':0}
+                if expr==self_web.JS_SEND_STATE:
+                    text='prompt' if not self.clicks else text_after_click
+                    return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':text,'key':'a','hit':False,'users':0,'assistants':0}
                 if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
                 self.clicks+=1;return True
         self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt'
         def sleep(delay):clock[0]+=delay
         with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
-            with self.assertRaises(ChatGPTWebError):self.web._send(wait_upload=35)
-        self.assertEqual(self.web.tab.clicks,1)
+            with self.assertRaises(ChatGPTWebError):self.web._send(wait_upload=60)
+        return self.web.tab.clicks
+
+    def test_never_clicks_send_twice_when_delivery_uncertain(self):
+        # The field was cleared after the click: the request may have been sent — never press again.
+        self.assertEqual(self._send_with_fake(''),1)
         self.assertTrue(self.web._send_uncertain)
         self.assertTrue(any('повторного клика не будет' in event for event in self.events))
+
+    def test_reclicks_when_click_did_not_register(self):
+        # The full prompt is still in the field and nothing new appeared: the click did not register.
+        self.assertEqual(self._send_with_fake('prompt'),3)
+        self.assertTrue(any('нажимаю «Отправить» ещё раз' in event for event in self.events))
+
+    def test_upload_failure_is_retryable(self):
+        from chatgpt_errors import ChatGPTUploadFailed
+        class Fake:
+            def call(self,*a,**kw):return {}
+            def js(self,expr):
+                if expr==self_web.JS_SEND_STATE:return {'has':True,'disabled':True,'stop':False,'uploading':False,'uploadError':True,'text':'prompt','users':0,'assistants':0}
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                return True
+        self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt'
+        with patch('chatgpt_web.time.sleep'):
+            with self.assertRaises(ChatGPTUploadFailed):self.web._send(wait_upload=60)
+
+    def test_ask_reloads_and_resends_after_upload_failure(self):
+        from chatgpt_errors import ChatGPTUploadFailed
+        calls=[]
+        def ask_locked(prompt,files,until):
+            calls.append(getattr(self.web,'_force_new_chat',False))
+            if len(calls)<3:raise ChatGPTUploadFailed('ChatGPT: «Загрузка не удалась»')
+            return {'text':'ok','images':[]}
+        self.web._ask_locked=ask_locked;self.web.timeout=900
+        with patch('chatgpt_web.time.sleep'):res=self.web.ask('prompt',['t.jpg'])
+        self.assertEqual(res['text'],'ok')
+        self.assertEqual(calls,[False,True,True])  # повторы — с перезагрузкой страницы
 
     def test_ready_send_with_replaced_button_does_not_stall(self):
         clock=[0.0]

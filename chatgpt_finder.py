@@ -43,10 +43,63 @@ class ChatGPTFinder:
                 headless=False,port=9300,profile=str(account/'profile'),timeout=self.timeout,verbose=False,offscreen=False)
         return self._web
 
+    # ---------- account management (Settings → ChatGPT accounts) ----------
+    @staticmethod
+    def _valid(account):
+        if not re.fullmatch(r'acc_[0-9]{2}',str(account)) or account=='acc_00':raise ValueError('Недопустимый профиль')
+        return account
+
+    def _state(self,account):
+        try:return json.loads((self.root/'gpt_accounts'/account/'state.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError):return {}
+
+    def _save_state(self,account,**values):
+        path=self.root/'gpt_accounts'/account/'state.json';state=self._state(account);state.update(values)
+        try:full_cycle.atomic_json(str(path),state)
+        except OSError:pass
+
+    def accounts_info(self):
+        """Accounts in the order the bot tries them, with what is known locally (no browser)."""
+        out=[]
+        for name in self._accounts():
+            folder=self.root/'gpt_accounts'/name;cookies=folder/'cookies.json';state=self._state(name)
+            out.append({'name':name,'has_profile':(folder/'profile').is_dir(),'has_cookies':cookies.is_file(),
+                        'cookies_saved':cookies.stat().st_mtime if cookies.is_file() else None,
+                        'last_ok':state.get('last_ok'),'last_used':state.get('last_used'),
+                        'checked_at':state.get('checked_at'),'session':state.get('session'),
+                        'current':name==self._account and self._web is not None})
+        return out
+
+    def create_account(self):
+        base=self.root/'gpt_accounts';base.mkdir(exist_ok=True)
+        for n in range(1,100):
+            name=f'acc_{n:02d}';folder=base/name
+            if not folder.exists():
+                (folder/'profile').mkdir(parents=True);return name
+        raise ValueError('Достигнут предел: 99 аккаунтов')
+
+    def check(self, account, timeout=60):
+        """Open the account's browser on chatgpt.com so the user can look; report whether it is signed in.
+        Caller must run in a background thread. The window stays open."""
+        with self._lock:
+            self._valid(account)
+            web=self._browser(account); web.offscreen=False; web.start()
+            if web.tab is None:
+                web.tab=web._open_tab('https://chatgpt.com/');web.tab.call('Network.enable')
+            else:
+                web.tab.call('Page.navigate',url='https://chatgpt.com/')
+            until=time.monotonic()+timeout;ok=False
+            while time.monotonic()<until:
+                if web._has_session():ok=True;break
+                time.sleep(2)
+            if ok:web.dump_cookies()
+            self._save_state(account,checked_at=time.time(),session=ok)
+            return ok
+
     def login(self, timeout=300, account='acc_01'):
         """Caller must run in a background thread; user logs in using the window."""
         with self._lock:
-            if account not in [f'acc_{n:02d}' for n in range(1,8)]: raise ValueError('Недопустимый профиль')
+            self._valid(account)
             web=self._browser(account); web.offscreen=False; web.start()
             if web.tab is None:
                 web.tab=web._open_tab('https://chatgpt.com/auth/login')
@@ -54,16 +107,23 @@ class ChatGPTFinder:
             until=time.monotonic()+timeout
             while time.monotonic()<until:
                 if web._has_session():
-                    web.dump_cookies(); return True
+                    web.dump_cookies(); self._save_state(account,checked_at=time.time(),session=True); return True
                 time.sleep(3)
+            self._save_state(account,checked_at=time.time(),session=False)
             return False
 
-    def _ask_document(self,instructions,document,filename,timeout,log=None,need='reactions',validate_response=None):
+    SAFETY_TRIES=4  # hidden answers in a row (each time in a fresh chat) before the job fails
+    SAFETY_NOTE=('\n\nВажно: предыдущий ответ скрыл фильтр безопасности ChatGPT. Ответь строго в том же формате, но нейтрально и сухо: '
+                 'не цитируй мат, оскорбления, откровенные или жестокие фразы — описывай такие места обобщённо.')
+
+    def _ask_document(self,instructions,document,filename,timeout,log=None,need='reactions',validate_response=None,predicate=None):
         with self._lock:
-            prompt=instructions+'\n\nПроанализируй приложенный файл с транскриптом.'
+            import lang as lang_mod
+            instructions=lang_mod.adapt(instructions)  # английские каналы: весь ответ на английском
+            prompt=instructions+('\n\nAnalyze the attached transcript file.' if lang_mod.is_en() else '\n\nПроанализируй приложенный файл с транскриптом.')
             key=full_cycle.response_key(prompt,document,filename)
             cache=self.root/'gpt_uploads'/'response_cache'/f'{key}.json'
-            predicate=lambda text:(isinstance(reactions.tc.parse_answer(text).get('donation_cuts'),list) if need=='donation_cuts' else reactions.answer_has(text,need))
+            predicate=predicate or (lambda text:(isinstance(reactions.tc.parse_answer(text).get('donation_cuts'),list) if need=='donation_cuts' else reactions.answer_has(text,need)))
             def valid_cache(text):
                 if not predicate(text): return False
                 if validate_response is None: return True
@@ -80,17 +140,28 @@ class ChatGPTFinder:
             path.write_text(document,encoding='utf8')
             # The exception is raised only for a visible upload restriction. Never
             # replay an uncertain or already-sent request on another account.
-            from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError
+            from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError, ChatGPTSafetyError
             accounts=self._accounts()
             accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x != self._account]
-            blocked=[]; signed_out=[]
+            blocked=[]; signed_out=[]; safety=0; ask_prompt=prompt; text=None
             for account in accounts:
                 web=self._browser(account); web.timeout=int(timeout); web.offscreen=False
                 if log: log(f'ChatGPT: профиль {account} — отправка транскрипта и ожидание ответа')
                 web.status_callback=log
                 try:
-                    text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
-                    break
+                    # Answer hidden by the safety filter: ask again in a fresh chat (twice per profile), then on the next profile.
+                    for same in range(2):
+                        try:
+                            text=(web.ask(ask_prompt,[str(path)],until=predicate).get('text') or '').strip()
+                            break
+                        except ChatGPTSafetyError:
+                            safety+=1
+                            if safety>=self.SAFETY_TRIES:
+                                raise ChatGPTSafetyError(f'ChatGPT скрыл ответ из соображений безопасности {safety} раз подряд — новые чаты и другие профили не помогли. Транскрипт сохранён в кэше')
+                            web._force_new_chat=True
+                            ask_prompt=instructions+self.SAFETY_NOTE+'\n\nПроанализируй приложенный файл с транскриптом.'
+                            if log: log(f'ChatGPT: {account} скрыл ответ из соображений безопасности — открываю новый чат и прошу снова (попытка {safety+1}/{self.SAFETY_TRIES})'+('; дальше — следующий профиль' if same else ''))
+                    if text is not None: break
                 except ChatGPTQuotaError:
                     if getattr(web,'_send_uncertain',False):
                         raise RuntimeError('ChatGPT: обнаружен лимит, но отправка могла произойти; проверьте чат вручную')
@@ -102,6 +173,7 @@ class ChatGPTFinder:
                 finally:
                     web.status_callback=None
             else:
+                if safety: raise ChatGPTSafetyError(f'ChatGPT скрыл ответ из соображений безопасности ({safety} раз), а других доступных профилей нет. Транскрипт сохранён в кэше')
                 raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
             if validate_response is not None: validate_response(text)
@@ -109,13 +181,92 @@ class ChatGPTFinder:
             full_cycle.atomic_json(str(cache),{'key':key,'text':text})
             return text
 
+    # ---------- image generation (previews) ----------
+    _IMAGE_LIMIT=re.compile(r'(?:лимит|limit|достигли|исчерпа|попробуйте (?:снова|ещё раз) (?:через|позже)|try again (?:later|in)|upgrade|Plus)',re.I)
+    _IMAGE_REFUSAL=re.compile(r'(?:правил|политик|нарушать|не могу (?:создать|сгенерировать|помочь)|can.t (?:create|generate|help)|content polic)',re.I)
+
+    def generate_image(self, prompt, templates, timeout=900, log=None):
+        """Send prompt + one template image; return the path of the generated picture.
+        A refusal tries the next template; an image/upload limit moves to the next account."""
+        from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError
+        templates=[str(t) for t in templates if t]
+        if not templates:raise RuntimeError('Нет шаблона превью')
+        with self._lock:
+            accounts=self._accounts()
+            accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x!=self._account]
+            # Accounts that recently answered «лимит генерации изображений» are skipped until it resets.
+            now=time.time();resting=[a for a in accounts if float(self._state(a).get('image_limit_until') or 0)>now]
+            if resting and log:log('ChatGPT: лимит картинок ещё действует у '+', '.join(resting)+' — пропускаю')
+            accounts=[a for a in accounts if a not in resting]
+            limited=list(resting);signed_out=[];failed=[];refused=0;last_text=''
+            for account in accounts:
+                tried=0
+                while tried<2 and refused<3:
+                    template=templates[(refused+tried)%len(templates)]
+                    web=self._browser(account);web.timeout=int(timeout);web.offscreen=False;web.status_callback=log
+                    if log:log(f'ChatGPT {account}: отправляю шаблон «{os.path.basename(template)}» и запрос на превью')
+                    try:
+                        res=web.ask(prompt,[template])
+                    except ChatGPTQuotaError:
+                        if getattr(web,'_send_uncertain',False):raise RuntimeError('ChatGPT: лимит, но запрос мог уйти; проверьте чат вручную')
+                        limited.append(account);break
+                    except ChatGPTLoginError:
+                        signed_out.append(account);break
+                    except Exception as exc:
+                        if type(exc).__name__=='ChatGPTSafetyError':
+                            refused+=1;tried+=1;continue
+                        if 'Порт браузера' in str(exc):raise  # not an account problem: other accounts would fail the same way
+                        # No answer / unreadable page on this account: an image request is safe to repeat elsewhere.
+                        if log:log(f'ChatGPT {account}: {str(exc)[:160]} — пробую следующий аккаунт')
+                        last_text=(getattr(web,'last_answer','') or '').strip()
+                        failed.append(account);break
+                    finally:
+                        web.status_callback=None
+                    images=[p for p in (res.get('images') or []) if p and os.path.isfile(p)]
+                    if images:
+                        self._save_state(account,last_ok=time.time())
+                        return images[-1],template
+                    last_text=(res.get('text') or '').strip()
+                    if self._IMAGE_LIMIT.search(last_text):
+                        if log:log(f'ChatGPT {account}: лимит генерации картинок — пробую следующий аккаунт')
+                        m=re.search(r'через\s+(\d+)\s*(час|мин)|in\s+(\d+)\s*(hour|min)',last_text,re.I)
+                        wait=(int(m.group(1) or m.group(3))*(3600 if (m.group(2) or m.group(4) or '').lower().startswith(('час','hour')) else 60)) if m else 6*3600
+                        self._save_state(account,image_limit_until=time.time()+wait)
+                        limited.append(account);break
+                    refused+=1;tried+=1
+                    if log:log(f'ChatGPT {account}: картинки нет ({last_text[:120]!r}) — пробую другой шаблон')
+                if refused>=3:break
+            raise RuntimeError('ChatGPT не сгенерировал превью. Лимит: '+(', '.join(limited) or 'нет')+'; нужен вход: '+
+                               (', '.join(signed_out) or 'нет')+'; без ответа: '+(', '.join(failed) or 'нет')+(f'; последний ответ: {last_text[:200]}' if last_text else ''))
+
     def __call__(self, video, segs, duration, streamer, cfg, progress):
+        mode=(cfg.get('_streamer_modes') or {}).get(str(streamer).lower()) or {}
+        want_r=bool(mode.get('reaction',True));want_d=bool(mode.get('discussion',True));want_g=bool(mode.get('game',False))
+        kinds=[k for k,on in (('reaction',want_r),('discussion',want_d),('game',want_g)) if on] or ['reaction','discussion']
         settings={'reactions':{'mode':'whole','min_minutes':float(cfg.get('min_reaction_minutes',10)),
-                   'bridge_minutes':float(cfg.get('bridge_minutes',5)), 'chatgpt_timeout':self.timeout}}
+                   'bridge_minutes':float(cfg.get('bridge_minutes',5)), 'chatgpt_timeout':self.timeout,'kinds':kinds,'max_games':4,
+                   'max_clips':int(mode.get('max_clips') or 0)}}
+        if kinds!=['reaction','discussion']:
+            names={'reaction':'реакции','discussion':'разговоры','game':'игры'}
+            progress('Поиск реакций','Для стримера включены: '+', '.join(names[k] for k in kinds))
+        if int(mode.get('max_clips') or 0):progress('Поиск реакций',f"Лимит стримера: не больше {int(mode['max_clips'])} нарезок за стрим")
+        game_doc=''
+        if want_g and cfg.get('_vod_id') and cfg.get('_work') and cfg.get('_cli'):
+            # Chat and Twitch chapters are fetched only for streamers with «Игры» enabled.
+            import twitch_vod
+            try:game_doc=twitch_vod.game_context(cfg['_vod_id'],cfg['_work'],cfg['_cli'],duration,
+                                                    progress=lambda m:progress('Поиск реакций',m))
+            except Exception as exc:
+                progress('Поиск реакций',f'Чат Twitch недоступен ({type(exc).__name__}: {str(exc)[:150]}); игры ищу только по речи')
+        elif want_g:
+            progress('Поиск реакций','Тестовый файл: данных чата нет, игры ищу только по речи')
         manual=cfg.get('_manual_reactions')
         if manual is not None: progress('Поиск реакций','Используется сохранённый ответ ChatGPT; повторного запроса не будет')
+        import youtube_titles
+        import lang as lang_mod
+        display=lang_mod.display_name(streamer,youtube_titles.ALIASES) if streamer else ''
         result=reactions.find_reactions_whole(video,segs,duration,settings,
-            extra={'chatgpt_doc':self._ask_document},who=streamer, manual_answer=manual,
+            extra={'chatgpt_doc':self._ask_document,'game_doc':game_doc},who=display, manual_answer=manual,
             log=lambda message:progress('Поиск реакций',message))
         return result['reactions']
 

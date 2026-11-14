@@ -8,3 +8,6 @@ opencv-python-headless>=4.10
 # Reaction preview compositor and metadata-only YouTube search
 Pillow>=11,<13
 yt-dlp>=2025.10.22
+
+# Desktop interface (app_flet.py)
+flet[desktop]==1.1.2

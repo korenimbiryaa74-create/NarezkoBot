@@ -27,7 +27,17 @@ class Service:
         self._watch_state={}; self._watch_generation=0; self._youtube_wait_message=''; self._youtube_batch_blocked=set()
 
     def log(self,text):
-        with self._lock: self._logs.append((time.time(),str(text)))
+        now=time.time()
+        with self._lock: self._logs.append((now,str(text)))
+        # Also keep a file journal so problems can be diagnosed after the window is closed.
+        try:
+            path=self.root/'state'/'service.log'
+            if path.exists() and path.stat().st_size>5_000_000:
+                path.replace(path.with_suffix('.log.1'))
+            with open(path,'a',encoding='utf-8') as f:
+                f.write(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now))+'  '+redact(str(text))+'\n')
+        except Exception:
+            pass
     def logs(self):
         with self._lock: return list(self._logs)
     def recover_interrupted(self):
@@ -51,7 +61,8 @@ class Service:
             self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
                        threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True),
-                       threading.Thread(target=self._youtube_loop,name='youtube-worker',daemon=True)]
+                       threading.Thread(target=self._youtube_loop,name='youtube-worker',daemon=True),
+                       threading.Thread(target=self._copyright_loop,name='copyright-doctor',daemon=True)]
         for t in self._threads:t.start()
         self.log('Служба запущена')
         return True
@@ -219,7 +230,14 @@ class Service:
             self.store.notify(f'{name}: началась обработка записи.',f"job:{job['id']}:started")
             cfg=copy.deepcopy(self.settings.load())
             engine=self.pipeline_factory(self.root,self.finder)
+            # Per-streamer clip kinds (reactions / discussions / both) for the moments request.
+            cfg['pipeline']['_streamer_modes']=cfg.get('streamer_modes',{})
             speech=cfg['pipeline']['speech']
+            # Английские (США) каналы: распознавание, промпты, названия и описание — на английском.
+            import lang as lang_mod
+            job_lang=lang_mod.for_streamer(job.get('streamer'),cfg)
+            lang_mod.set_current(job_lang)
+            if job_lang=='en':speech['language']='en'
             speech['groq_proxy_url']=cfg['proxy']['url'] if cfg['proxy']['enabled'] and cfg['proxy'].get('groq') else ''
             secrets=(cfg['twitch']['client_secret'],cfg['proxy']['url'],speech.get('groq_api_key',''))
             def clean(text):
@@ -233,15 +251,37 @@ class Service:
                 if stage in ('Скачивание','Транскрибация','Поиск реакций','Нарезка','Рендер','Проверка нарезки','Организация файлов','Превью'): self.log(f"VOD {job['vod_id']}: {detail}")
             outcome=engine.run(job,cfg['pipeline'],progress)
             count=len(outcome['outputs'])
-            if cfg.get('youtube',{}).get('enabled') and count:
-                profile='__test__' if job.get('local_name') else job['streamer']
-                binding=self.youtube_queue.get_profile(profile)
-                if not binding or binding.get('audience') not in ('kids','not_kids'):
-                    raise ValueError('Сначала привяжите канал YouTube и укажите аудиторию')
-                # Temporarily publish with the existing filenames; no additional
-                # ChatGPT request is made to generate titles.
+            profile='__test__' if job.get('local_name') else job['streamer']
+            binding=self.youtube_queue.get_profile(profile) if cfg.get('youtube',{}).get('enabled') and count else None
+            if cfg.get('youtube',{}).get('enabled') and count and (not binding or binding.get('audience') not in ('kids','not_kids')):
+                # Clips are ready; a missing channel must not turn the whole job into an error.
+                self.log(f"VOD {job['vod_id']}: канал YouTube для «{profile}» не привязан — нарезки готовы, выложите их через «Выложить нарезки…»")
+                binding=None
+            from pipeline import is_fast_test
+            if binding and is_fast_test(self.root,job):
+                # 160p test clips are never published automatically.
+                self.log(f"VOD {job['vod_id']}: быстрый тест (160p) — автопубликация пропущена; при желании выложите через «Выложить нарезки…»")
+                binding=None
+            if binding:
+                # Reuse titles from the timestamps response; never ask GPT again.
+                moments=outcome.get('moments')
+                titles=[r.get('video_title') for r in moments] if isinstance(moments,list) and len(moments)==count and all(isinstance(r,dict) and r.get('video_title') for r in moments) else None
                 progress('Публикация YouTube','Подготовка готовых видео к публикации')
-                added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')))
+                # Description: streamer's Twitch links + the owner's footer (same text for every clip).
+                import youtube_descriptions
+                description=youtube_descriptions.build(self.root,youtube_descriptions.login_for(job,profile,cfg),
+                                                       (lang_mod.footer(cfg) if lang_mod.is_en() else cfg.get('youtube',{}).get('description_footer')))
+                # Разговорные нарезки: таймкоды в конце описания (локальная модель через Ollama, не ChatGPT).
+                try:
+                    import video_chapters,youtube_titles
+                    progress('Публикация YouTube','Таймкоды для разговорных нарезок (локальная модель)')
+                    description=video_chapters.descriptions_for(outcome['outputs'],description,who=youtube_titles.streamer_name(job) or '',
+                                                                settings=cfg.get('youtube',{}).get('chapters') or {},
+                                                                log=lambda m:self.log(f"VOD {job['vod_id']}: {m}"))
+                except Exception as exc:
+                    self.log(f"VOD {job['vod_id']}: таймкоды пропущены ({type(exc).__name__})")
+                added=self.youtube_queue.enqueue(job['id'],job['streamer'],outcome['outputs'],is_test=bool(job.get('local_name')),titles=titles,
+                                                 descriptions=description)
                 self.log(f"VOD {job['vod_id']}: подготовлено к публикации на YouTube: {added}")
             name=('Тест: '+job['local_name']) if job.get('local_name') else job['streamer']
             notice=f'{name}: обработка завершена, готовых нарезок: {count}.' if count else f'{name}: обработка завершена, подходящих моментов не найдено.'
@@ -279,14 +319,20 @@ class Service:
         else:self._youtube_batch_blocked.discard(profile)
         self.wake.set()
 
-    def youtube_once(self):
-        enabled=self.settings.load().get('youtube',{}).get('enabled')
-        row=self.youtube_queue.claim(finished_only=True,exclude_profiles=tuple(self._youtube_batch_blocked)) if enabled else None
-        pending=[r for r in self.youtube_queue.submitted_uploads() if r['profile'] not in self._youtube_batch_blocked] if enabled else []
+    def youtube_once(self, profile=None):
+        yt=self.settings.load().get('youtube',{})
+        enabled=yt.get('enabled')
+        self.youtube_queue.auto_approve_reviews=bool(yt.get('auto_approve_reactions'))
+        import upload_limits
+        # Дневной лимит полных видео: новые нарезки канала не берутся, отправленные досматриваются.
+        limited=bool(profile) and upload_limits.active(profile,'video')
+        row=self.youtube_queue.claim(finished_only=True,profile=profile,exclude_profiles=tuple(self._youtube_batch_blocked)) if enabled and not limited else None
+        pending=[r for r in self.youtube_queue.submitted_uploads(profile) if r['profile'] not in self._youtube_batch_blocked] if enabled else []
         if not row and not pending:
-            message=self.youtube_queue.waiting_reason(enabled=bool(enabled))
-            if message and message!=self._youtube_wait_message:self.log(message)
-            self._youtube_wait_message=message
+            if profile is None:
+                message=self.youtube_queue.waiting_reason(enabled=bool(enabled))
+                if message and message!=self._youtube_wait_message:self.log(message)
+                self._youtube_wait_message=message
             return False
         self._youtube_wait_message=''
         # The fallback keeps compatibility with alternate uploader implementations.
@@ -312,6 +358,14 @@ class Service:
         try:
             self.youtube_studio.upload_batch(self.youtube_queue,row,anchor['profile'],anchor['channel_id'],self.stop_event,progress,confirmed)
         except Exception as exc:
+            if type(exc).__name__=='UploadLimitReached':
+                until=upload_limits.hit(anchor['profile'],'video')
+                msg=(f"YouTube {anchor['profile']}: дневной лимит загрузок канала — пауза нарезок и Shorts до {upload_limits.fmt(until)}; "
+                     "после неё все накопившиеся нарезки выложатся сами. Удалите в Studio черновик, который YouTube не загрузил")
+                self.log(msg)
+                try:self.store.notify(msg)
+                except Exception:pass
+                return True
             detail=redact(f'{type(exc).__name__}: {str(exc)[:500]}')
             if row:
                 current=next((r for r in self.youtube_queue.list_uploads() if r['id']==row['id']),None)
@@ -326,7 +380,53 @@ class Service:
     def _youtube_loop(self):
         while not self.stop_event.is_set():
             try:
-                if self.youtube_once(): continue
+                self.youtube_dispatch()
             except Exception as exc:
                 self.log('Ошибка очереди YouTube ('+type(exc).__name__+')')
             self.stop_event.wait(5)
+
+    def youtube_dispatch(self):
+        # Диспетчер: у каждого канала свой поток загрузки, поэтому пока один канал ждёт обработку
+        # длинного видео, другие каналы уже загружают свои нарезки.
+        import upload_limits
+        workers=self.__dict__.setdefault('_youtube_workers',{})
+        for p,th in list(workers.items()):
+            if not th.is_alive():workers.pop(p,None)
+        yt=self.settings.load().get('youtube',{})
+        enabled=bool(yt.get('enabled'))
+        profiles=[]
+        if enabled:
+            for r in self.youtube_queue.list_uploads():
+                if r.get('state')=='queued' and upload_limits.active(r.get('profile'),'video'):continue  # дневной лимит полных видео
+                if r.get('state')=='queued' or (r.get('state')=='uploading' and r.get('submitted')):
+                    p=r.get('profile')
+                    if p and p not in profiles and p not in self._youtube_batch_blocked:profiles.append(p)
+        for p in profiles:
+            if p in workers:continue
+            th=threading.Thread(target=self._youtube_profile_worker,args=(p,),name='youtube-'+str(p),daemon=True)
+            workers[p]=th;th.start()
+        if not workers:
+            message=self.youtube_queue.waiting_reason(enabled=enabled)
+            if message and message!=self._youtube_wait_message:self.log(message)
+            self._youtube_wait_message=message
+
+    def _youtube_profile_worker(self, profile):
+        try:
+            while not self.stop_event.is_set() and profile not in self._youtube_batch_blocked:
+                if not self.youtube_once(profile):break
+        except Exception as exc:
+            self.log(f'Ошибка очереди YouTube {profile} ('+type(exc).__name__+')')
+
+    def _copyright_loop(self):
+        # Видео, заблокированные в части стран из-за музыки: бот сам делает в Studio «Удалить трек».
+        try:
+            import copyright_fix
+            doctor=copyright_fix.CopyrightDoctor(self.root,self)
+        except Exception as exc:
+            self.log('Авторские права: проверка отключена ('+type(exc).__name__+')')
+            return
+        self.stop_event.wait(90)
+        while not self.stop_event.is_set():
+            try:doctor.tick(self.stop_event)
+            except Exception as exc:self.log('Авторские права: ошибка проверки ('+type(exc).__name__+')')
+            self.stop_event.wait(60)

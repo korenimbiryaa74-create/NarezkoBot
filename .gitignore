@@ -42,3 +42,12 @@ thumbnail_assets/
 
 # User-supplied preview style references
 thumbnail_styles/
+
+# Local backups made before edits.
+*.bak
+*.bak[0-9]*
+*.bak_*
+
+# Preview templates: downloaded clip-channel thumbnails and user samples.
+thumbnail_templates/
+

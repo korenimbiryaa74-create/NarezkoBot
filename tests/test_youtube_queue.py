@@ -16,6 +16,8 @@ class YouTubeQueueTests(unittest.TestCase):
         for i in range(5):
             p = self.root / f'clip {i + 1}.mp4'
             p.write_bytes(bytes([i + 1]) * 20)
+            p.with_suffix('.pipeline.json').write_text('{"reaction":{"type":"discussion","title":"fixture"}}',encoding='utf8')
+            p.with_suffix('.txt').write_text('fixture',encoding='utf8')
             self.files.append(p)
 
     def test_fast_slow_and_test_schedule(self):

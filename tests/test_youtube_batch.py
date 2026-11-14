@@ -29,6 +29,8 @@ class BatchTests(unittest.TestCase):
         self.files=[]
         for i in range(3):
             p=self.root/f'{i}.mp4';p.write_bytes(b'video'+bytes([i]));self.files.append(p)
+            p.with_suffix('.pipeline.json').write_text('{"reaction":{"type":"discussion","title":"fixture"}}',encoding='utf8')
+            p.with_suffix('.txt').write_text('fixture',encoding='utf8')
         self.queue.enqueue(job['id'],'test',self.files,now=1000)
         self.first=self.queue.claim(finished_only=True);self.obj=studio.YouTubeStudio(self.root)
         self.events=[];self.stop=Stop()
@@ -140,6 +142,30 @@ class BatchTests(unittest.TestCase):
                 return 'ambiguous' if script==studio._CONFIRM_CHECKS_WARNING else {'links':None,'warning':True}
         with self.assertRaisesRegex(studio.StudioError,'однозначно подтвердить'):
             studio.wait_for_submission(Tab(),candidate_id='a'*11,timeout=5)
+    def test_receipt_under_stale_checks_prompt_is_accepted_without_reclicking(self):
+        # Studio can keep the checks prompt rendered on top of the share dialog after a successful publish.
+        class Tab:
+            def __init__(self):self.states=iter([{'links':None,'warning':True}]);self.clicks=0
+            def js(self,script):
+                if script==studio._CONFIRM_CHECKS_WARNING:self.clicks+=1;return 'clicked'
+                return next(self.states,{'links':['https://youtube.com/shorts/'+'a'*11+'?feature=share'],'warning':True})
+        tab=Tab()
+        with patch.object(studio.time,'sleep'):
+            self.assertEqual(studio.wait_for_submission(tab,candidate_id='a'*11,timeout=5),'a'*11)
+        self.assertEqual(tab.clicks,1)
+
+    def test_ignored_checks_prompt_click_is_retried_a_bounded_number_of_times(self):
+        class Tab:
+            def __init__(self):self.clicks=0
+            def js(self,script):
+                if script==studio._CONFIRM_CHECKS_WARNING:self.clicks+=1;return 'clicked'
+                return {'links':None,'warning':True}
+        clock=iter(range(0,100000));tab=Tab()
+        with patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)):
+            with self.assertRaisesRegex(studio.StudioError,'не подтвердила отправку'):
+                studio.wait_for_submission(tab,candidate_id='a'*11,timeout=200)
+        self.assertEqual(tab.clicks,studio._CHECKS_WARNING_ATTEMPTS)
+
     def test_processing_dialog_requires_known_video_id(self):
         class Tab:
             def js(self,script):return {'links':None,'warning':False,'processing':True}
@@ -186,9 +212,9 @@ class BatchTests(unittest.TestCase):
                 if script==studio._PRE_UPLOAD_RELOAD:self.reloads+=1;return 'refreshing'
                 return {'origin':200,'ready':'complete'}
         clock=iter(range(100));tab=Tab();messages=[]
-        with patch.object(studio,'channel_ready') as ready,patch.object(studio,'click') as click,patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)):
+        with patch.object(studio,'channel_ready') as ready,patch.object(studio,'open_upload_menu') as menu,patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)):
             studio.prepare_upload_dialog(tab,CHANNEL,progress=messages.append)
-        self.assertEqual(tab.reloads,1);self.assertEqual(ready.call_count,2);self.assertEqual(click.call_count,4)
+        self.assertEqual(tab.reloads,1);self.assertEqual(ready.call_count,2);self.assertEqual(menu.call_count,2)
         self.assertTrue(any('до выбора файла' in m for m in messages))
 
     def test_access_prompt_never_refreshes_unsafe_upload_or_repeats(self):
@@ -200,13 +226,39 @@ class BatchTests(unittest.TestCase):
                     return {'popup':1,'safe':not self.unsafe,'origin':100}
                 if script==studio._PRE_UPLOAD_RELOAD:self.reloads+=1;return 'refreshing'
                 return {'origin':200,'ready':'complete'}
-        with patch.object(studio,'channel_ready'),patch.object(studio,'click'),patch.object(studio.time,'sleep'):
+        with patch.object(studio,'channel_ready'),patch.object(studio,'open_upload_menu'),patch.object(studio.time,'sleep'):
             t=Tab(True)
             with self.assertRaises(studio.UnsafeUploadState):studio.prepare_upload_dialog(t,CHANNEL)
             self.assertEqual(t.reloads,0)
             t=Tab()
             with self.assertRaises(studio.StudioError):studio.prepare_upload_dialog(t,CHANNEL)
             self.assertEqual(t.reloads,1)
+
+    def test_upload_menu_reclicks_create_when_first_click_is_ignored(self):
+        class Tab:
+            # The first «Создать» click lands before Studio attaches its handler: the menu stays closed.
+            def __init__(self):self.create_clicks=0;self.item_clicks=0
+            def js(self,script):
+                if script.startswith('(()=>{const vis='):
+                    if self.create_clicks<2:return 0
+                    if "'clicked'" in script:self.item_clicks+=1;return 'clicked'
+                    return 'ready'
+                self.create_clicks+=1;return True
+        clock=iter(range(0,1000));tab=Tab()
+        with patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)*.1):
+            self.assertTrue(studio.open_upload_menu(tab))
+        self.assertEqual(tab.create_clicks,2);self.assertEqual(tab.item_clicks,1)
+
+    def test_upload_menu_never_clicks_create_while_menu_is_open(self):
+        class Tab:
+            def __init__(self):self.create_clicks=0
+            def js(self,script):
+                if script.startswith('(()=>{const vis='):return 2  # ambiguous: never pick one, never toggle the menu
+                self.create_clicks+=1;return True
+        clock=iter(range(0,10000));tab=Tab()
+        with patch.object(studio.time,'sleep'),patch.object(studio.time,'monotonic',side_effect=lambda:next(clock)):
+            with self.assertRaises(studio.StudioError):studio.open_upload_menu(tab,item_message='item')
+        self.assertEqual(tab.create_clicks,0)
 
     def test_new_upload_tab_is_foregrounded_without_closing_old_tab(self):
         calls=[]

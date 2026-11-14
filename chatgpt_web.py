@@ -23,7 +23,7 @@ def _cookie_domain(value):
     value = str(value or '').lstrip('.').lower()
     return any((value == d or value.endswith('.' + d) for d in ('chatgpt.com', 'openai.com')))
 
-from chatgpt_errors import ChatGPTWebError, ChatGPTSafetyError, ChatGPTLoginError, ChatGPTQuotaError, ChatGPTTechnicalError
+from chatgpt_errors import ChatGPTWebError, ChatGPTSafetyError, ChatGPTLoginError, ChatGPTQuotaError, ChatGPTTechnicalError, ChatGPTUploadFailed
 
 JS_EXPIRED_RE = '/Срок действия вашего сеанса истек|сеанс истек|Session has expired|session has expired|Войдите снова|войдите снова|Log in again/i'
 
@@ -150,6 +150,18 @@ class Tab:
         except Exception:
             pass
 
+_OWN_CHROME_PIDS = set()  # Chrome processes started by this app run (never closed as «stale»)
+
+
+def _patch_js(js, pairs):
+    """Apply exact text replacements to an injected script; a missing fragment is a programming error."""
+    for old, new in pairs:
+        if old not in js:
+            raise RuntimeError('chatgpt_web: не найден фрагмент скрипта для обновления: ' + old[:60])
+        js = js.replace(old, new, 1)
+    return js
+
+
 class ChatGPTWeb:
     DEFAULT_LOAD_TIMEOUT = 90
 
@@ -178,6 +190,41 @@ class ChatGPTWeb:
                 return p
         raise ChatGPTWebError('не нашёл ни Chrome, ни Edge')
 
+    def _close_stale_chrome(self):
+        """The port is held by a ChatGPT Chrome left over from a previous run of the app (same gpt_accounts
+        folder, not started by this process): close it so the requested account can start."""
+        if os.name != 'nt':
+            return False
+        base = os.path.normcase(os.path.dirname(os.path.dirname(os.path.abspath(self.profile))))
+        try:
+            out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" | "
+                "ForEach-Object { [string]$_.ProcessId + [char]9 + $_.CommandLine }"],
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=25,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout or ''
+        except (OSError, subprocess.SubprocessError):
+            return False
+        killed = False
+        for line in out.splitlines():
+            pid, _, cmd = line.partition('\t')
+            if not pid.strip().isdigit() or int(pid) in _OWN_CHROME_PIDS or '--type=' in cmd:
+                continue
+            if f'--remote-debugging-port={self.port}' in cmd and base in os.path.normcase(cmd.replace('"', '')):
+                self._log(f'порт {self.port} занят ChatGPT-браузером от прошлого запуска (PID {pid}) — закрываю его')
+                try:
+                    subprocess.run(['taskkill', '/PID', pid.strip(), '/T', '/F'], capture_output=True, timeout=20,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    killed = True
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        if not killed:
+            return False
+        for _ in range(20):
+            if not self._debug_port_busy():
+                return True
+            time.sleep(.5)
+        return False
+
     def _debug_port_busy(self):
         try:
             with socket.create_connection(('127.0.0.1',self.port),timeout=.3): return True
@@ -190,7 +237,7 @@ class ChatGPTWeb:
         if self.proc:
             self.proc = None
             self.tab = None
-        if self._debug_port_busy():
+        if self._debug_port_busy() and not self._close_stale_chrome():
             raise ChatGPTWebError('Порт браузера ChatGPT занят; закройте старое окно приложения и повторите')
         args = [self._chrome_path(), f'--remote-debugging-port={self.port}', '--remote-debugging-address=127.0.0.1', f'--user-data-dir={self.profile}', '--no-first-run', '--no-default-browser-check', '--disable-session-crashed-bubble', '--disable-blink-features=AutomationControlled', '--remote-allow-origins=*', '--window-size=1400,1000']
         if self.headless:
@@ -202,6 +249,7 @@ class ChatGPTWeb:
             args.extend(bridge_args)
             self._log(f'прокси: {proxy_setup.describe()}')
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _OWN_CHROME_PIDS.add(self.proc.pid)
         self._log(f'Chrome pid {self.proc.pid}')
         for _ in range(60):
             try:
@@ -386,6 +434,21 @@ class ChatGPTWeb:
     JS_COMPOSER_TEXT = "(()=>{const e=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');return e?(e.innerText||e.value||''):null;})()"
     JS_USER_MSGS = 'document.querySelectorAll(\'[data-message-author-role="user"],[data-turn="user"]\').length'
     JS_SEND_STATE = '(()=>{\nconst e=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nconst visible=n=>!!n&&n.getClientRects().length>0&&getComputedStyle(n).visibility!==\'hidden\';\nconst label=n=>(n.getAttribute(\'aria-label\')||n.getAttribute(\'title\')||\'\').trim();\nconst stopLabel=n=>/^(?:stop(?:\\s|$)|остановить(?:\\s|$)|прекратить(?:\\s|$))/i.test(label(n));\nconst sendLabel=n=>/^(?:send(?:\\s|$)|submit(?:\\s|$)|отправить(?:\\s|$))/i.test(label(n));\nconst known=\'button[data-testid="send-button"],button[data-testid="composer-submit-button"],button#composer-submit-button\';\nlet scope=e?(e.closest(\'form\')||e.parentElement):null;\nif(scope&&!scope.matches(\'form\')){\n  for(let i=0;i<5&&scope;i++){\n    if(scope.querySelector(known)||Array.from(scope.querySelectorAll(\'button\')).some(sendLabel))break;\n    scope=scope.parentElement;\n  }\n}\nscope=scope||document;\nconst buttons=Array.from(scope.querySelectorAll(\'button\')).filter(visible);\nconst stop=Array.from(document.querySelectorAll(\'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],button[data-testid="stop-generating"]\')).some(visible)||buttons.some(stopLabel);\nconst b=buttons.find(n=>n.matches(known)&&!stopLabel(n))||buttons.find(n=>sendLabel(n)&&!stopLabel(n))||\n  (scope.tagName===\'FORM\'?buttons.find(n=>n.type===\'submit\'&&!stopLabel(n)):null);\nconst uploading=Array.from(scope.querySelectorAll(\'[role="progressbar"],[aria-busy="true"],.animate-spin,[data-state="uploading"]\')).some(visible);\nconst alerts=Array.from(scope.querySelectorAll(\'[role="alert"],[data-testid="file-upload-error"],[data-testid="upload-error"],[data-state="error"]\')).filter(visible).map(n=>n.innerText||\'\').join(\' \');\nconst uploadError=/(?:upload|file|файл|загруз)/i.test(alerts)&&/(?:error|fail|ошиб|не удалось|невозможно)/i.test(alerts);\nconst text=e?(e.value!==undefined?e.value:(e.innerText||e.textContent||\'\')):\'\';\nlet x=null,y=null,hit=false,key=null;\nif(b){\n  if(!b.dataset.twlSend)b.dataset.twlSend=String(Math.random());key=b.dataset.twlSend;\n  const r=b.getBoundingClientRect();x=r.x+r.width/2;y=r.y+r.height/2;\n  const top=document.elementFromPoint(x,y);hit=!!top&&(top===b||b.contains(top));\n}\nreturn {has:!!b,disabled:!b||b.disabled||b.getAttribute(\'aria-disabled\')===\'true\',stop,\n uploading,uploadError,text,x,y,hit,key,\n users:document.querySelectorAll(\'[data-message-author-role="user"],[data-turn="user"]\').length,\n assistants:document.querySelectorAll(\'[data-message-author-role="assistant"],[data-turn="assistant"]\').length};\n})()'
+    # 2026-11 markup: user turns are data-user-message-bubble / ...:user; network upload failures are shown as a
+    # «Загрузка не удалась» tile in the composer and a toast at the top of the page, not as role=alert in the form.
+    JS_SEND_STATE = _patch_js(JS_SEND_STATE, (
+        ('const uploadError=',
+         'const failText=/загрузка не удалась|не удалось загрузить|проблем[аы]? с сетью|upload failed|failed to upload/i;\n'
+         'const pageFail=Array.from(document.querySelectorAll(\'[role="alert"],[role="status"],[data-sonner-toast],li[data-type="error"]\'))'
+         '.filter(visible).some(n=>failText.test(n.innerText||\'\'))||failText.test((scope&&scope.innerText)||\'\');\n'
+         'const uploadError=pageFail||'),
+        ('users:document.querySelectorAll(\'[data-message-author-role="user"],[data-turn="user"]\').length',
+         # Only visible turns outside the composer: ChatGPT keeps hidden copies of earlier chats in the DOM,
+         # and counting them made a never-sent prompt look «sent».
+         'users:(()=>{const s=\'[data-message-author-role="user"],[data-turn="user"],[data-user-message-bubble="true"],'
+         '[data-content-search-unit-key$=":user"]\';return Array.from(document.querySelectorAll(s)).filter(n=>visible(n)&&'
+         '!n.closest(\'form\')&&!(n.parentElement&&n.parentElement.closest(s))).length;})()'),
+    ))
     JS_CLICK_SEND = "(()=>{\nconst state=%s;\nconst b=Array.from(document.querySelectorAll('button')).find(n=>n.dataset.twlSend===state.key);\nif(!b||b.disabled||b.getAttribute('aria-disabled')==='true'||!b.getClientRects().length)return false;\nb.click();return true;\n})()"
 
     def _wait_ready(self, wait: int=None, settle: float=2.5) -> dict | None:
@@ -485,6 +548,7 @@ class ChatGPTWeb:
         deadline = time.monotonic() + self._remaining(wait_upload)
         expected = self._norm(getattr(self, '_pending_prompt', '') or initial.get('text', ''))
         clicks = 0
+        last_click = 0.0
         stable_key = None
         stable = 0
         next_log = 0.0
@@ -501,9 +565,23 @@ class ChatGPTWeb:
                 return True
             self._check_upload_quota()
             if st.get('uploadError'):
+                if not clicks:
+                    raise ChatGPTUploadFailed('ChatGPT: «Загрузка не удалась» — файл не принят, запрос НЕ отправлен')
                 raise ChatGPTWebError('ChatGPT сообщил об ошибке загрузки файла; запрос НЕ отправлен')
             current = self._norm(st.get('text', ''))
+            reclick = False
             if clicks:
+                # The click sometimes does not register (screen shows the full prompt still in the field).
+                # Only when nothing was sent — no new turn, no generation, the same full text is still in the
+                # field and the button is active — is it safe to press again.
+                unsent = st.get('has') and not st.get('stop') and not st.get('disabled') and not st.get('uploading') \
+                    and current and (not expected or current == expected)
+                if unsent and clicks < 3 and time.monotonic() - last_click >= 8:
+                    reclick = True
+                    self._status('кнопка не сработала — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
+                    self._log(f'после нажатия прошло {int(time.monotonic() - last_click)} с, но текст в поле и новых сообщений нет — '
+                              f'нажимаю ещё раз ({clicks + 1}/3)')
+            if clicks and not reclick:
                 if time.monotonic() >= next_log:
                     self._status('кнопка нажата; жду подтверждения отправки, повторного клика не будет')
                     self._log('кнопка нажата; жду подтверждения, повторно НЕ отправляю')
@@ -525,11 +603,11 @@ class ChatGPTWeb:
                 self._status('подготовка отправки: '+reason)
                 self._log('отправка: ' + reason)
                 next_log = time.monotonic() + 10
-            can_click = stable >= 3 and clicks == 0
+            can_click = (stable >= 3 and clicks == 0) or reclick
             if can_click:
                 previous_uncertainty = getattr(self, '_send_uncertain', False)
                 self._send_uncertain = True
-                if clicks == 0 and st.get('hit') and (st.get('x') is not None):
+                if st.get('hit') and (st.get('x') is not None):
                     x, y = (st['x'], st['y'])
                     tab.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
                     tab.call('Input.dispatchMouseEvent', type='mousePressed', x=x, y=y, button='left', clickCount=1)
@@ -545,6 +623,7 @@ class ChatGPTWeb:
                     self._status('кнопка нажата; проверяю подтверждение отправки')
                     self._log('нажал кнопку отправки через DOM; проверяю доставку')
                 clicks += 1
+                last_click = time.monotonic()
                 stable = 0
             time.sleep(0.5)
         if clicks:
@@ -553,7 +632,10 @@ class ChatGPTWeb:
         self._log('не удалось дождаться готового файла/кнопки; запрос НЕ отправлен')
         return False
     JS_PICK_FILE_INPUT = chatgpt_attach.JS_PICK_FILE_INPUT
-    JS_ATTACHED = chatgpt_attach.JS_ATTACHED
+    # A failed upload keeps its file name in the tile, so «named» alone is not success.
+    JS_ATTACHED = _patch_js(chatgpt_attach.JS_ATTACHED, ((
+        'if(named||blob)return {blob,named,busy};',
+        'if(named||blob)return {blob,named,busy,failed:/загрузка не удалась|не удалось загрузить|upload failed|failed to upload/i.test(txt)};'),))
     JS_QUOTA = chatgpt_attach.JS_QUOTA
 
     def _check_upload_quota(self):
@@ -576,10 +658,14 @@ class ChatGPTWeb:
             self._check_upload_quota()
             try:
                 state = self.tab.js(self.JS_ATTACHED % json.dumps(name)) or {}
+                if state.get('failed') or (self.tab.js(self.JS_SEND_STATE) or {}).get('uploadError'):
+                    raise ChatGPTUploadFailed('ChatGPT: «Загрузка не удалась» — файл не принят, запрос НЕ отправлен')
                 exists = state.get('blob') or state.get('named') if image else state.get('named')
                 stable = stable + 1 if exists and (not state.get('busy')) else 0
                 if stable >= 2:
                     return True
+            except ChatGPTUploadFailed:
+                raise
             except Exception:
                 stable = 0
             time.sleep(0.5)
@@ -599,7 +685,18 @@ class ChatGPTWeb:
             self._quota_blocked = False
             self._request_deadline = time.monotonic() + float(self.timeout)
             try:
-                return self._ask_locked(prompt, files, until)
+                for upload_try in range(3):
+                    try:
+                        return self._ask_locked(prompt, files, until)
+                    except ChatGPTUploadFailed as exc:
+                        # Nothing was sent: reload the page and attach + send again.
+                        if upload_try == 2 or self._remaining(60) < 30:
+                            raise
+                        self._log(f'{exc}; перезагружаю страницу и отправляю заново ({upload_try + 2}/3)')
+                        self._status('загрузка файла не удалась — перезагружаю страницу и отправляю заново')
+                        self._force_new_chat = True
+                        self._send_uncertain = False
+                        time.sleep(3)
             finally:
                 self._request_deadline = None
 
@@ -609,7 +706,8 @@ class ChatGPTWeb:
             if self._remaining(1) <= 0:
                 raise ChatGPTWebError('время отправки запроса истекло')
             self._status('подготавливаю браузер и проверяю вход')
-            if not self.new_chat(force=attempt > 0):
+            force, self._force_new_chat = attempt > 0 or getattr(self, '_force_new_chat', False), False
+            if not self.new_chat(force=force):
                 raise ChatGPTWebError('не залогинились в ChatGPT — куки протухли, переэкспортируй их из браузера')
             self._status('чат готов, проверяю интерфейс')
             tab = self.tab
@@ -660,6 +758,24 @@ class ChatGPTWeb:
         raise ChatGPTWebError(f'не удалось отправить запрос: {last}')
     JS_STATE = '(()=>{\nconst pending="";\nconst prior=[];\nconst priorNotices=[];\nconst norm=t=>(t||\'\').normalize(\'NFC\').replace(/[\\u200B-\\u200D\\uFEFF\\s]+/g,\'\').toLowerCase();\nconst promptNorm=norm(pending);\nconst previous=new Set(prior.map(norm));\nconst allowed=t=>{\n const n=norm(t);\n if(!n||previous.has(n)||Array.from(previous).some(p=>p.length>20&&n.includes(p)))return false;\n if(promptNorm&&(promptNorm.includes(n)||n.includes(promptNorm)))return false;\n return true;\n};\nconst visible=e=>!!e&&!!e.getClientRects().length&&getComputedStyle(e).visibility!==\'hidden\';\nconst user=\'[data-message-author-role="user"],[data-turn="user"]\';\nconst excluded=\'[data-testid*="advert"],[data-testid*="sponsor"],[data-testid*="recommend"],\'+\n \'[data-ad],.adsbygoogle,[aria-label="Advertisement"],[aria-label="Реклама"],\'+\n \'[data-testid*="thinking"],[data-testid*="reasoning"],.result-thinking\';\nconst skip=e=>!!e.closest(user+\',\'+excluded+\',form,[contenteditable="true"]\');\nconst article=\'article[data-testid^="conversation-turn"],article[data-turn-id],article[data-turn]\';\nconst content=\'.markdown,.prose,[data-testid="markdown"],[data-testid="message-content"]\';\nconst users=Array.from(document.querySelectorAll(user)).filter(visible);\nconst lastUser=users.length?users[users.length-1]:null;\nconst roots=[];\nconst add=e=>{\n if(!visible(e)||skip(e))return;\n const root=e.closest(article)||e;\n if(skip(root)||root.matches(\'[data-turn="user"]\')||root.querySelector(user))return;\n if(lastUser && !(lastUser.compareDocumentPosition(root)&Node.DOCUMENT_POSITION_FOLLOWING))return;\n if(!roots.includes(root))roots.push(root);\n};\nfor(const e of document.querySelectorAll(\'[data-message-author-role="assistant"],[data-turn="assistant"],\'+article)){\n if(e.matches(article)&&!e.matches(\'[data-turn="assistant"]\')&&\n    !e.querySelector(\'[data-message-author-role="assistant"],\'+content))continue;\n add(e);\n}\nif(!roots.length){\n for(const e of document.querySelectorAll(\'main \'+content.split(\',\').join(\',main \')+\',main [class*="agent-turn"]\')){\n  if(e.matches(\'[class*="agent-turn"]\')&&!e.querySelector(content)&&!e.innerText.trim())continue;\n  add(e);\n }\n}\nroots.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nconst el=roots.length?roots[roots.length-1]:null;\nconst texts=[];\nconst put=t=>{t=(t||\'\').trim();if(allowed(t)&&!texts.includes(t))texts.push(t);};\nconst read=e=>{\n const clone=e.cloneNode(true);\n for(const x of clone.querySelectorAll(\'button,svg,[role="button"],\'+excluded))x.remove();\n for(const x of clone.querySelectorAll(\'br\'))x.replaceWith(document.createTextNode(\'\\n\'));\n for(const x of clone.querySelectorAll(\'p,div,pre,li\'))x.append(document.createTextNode(\'\\n\'));\n return clone.textContent||\'\';\n};\nif(el){\n const blocks=Array.from(el.querySelectorAll(content)).filter(e=>visible(e)&&!skip(e));\n const outer=blocks.filter(e=>!blocks.some(x=>x!==e&&x.contains(e)));\n if(outer.length)put(outer.map(read).join(\'\\n\'));\n const pres=Array.from(el.querySelectorAll(\'pre\')).filter(e=>visible(e)&&!skip(e));\n if(pres.length)put(pres.map(e=>(e.querySelector(\'code\')||e).textContent||\'\').join(\'\\n\'));\n for(const e of pres)put((e.querySelector(\'code\')||e).textContent);\n if(!texts.length)put(read(el));\n}\nconst fallback=[];\nconst safe=e=>visible(e)&&!skip(e)&&!e.closest(\'aside,nav,header,button,[role="button"]\')&&\n (!lastUser||!!(lastUser.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));\nconst walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nconst seeds=[];\nwhile(walker.nextNode()){\n const node=walker.currentNode;\n if(/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(node.nodeValue||\'\')&&safe(node.parentElement))seeds.push(node.parentElement);\n}\nfor(const e of document.querySelectorAll(\'p,pre,code\')){\n if(safe(e)&&/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(e.textContent||\'\')&&!seeds.includes(e))seeds.push(e);\n}\nseeds.sort((a,b)=>a===b?0:(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));\nfor(const seed of seeds.reverse()){\n let e=seed;\n for(let depth=0;e&&e!==document.body&&depth<7;depth++,e=e.parentElement){\n  if(!safe(e)||e.querySelector(user+\',form,[contenteditable="true"]\'))break;\n  const t=read(e).trim();\n  if(promptNorm&&norm(t).includes(promptNorm))break;\n  if(t.length>300000)break;\n  if(/"(?:reactions|chapters|donation_cuts)"\\s*:/.test(t)&&allowed(t)&&!fallback.includes(t))fallback.push(t);\n }\n}\nfor(const t of fallback.slice(0,64))put(t);\nconst stops=Array.from(document.querySelectorAll(\'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],\'+\n \'[data-testid="stop-generating"],button[aria-label]\')).filter(e=>visible(e)&&(\n /stop-button|composer-stop-button|stop-generating/.test(e.getAttribute(\'data-testid\')||\'\')||\n /^(stop( generating| streaming| response)?|остановить( генерацию| ответ)?|прекратить генерацию)$/i.test(e.getAttribute(\'aria-label\')||\'\')));\nconst busy=stops.length>0||!!(el&&Array.from(el.querySelectorAll(\'[data-is-streaming="true"],[data-testid="streaming-cursor"]\')).some(visible));\nconst rx=/oaiusercontent|estuary\\/content|\\/backend-api\\/files|persistent\\.oaistatic|videos\\.openai/;\nconst own=el?Array.from(el.querySelectorAll(\'img\')).filter(i=>!skip(i)):[];\nconst doc=Array.from(document.querySelectorAll(\'img\')).filter(i=>!skip(i)&&rx.test(i.currentSrc||i.src||\'\'));\nconst seen=[];\nfor(const im of own.concat(doc)){\n const u=im.currentSrc||im.src||\'\';\n if(!u||u.startsWith(\'data:\')||seen.some(x=>x.u===u))continue;\n seen.push({u:u,ok:!!(im.complete&&im.naturalWidth>0)});\n}\nconst noticeRE=/^(?:этот контент нельзя показать из соображений безопасности|this content (?:isn[\'’]t|cannot be|can[\'’]t be) (?:shown|displayed)(?: for safety reasons)?|something went wrong while generating the response|a network error occurred|network error|произошла ошибка при создании ответа|ошибка сети)(?:[.\\s]|$)/i;\nconst safetyRE=/^(?:этот контент нельзя показать из соображений безопасности|this content)/i;\nconst notices=[];\nconst noticeWalker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\nwhile(noticeWalker.nextNode()){\n const node=noticeWalker.currentNode;\n let t=(node.nodeValue||\'\').trim();\n if(!t||t.length>600||!safe(node.parentElement))continue;\n if(!noticeRE.test(t)&&/^(?:этот контент|this content|something went wrong|a network error)/i.test(t)){\n  let parent=node.parentElement;\n  for(let depth=0;parent&&depth<3;depth++,parent=parent.parentElement){\n   if(!safe(parent)||parent.querySelector(user+\',form,[contenteditable="true"]\'))break;\n   const joined=(parent.textContent||\'\').trim();\n   if(joined.length>600)break;\n   if(noticeRE.test(joined)){t=joined;break;}\n  }\n }\n if(!noticeRE.test(t)||!allowed(t)||priorNotices.includes(t))continue;\n if(!notices.includes(t))notices.push(t);\n}\nconst blocked=notices.find(t=>safetyRE.test(t))||\'\';\nconst technical=notices.find(t=>!safetyRE.test(t))||\'\';\nreturn {blocked:blocked,technical_error:technical,notices:notices,n:roots.length||seeds.length,fallbacks:fallback.length,text:texts[0]||\'\',texts:texts,imgs:seen,busy:busy,\n source:el?(el.getAttribute(\'data-message-author-role\')||el.getAttribute(\'data-testid\')||el.tagName):(fallback.length?\'dom-text/json\':\'none\'),\n expired:' + JS_EXPIRED_RE + ".test(document.body.innerText||'')};\n})()"
 
+    # ChatGPT markup from 2026-11 (new message renderer): there is no data-message-author-role any more.
+    # Messages are marked with data-user-message-bubble / data-content-search-unit-key="…:user|…:assistant" and
+    # data-markdown-text-style="assistant-message"; the turn state is data-talvt-turn-state.
+    JS_STATE = _patch_js(JS_STATE, (
+        ("const user='[data-message-author-role=\"user\"],[data-turn=\"user\"]';",
+         "const user='[data-message-author-role=\"user\"],[data-turn=\"user\"],[data-user-message-bubble=\"true\"],"
+         "[data-content-search-unit-key$=\":user\"]';"),
+        ("const content='.markdown,.prose,[data-testid=\"markdown\"],[data-testid=\"message-content\"]';",
+         "const content='.markdown,.prose,[data-testid=\"markdown\"],[data-testid=\"message-content\"],"
+         "[data-markdown-text-style=\"assistant-message\"]';"),
+        ("for(const e of document.querySelectorAll('[data-message-author-role=\"assistant\"],[data-turn=\"assistant\"],'+article)){",
+         "for(const e of document.querySelectorAll('[data-message-author-role=\"assistant\"],[data-turn=\"assistant\"],"
+         "[data-content-search-unit-key$=\":assistant\"],'+article)){"),
+        ("const busy=stops.length>0||",
+         "const busy=stops.length>0||Array.from(document.querySelectorAll('[data-talvt-turn-state]')).some(e=>"
+         "/stream|progress|pending|generat|running/i.test(e.getAttribute('data-talvt-turn-state')||''))||"),
+    ))
+
     def _read_answer_state(self):
         expression = self.JS_STATE.replace('const pending="";', 'const pending=' + json.dumps(getattr(self, '_pending_prompt', ''), ensure_ascii=True) + ';', 1)
         expression = expression.replace('const prior=[];', 'const prior=' + json.dumps(getattr(self, '_answer_baseline', []), ensure_ascii=True) + ';', 1)
@@ -684,6 +800,7 @@ class ChatGPTWeb:
         status_at = 0
         empty_idle_since = None
         self._log('читатель ответа v26: сообщения + реакции/главы в DOM')
+        gen_last, gen_stable = None, 0
         while time.time() < deadline:
             try:
                 state = self._read_answer_state()
@@ -691,6 +808,22 @@ class ChatGPTWeb:
                 self._log(f'страница не ответила ({str(e)[:60]}) — жду')
                 time.sleep(5)
                 continue
+            if until is None:
+                # Image request: the picture is final when its source and size stay unchanged for ~6 s.
+                try:
+                    gen = [g for g in (tab.js(self.JS_GENERATED) or []) if g.split('#')[0] not in known]
+                except Exception:
+                    gen = []
+                if gen:
+                    key = tuple(gen)
+                    gen_stable = gen_stable + 1 if key == gen_last else 0
+                    gen_last = key
+                    if gen_stable >= 3:
+                        images = [g.split('#')[0] for g in gen]
+                        text = _clean_text((state or {}).get('text', '') or '')
+                        complete = True
+                        self._log(f'сгенерированная картинка готова: {gen[-1].split("#")[1]}')
+                        break
             if time.time() - t_log >= 60:
                 t_log = time.time()
                 st = state or {}
@@ -711,7 +844,7 @@ class ChatGPTWeb:
                     self._safety_blocked = True
                     self._answer_unreadable = True
                     self.last_answer = str(state['blocked'])
-                    raise ChatGPTSafetyError('ChatGPT скрыл ответ из соображений безопасности. Запрос остановлен; повтора и смены аккаунта не будет. Транскрипт сохранён в кэше')
+                    raise ChatGPTSafetyError('ChatGPT скрыл ответ из соображений безопасности')
                 if state.get('technical_error') and (not state.get('busy')):
                     self._answer_unreadable = True
                     self.last_answer = str(state['technical_error'])
@@ -734,11 +867,15 @@ class ChatGPTWeb:
                 cur_imgs = [it['u'] for it in items]
                 img_ready = all((it.get('ok') for it in items))
                 busy = bool(state.get('busy'))
-                if until is not None and not busy and not cur_text:
+                if not busy and not cur_text and not cur_imgs and not (until is None and gen_last):
                     empty_idle_since = empty_idle_since or time.time()
-                    if time.time() - empty_idle_since > 300:
+                    if until is not None and time.time() - empty_idle_since > 300:
                         self._answer_unreadable = True
                         raise ChatGPTWebError('ChatGPT не удалось прочитать ответ за 5 минут без признаков генерации; повторной отправки не будет')
+                    if until is None and time.time() - empty_idle_since > 150:
+                        # Image request with no picture, no text and no generation: e.g. an unreadable limit notice.
+                        self._answer_unreadable = True
+                        raise ChatGPTWebError('ChatGPT 2,5 минуты не генерирует картинку и ничего не отвечает')
                 else:
                     empty_idle_since = None
                 if cur_imgs and (not img_ready):
@@ -800,6 +937,8 @@ class ChatGPTWeb:
                 self._log(f'картинка не скачалась: {str(e)[:80]}')
         return (text, paths)
     JS_FETCH_IMAGE = '(async()=>{const r=await fetch(%s);const b=await r.blob();return await new Promise(res=>{const f=new FileReader();f.onload=()=>res(f.result);f.readAsDataURL(b);});})()'
+    # Current UI: generated pictures live in a gallery with blob: sources (not caught by JS_IMGS).
+    JS_GENERATED = "(()=>{const imgs=[...document.querySelectorAll('[data-testid=\"generated-image-gallery\"] img, img[alt^=\"Сгенерированное изображение\"], img[alt^=\"Generated image\"]')];return imgs.filter(i=>i.complete&&i.naturalWidth>256&&i.getClientRects().length).map(i=>(i.currentSrc||i.src)+'#'+i.naturalWidth+'x'+i.naturalHeight).filter(Boolean);})()"
     JS_IMG_READY = '(()=>{const im=Array.from(document.images).find(i=>(i.currentSrc||i.src)===%s);return !!im&&im.complete&&im.naturalWidth>0;})()'
     JS_IMG_BOX = "(()=>{const im=Array.from(document.images).find(i=>(i.currentSrc||i.src)===%s);if(!im)return null;im.scrollIntoView({block:'center'});const r=im.getBoundingClientRect();return {x:r.x+window.scrollX,y:r.y+window.scrollY,w:r.width,h:r.height};})()"
 

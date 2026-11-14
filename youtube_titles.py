@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-ALIASES={'kussia88':'Каша','nix':'Никс'}
+ALIASES={'kussia88':'Каша','nix':'Никс','stintik':'Стинт','inkmate0':'Инк Мейт'}
 
 
 def streamer_name(job):
@@ -16,7 +16,8 @@ def streamer_name(job):
     else:
         login=str(job.get('streamer') or '').strip().lower()
         if not re.fullmatch(r'[a-z0-9_]{1,25}',login): login=''
-    return ALIASES.get(login,login)
+    import lang
+    return lang.display_name(login,ALIASES)
 
 
 def _part(value, required=True):
@@ -25,15 +26,30 @@ def _part(value, required=True):
         return ''
     value=re.sub(r'\s+',' ',value).strip(' \t\r\n"«»')
     # Angle brackets are not accepted in YouTube video titles.
-    value=value.replace('<','').replace('>','').replace('|',' ').strip()
+    value=value.replace('<','').replace('>','').strip()
     if required and not value:raise ValueError('Название: пустое поле')
     return value
 
 
 def _limit(value,limit=100):
     # YouTube limits titles to 100 characters; UTF-16 accounting is conservative.
+    original=value
     while len(value.encode('utf-16-le'))//2>limit:value=value[:-1]
+    if len(value)<len(original) and value and not value[-1].isspace() and not original[len(value)].isspace() and ' ' in value:
+        value=value.rsplit(' ',1)[0]
     return value.rstrip(' ,:;|–—-')
+
+
+def title_from_moment(row, name):
+    """Use the same timestamp response; never call a model to name a video."""
+    if row.get('type','reaction')=='reaction':
+        target=_part(row.get('verified_source_title') or row.get('title'))
+        import lang
+        if lang.is_en():prefix=(name.upper()+' REACTS: ') if name else 'REACTION: '
+        else:prefix=(name.upper()+' СМОТРИТ: ') if name else 'РЕАКЦИЯ: '
+        return _limit(prefix+target)
+    title=_part(row.get('video_title') or row.get('title'))
+    return _limit(title)
 
 
 def format_titles(raw, moments, name):

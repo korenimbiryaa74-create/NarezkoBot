@@ -53,6 +53,8 @@ class ServiceIntegrationTests(unittest.TestCase):
                 files=[]
                 for i in range(3):
                     p=root/f'clip {i}.mp4';p.write_bytes(b'video'+bytes([i]));files.append(str(p))
+                    p.with_suffix('.pipeline.json').write_text('{"reaction":{"type":"discussion","title":"fixture"}}',encoding='utf8')
+                    p.with_suffix('.txt').write_text('fixture',encoding='utf8')
                 return {'outputs':files,'folder':str(root)}
         class Finder:
             def youtube_titles(self,*args):raise AssertionError('Генерация названий должна быть выключена')
@@ -80,6 +82,19 @@ class ServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0]['state'],'confirmed')
         self.assertAlmostEqual(rows[1]['publish_at']-rows[0]['updated_at'],16*3600)
         self.assertAlmostEqual(rows[2]['publish_at']-rows[0]['updated_at'],32*3600)
+
+    def test_saved_moment_titles_are_enqueued_without_new_gpt_request(self):
+        svc=self.make_service()
+        factory=svc.pipeline_factory
+        class WithTitles:
+            def __init__(self,*args): self.engine=factory(*args)
+            def run(self,*args):
+                result=self.engine.run(*args)
+                result['moments']=[{'video_title':x} for x in ('КАША СМОТРИТ: ТЕСТ','Интересный разговор','Третий момент')]
+                return result
+        svc.pipeline_factory=WithTitles
+        self.assertTrue(svc.worker_once())
+        self.assertEqual([u['title'] for u in svc.youtube_queue.list_uploads()],['КАША СМОТРИТ: ТЕСТ','Интересный разговор','Третий момент'])
 
     def test_uncertain_old_upload_does_not_require_manual_check(self):
         svc=self.make_service(local=True);self.assertTrue(svc.worker_once())
@@ -163,6 +178,10 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_receipt_id_and_schedule_parsing(self):
         self.assertEqual(studio.video_from_url('https://youtu.be/'+'a'*11),'a'*11)
+        self.assertEqual(studio.video_from_url('https://youtube.com/shorts/'+'a'*11+'?feature=share'),'a'*11)
+        self.assertEqual(studio.video_from_url('https://www.youtube.com/shorts/'+'a'*11),'a'*11)
+        self.assertIsNone(studio.video_from_url('https://youtube.com/shorts/'+'a'*11+'/x'))
+        self.assertIsNone(studio.video_from_url('https://youtube.com/channel/'+'a'*11))
         self.assertIsNone(studio.video_from_url('https://evil.example/'+'a'*11))
         self.assertEqual(str(studio.parse_date('Nov 9, 2026')),'2026-11-09')
         self.assertEqual(str(studio.parse_time('1:15 PM')),'13:15:00')
@@ -200,7 +219,7 @@ class BrowserFlowTests(unittest.TestCase):
                 self.clicked=True;return 'clicked'
             def key(self,key,code):self.esc=True
         tab=Tab()
-        with patch.object(studio,'click'),patch.object(studio,'wait'),patch.object(studio.time,'sleep'):
+        with patch.object(studio,'click'),patch.object(studio,'open_upload_menu'),patch.object(studio,'wait'),patch.object(studio.time,'sleep'):
             studio.set_schedule_date(tab,when)
         self.assertTrue(tab.clicked);self.assertTrue(tab.esc)
 
@@ -211,7 +230,7 @@ class BrowserFlowTests(unittest.TestCase):
                 if script==studio._DATE_STATE:return {'date':'10 нояб. 2026 г.','open':False,'invalid':False}
                 if script==studio._CALENDAR_MONTHS:return ['НОЯБ. 2026 Г.','Ноябрь 2026']
                 raise AssertionError('Must not click ambiguous day')
-        with patch.object(studio,'click'),patch.object(studio,'wait'):
+        with patch.object(studio,'click'),patch.object(studio,'open_upload_menu'),patch.object(studio,'wait'):
             with self.assertRaisesRegex(studio.StudioError,'несколько одинаковых месяцев'):studio.set_schedule_date(Tab(),when)
 
     def test_open_schedule_waits_for_visible_controls_and_refuses_ambiguity(self):
@@ -269,7 +288,7 @@ class BrowserFlowTests(unittest.TestCase):
         class Tab:
             def fill(self,*args):pass
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
-        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click'),patch.object(studio,'wait',return_value=True),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',side_effect=studio.StudioError('timeout')),patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',Browser),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click'),patch.object(studio,'open_upload_menu'),patch.object(studio,'wait',return_value=True),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',side_effect=studio.StudioError('timeout')),patch.object(studio.time,'sleep'):
             with self.assertRaises(studio.StudioError):studio.YouTubeStudio('/tmp').upload(row)
         self.assertTrue(Browser.last.keep_open)
 
@@ -319,7 +338,7 @@ class BrowserFlowTests(unittest.TestCase):
             return ['https://youtu.be/'+'a'*11] if 'ytcp-video-share-dialog' in expr else True
         row={'profile':'x','channel_id':CHANNEL,'file_path':'/video.mp4','title':'title','audience':'not_kids','publish_at':None}
         obj=studio.YouTubeStudio('/tmp')
-        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
+        with patch.object(studio,'Browser',lambda *a:nullcontext(Tab())),patch.object(studio,'channel_ready',return_value=CHANNEL),patch.object(studio,'click',side_effect=click),patch.object(studio,'open_upload_menu'),patch.object(studio,'wait',side_effect=wait),patch.object(studio,'attach_file'),patch.object(studio,'wait_for_title',return_value=studio._TITLE_SELECTORS[0]),patch.object(studio,'selected',return_value=True),patch.object(studio,'upload_video_id',return_value='a'*11),patch.object(studio,'wait_for_receipt',return_value='a'*11),patch.object(studio,'set_schedule') as schedule,patch.object(studio.time,'sleep'):
             self.assertEqual(obj.upload(row),'a'*11)
             self.assertIn('tp-yt-paper-radio-button[name="PUBLIC"]',calls)
             schedule.assert_not_called()

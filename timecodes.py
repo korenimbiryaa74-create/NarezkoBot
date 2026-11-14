@@ -379,7 +379,18 @@ def parse_answer(text: str) -> dict:
             if isinstance(d, dict):
                 return d
         except ValueError:
-            pass
+            # Несколько JSON подряд (черновик и исправленный ответ) — берём последний полный.
+            dec, i, last = json.JSONDecoder(), a, None
+            while i >= 0:
+                try:
+                    d, end = dec.raw_decode(text, i)
+                except ValueError:
+                    break
+                if isinstance(d, dict):
+                    last = d
+                i = text.find("{", end)
+            if last is not None:
+                return last
     # запасной вариант: строки вида "03:17 Обувь"
     ch = []
     for line in text.splitlines():

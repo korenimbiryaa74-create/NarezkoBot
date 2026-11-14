@@ -590,7 +590,7 @@ class App:
         self.preview_status.set('Превью: подготовка…')
         def work():
             try:
-                result=reaction_previews.generate_saved_clip(ROOT,path,login,cancel=self._preview_cancel,status=lambda msg:self._preview_events.put(('status',msg)),source_url=source_url)
+                result=reaction_previews.generate_saved_clip(ROOT,path,login,cancel=self._preview_cancel,status=lambda msg:self._preview_events.put(('status',msg)),source_url=source_url,new_copy=True)
                 self._preview_events.put(('done',result))
             except Exception as exc:self._preview_events.put(('error',str(exc)))
         threading.Thread(target=work,daemon=True).start()
@@ -607,7 +607,7 @@ class App:
                 self._preview_running=False;self.preview_status.set('Превью готово: '+value['path'])
                 description=('Найдено готовое превью' if value.get('existing') else 'Превью сохранено')+':\n'+value['path']
                 description+='\n\nТекст, переданный модели: '+(value.get('preview_text') or 'неизвестен')
-                description+='\nПроверьте надпись, лицо и источник: ИИ может их изменить.'
+                description+='\nПроверьте надпись, композицию и источник.'
                 if value.get('warnings'):description+='\n'+('\n'.join(value['warnings']))
                 if messagebox.askyesno('Тест превью',description+'\n\nОткрыть превью?') and hasattr(os,'startfile'):os.startfile(value['path'])
             elif kind=='error':

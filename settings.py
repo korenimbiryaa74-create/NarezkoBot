@@ -6,16 +6,17 @@ from pathlib import Path
 from monitor import normalize_login
 from pipeline import atomic_json
 from proxy_setup import parse_proxy
+from youtube_descriptions import DEFAULT_FOOTER
 
 DEFAULTS={
  'twitch':{'client_id':'','client_secret':''},
- 'youtube':{'enabled':False},
- 'streamers':[], 'monitor':{'enabled':False,'interval':60,'profiles_imported':False},
+ 'youtube':{'enabled':False,'auto_approve_reactions':False,'description_footer':DEFAULT_FOOTER},
+ 'streamers':[], 'streamer_modes':{}, 'monitor':{'enabled':False,'interval':60,'profiles_imported':False},
  'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True,'groq':False},
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
-             'keep_original':False,'remove_donations':True,'preview':{'enabled':False,'test_streamer':''},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
+             'keep_original':False,'remove_donations':True,'preview':{'enabled':False,'test_streamer':'','templates':{},'prompts':{}},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
 
 def merge(base, override):
     result=copy.deepcopy(base)
@@ -24,10 +25,33 @@ def merge(base, override):
         else: result[k]=v
     return result
 
+def _clip_limit(value):
+    """Clips per stream for a streamer: 0 = no limit, otherwise 1..50."""
+    try: value=int(value or 0)
+    except (TypeError,ValueError): value=0
+    return max(0,min(50,value))
+
 def validate(config):
     result=merge(DEFAULTS,config)
     if not isinstance(result.get('youtube'),dict) or not isinstance(result['youtube'].get('enabled'),bool): raise ValueError('Некорректная настройка YouTube')
+    result['youtube']['auto_approve_reactions']=bool(result['youtube'].get('auto_approve_reactions',False))
+    footer=result['youtube'].get('description_footer')
+    if not isinstance(footer,str): footer=DEFAULT_FOOTER
+    footer=footer.replace('\r\n','\n').replace('<','').replace('>','')
+    if len(footer)>3000: raise ValueError('Подпись описания YouTube: не длиннее 3000 символов')
+    result['youtube']['description_footer']=footer
+    # Английские (США) каналы: своя подпись и язык по логину стримера.
+    fen=result['youtube'].get('description_footer_en')
+    if not isinstance(fen,str): fen='💬 My Telegram - https://t.me/korenmbr'
+    result['youtube']['description_footer_en']=fen.replace('\r\n','\n').replace('<','').replace('>','')[:3000]
+    langs=result.get('languages') if isinstance(result.get('languages'),dict) else {}
+    result['languages']={normalize_login(k):('en' if str(v).lower()=='en' else 'ru') for k,v in langs.items() if str(k).strip()}
     result['streamers']=list(dict.fromkeys(normalize_login(s) for s in result['streamers']))
+    modes=result.get('streamer_modes') if isinstance(result.get('streamer_modes'),dict) else {}
+    result['streamer_modes']={normalize_login(k):{'reaction':bool((v or {}).get('reaction',True)),'discussion':bool((v or {}).get('discussion',True)),
+                                                  'game':bool((v or {}).get('game',False)),
+                                                  'max_clips':_clip_limit((v or {}).get('max_clips',0))}
+                              for k,v in modes.items() if isinstance(v,dict) and str(k).strip()}
     m=result['monitor']; m['interval']=int(m['interval'])
     if not 15<=m['interval']<=3600: raise ValueError('Интервал мониторинга: от 15 до 3600 секунд')
     p=result['proxy']
@@ -43,6 +67,12 @@ def validate(config):
     test_login=preview.get('test_streamer','')
     if not isinstance(test_login,str): raise ValueError('Некорректный ник для теста превью')
     preview['test_streamer']=normalize_login(test_login) if test_login.strip() else ''
+    templates=preview.get('templates') if isinstance(preview.get('templates'),dict) else {}
+    preview['templates']={normalize_login(k):('manual' if v=='manual' else 'auto') for k,v in templates.items() if str(k).strip()}
+    # Per-streamer opening of the preview request (everything before «<надпись>» and «контекст: …»).
+    prompts=preview.get('prompts') if isinstance(preview.get('prompts'),dict) else {}
+    preview['prompts']={normalize_login(k):str(v).replace('\r\n','\n').strip()[:2000] for k,v in prompts.items()
+                        if str(k).strip() and isinstance(v,str) and v.strip()}
     if not isinstance(q['banner_blur'],dict) or not isinstance(q['banner_blur'].get('enabled'),bool): raise ValueError('Некорректная настройка блюра баннеров')
     q['banner_blur']['interval']=int(q['banner_blur']['interval'])
     if not 1<=q['banner_blur']['interval']<=60: raise ValueError('Интервал поиска баннеров: от 1 до 60 секунд')

@@ -18,6 +18,8 @@ class DiagnosticsUITests(unittest.TestCase):
         self.app.window=MagicMock(); self.app.status=MagicMock(); self.app.events=MagicMock();self.app.notifications=MagicMock()
         self.app.jobs=MagicMock(); self.app.streams=MagicMock(); self.app.service=MagicMock()
         self.app.config={};self.app.service.stream_rows.return_value=[]
+        self.app.refresh_youtube_profiles=MagicMock();self.app.youtube_rows=MagicMock()
+        self.app.youtube_rows.selection.return_value=();self.app.service.youtube_queue.list_uploads.return_value=[]
     def test_copy_selected_job_detail(self):
         self.app.jobs.selection.return_value=('7',)
         self.app.service.store.list_jobs.return_value=[{'id':7,'local_name':'demo.mp4','streamer':'test','state':'retry','stage':'Ожидает повтора','detail':'TranscribeError: причина'}]

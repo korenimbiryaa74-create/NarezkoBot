@@ -159,9 +159,11 @@ class JobStore:
                 db.rollback(); raise ValueError('Повторить можно только задание с ошибкой')
             self._event(db,job_id,now,'Ожидает обработки'); db.commit()
 
-    def list_jobs(self, limit=100):
+    def list_jobs(self, limit=100, include_hidden=False):
+        # include_hidden: jobs removed by «очистить историю» still have their clips on disk.
+        where='' if include_hidden else 'WHERE hidden=0 '
         with self._connect() as db:
-            return [dict(r) for r in db.execute('SELECT * FROM jobs WHERE hidden=0 ORDER BY id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
+            return [dict(r) for r in db.execute('SELECT * FROM jobs '+where+'ORDER BY id DESC LIMIT ?', (max(1,min(int(limit),1000)),))]
 
     def local_test_ids(self, name, size, mtime_ns):
         # Keep even hidden records: legacy per-job caches can still be reused.

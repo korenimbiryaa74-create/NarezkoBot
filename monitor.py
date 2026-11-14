@@ -117,6 +117,24 @@ class Monitor:
         self.poll_pending(login)
         return live
 
+    def _covering_vod(self, row):
+        """VOD that already contains this stream: Twitch gave a restarted stream a new id, the short first part has
+        no VOD of its own. Only a stream of the same streamer that started within 30 minutes and is already queued counts."""
+        from datetime import datetime
+        def ts(v):
+            try:return datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
+            except (TypeError,ValueError):return None
+        start=ts(row['started_at'])
+        if start is None:return None
+        with self.store._connect() as db:
+            rows=db.execute("SELECT queued_vod_id,started_at FROM observed_streams WHERE login=? AND stream_id!=? AND state='queued' AND queued_vod_id IS NOT NULL",
+                            (row['login'],row['stream_id'])).fetchall()
+        for r in rows:
+            s2=ts(r['started_at'])
+            if s2 is not None and 0<s2-start<=1800:
+                return str(r['queued_vod_id'])
+        return None
+
     def poll_pending(self, login):
         login=normalize_login(login)
         with self.store._connect() as db:
@@ -127,6 +145,21 @@ class Monitor:
                 videos=self.api.videos(row['user_id'])
                 match=next((v for v in videos if str(v.get('stream_id') or '')==row['stream_id'] and v.get('id') and v.get('duration')),None)
                 if not match:
+                    covered=self._covering_vod(row)
+                    with self.store._connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        if covered:
+                            # Twitch restart: this short stream has no VOD of its own; it is inside the next stream's recording.
+                            db.execute("UPDATE observed_streams SET state='covered',queued_vod_id=?,last_error=?,updated_at=? WHERE stream_id=? AND state='waiting_vod'",
+                                       (covered,f'Эфир перезапускался: этот отрезок вошёл в запись {covered}',now,row['stream_id']))
+                            db.commit()
+                            continue
+                        if row['ended_at'] is not None and now-row['ended_at']>=172800:
+                            db.execute("UPDATE observed_streams SET state='no_vod',last_error=?,updated_at=? WHERE stream_id=? AND state='waiting_vod'",
+                                       ('Запись Twitch не появилась за 2 суток',now,row['stream_id']))
+                            self.store._notification(db,now,f"{login}: запись Twitch так и не появилась за 2 суток после эфира — больше не жду.",f"stream:{row['stream_id']}:no_vod")
+                            db.commit()
+                            continue
                     # Absence breaks continuity; never count the missing interval as stable.
                     with self.store._connect() as db:
                         db.execute("BEGIN IMMEDIATE")

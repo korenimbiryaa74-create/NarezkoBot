@@ -14,3 +14,8 @@ class ChatGPTQuotaError(ChatGPTWebError):
 
 class ChatGPTTechnicalError(ChatGPTWebError):
     pass
+
+class ChatGPTUploadFailed(ChatGPTWebError):
+    """ChatGPT showed «Загрузка не удалась» (network): the file was not accepted and nothing was sent,
+    so the page can be reloaded and the request repeated safely."""
+    pass

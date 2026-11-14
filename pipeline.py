@@ -121,6 +121,26 @@ def test_transcript_cache(root, video, job, progress, check_local):
 def job_identity(job):
     return {k:job.get(k) for k in ('id','vod_id','streamer','local_name','local_size','local_mtime_ns')}
 
+FAST_TEST_QUALITY='160p30'
+
+
+def job_options_path(root, vod_id):
+    vod_id=str(vod_id)
+    if not vod_id.isdecimal(): raise ValueError('Некорректный ID записи')
+    return Path(root)/'state'/'job_options'/f'{vod_id}.json'
+
+
+def job_options(root, vod_id):
+    """Per-VOD options set by «Запись Twitch по ссылке» (e.g. fast low-quality test)."""
+    try: value=load_json(job_options_path(root,vod_id))
+    except ValueError: return {}
+    return value if isinstance(value,dict) else {}
+
+
+def is_fast_test(root, job):
+    return not job.get('local_name') and bool(job_options(root,job.get('vod_id')).get('fast_test'))
+
+
 def manual_answer_path(root, job_id):
     if isinstance(job_id,bool) or not isinstance(job_id,int) or job_id <= 0: raise ValueError('Некорректный номер задания')
     return Path(root)/'state'/'manual_reactions'/f'{job_id}.json'
@@ -143,9 +163,12 @@ def validate_intervals(rows,duration,min_seconds=0):
         if b-a<min_seconds: continue
         row={'start':a,'end':min(b,duration),'title':str(item.get('title') or 'Момент')[:100]}
         if 'type' in item:
-            if item['type'] not in ('reaction','discussion'): raise PipelineError('Неизвестный тип момента')
+            if item['type'] not in ('reaction','discussion','game'): raise PipelineError('Неизвестный тип момента')
             row['type']=item['type']
         if isinstance(item.get('preview_text'),str): row['preview_text']=item['preview_text'].strip()[:80]
+        if isinstance(item.get('source_url_hint'),str): row['source_url_hint']=item['source_url_hint'].strip()[:300]
+        if isinstance(item.get('source_search_hint'),str): row['source_search_hint']=item['source_search_hint'].strip()[:120]
+        if isinstance(item.get('video_title'),str): row['video_title']=item['video_title'].strip()[:100]
         if item.get('confidence') in ('high','medium','low'): row['confidence']=item['confidence']
         clean.append(row)
     clean.sort(key=lambda x:x['start'])
@@ -191,8 +214,32 @@ def default_download(vod_id, quality, output, begin=None, end=None, cli=None, th
     # Download does not implicitly inherit proxies; service-specific proxy support must be explicit.
     env={k:v for k,v in os.environ.items() if not k.lower().endswith('_proxy')}
     env['NO_PROXY']='*'; env['no_proxy']='*'
-    result=subprocess.run(command,cwd=str(Path(cli).parent),env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    if result.returncode or not output.is_file(): raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')')
+    def run(run_env):
+        return subprocess.run(command,cwd=str(Path(cli).parent),env=run_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    result=run(env)
+    if result.returncode or not output.is_file():
+        # Some Twitch VOD servers (a CloudFront distribution per recording) drop connections from the
+        # local network while others work; the same download then succeeds through the configured proxy.
+        proxy=''
+        try:
+            import proxy_setup
+            proxy=proxy_setup.proxy_url()
+        except Exception:
+            proxy=''
+        if proxy:
+            if output.exists():output.unlink()  # our own partial temp file (checked absent above)
+            import proxy_bridge
+            bridge=proxy_bridge.ProxyBridge(proxy)
+            local=bridge.start()
+            try:
+                penv={k:v for k,v in env.items() if k.lower()!='no_proxy'}
+                penv.update({'HTTP_PROXY':local,'HTTPS_PROXY':local,'ALL_PROXY':local,'NO_PROXY':'127.0.0.1,localhost'})
+                result=run(penv)
+            finally:
+                bridge.close()
+    if result.returncode or not output.is_file():
+        reason=[l.strip() for l in (result.stderr or '').splitlines() if 'Exception' in l and ':' in l][:1]
+        raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')'+(' — '+reason[0][:160] if reason else '')+('; через прокси тоже' if 'proxy' in locals() and proxy else ''))
 
 def _valid_speech_segments(segments, start, end):
     if not isinstance(segments, list): raise PipelineError('Распознаватель не вернул список сегментов')
@@ -315,6 +362,10 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     # Keep the cutter's generated timeline away from the user's input file.
     args.timeline=str(Path(output).parent/'_work'/(Path(output).stem+'.timeline.json'))
     args.min_cut=float(silence_cfg.get('min_cut',1.5)); args.max_gap=float(silence_cfg.get('max_gap',2.0))
+    if row.get('type')=='game':
+        # Gameplay: the streamer is often silent while playing; cut only long dead pauses.
+        long_pause=float(silence_cfg.get('game_min_cut',20.0))
+        args.min_cut=max(args.min_cut,long_pause); args.max_gap=max(args.max_gap,long_pause)
     args.onset_db=float(silence_cfg.get('onset_db',12.0))
     args.blur_regions=[]; args.precise=True; args.fast=False; args.map_timeline=True
     args.scale_height=int(silence_cfg.get('max_height',1080) or 0)
@@ -550,6 +601,9 @@ class Pipeline:
         work=folder/'_work'; work.mkdir(exist_ok=True)
         cli=cfg.get('cli_path') or str(self.root/'desktop'/'tools'/'TwitchDownloaderCLI'/'TwitchDownloaderCLI.exe')
         threads=int(cfg.get('download_threads',4)); quality=cfg.get('quality','1080p60')
+        # Fast test: clips are cut straight from the 160p file already downloaded for transcription.
+        fast_test=is_fast_test(self.root,job)
+        if fast_test: quality=FAST_TEST_QUALITY
         def check_local():
             if local_name:
                 path=self.root/'test_input'/local_name
@@ -599,8 +653,18 @@ class Pipeline:
             manual=load_json(manual_answer_path(self.root,job['id']))
             if isinstance(manual,dict) and manual.get('job')==job_identity(job) and isinstance(manual.get('text'),str):
                 finder_cfg=dict(cfg,_manual_reactions=manual['text'])
-        finder_login=(cfg.get('preview',{}).get('test_streamer','') if local_name else login)
+        import youtube_titles
+        known_name=youtube_titles.streamer_name(job)
+        finder_login=(known_name or cfg.get('preview',{}).get('test_streamer','') if local_name else login)
+        # Game clips need the VOD's chat and chapters; the finder downloads them only when «Игры» is on.
+        if not local_name: finder_cfg=dict(finder_cfg,_vod_id=vod_id,_work=str(work),_cli=cli)
         rows=validate_intervals(self.finder(str(src),segs,duration,finder_login,finder_cfg,progress),duration,float(cfg.get('min_reaction_minutes',10))*60)
+        display_name=known_name or (youtube_titles.ALIASES.get(str(finder_login).lower(),str(finder_login)) if finder_login else '')
+        # Reaction titles come from the same answer: «<СТРИМЕР> СМОТРИТ: <ролик>».
+        for row in rows:
+            if row.get('type')=='reaction' and not row.get('video_title'):row['video_title']=youtube_titles.title_from_moment(row,display_name)
+        for row in rows:
+            row['video_title']=youtube_titles.title_from_moment(row,display_name)
         check_local()
         if cfg.get('remove_donations',False) and any(r.get('type','reaction')=='reaction' for r in rows):
             if not hasattr(self.finder,'find_donations'): raise PipelineError('Поиск донатов недоступен у текущего поставщика')
@@ -615,76 +679,113 @@ class Pipeline:
             check_local()
         atomic_json(folder/'reactions.json',{'vod_id':vod_id,'reactions':rows})
         outputs=[]
-        for i,row in enumerate(rows,1):
-            progress('Нарезка',f"{i}/{len(rows)} · {('Реакция' if row.get('type')=='reaction' else 'Обсуждение/момент' if row.get('type')=='discussion' else 'Момент')} · {timestamp(row['start'])}–{timestamp(row['end'])}")
-            stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
-            old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
-            hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
-            if banner_cfg.get('enabled',False):hash_data['banner_blur']=banner_cfg
-            config_hash=hashlib.sha256(json.dumps(hash_data,sort_keys=True).encode()).hexdigest()
-            previous=load_json(meta)
-            if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
-                media_duration(old_output); outputs.append(str(old_output)); continue
-            if old_output or meta.exists() or old_txt: raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
-            begin,end=full_cycle.download_bounds(row['start'],row['end'])
-            raw=work/(f'clip-{i:04}.mp4'); temp=work/(f'clip-{i:04}.download.mp4'); rendered=folder/(stem+'.rendering.mp4')
-            if rendered.exists():rendered.unlink()
-            if local_name:
+        # Пока рендерится нарезка, следующая уже скачивается в фоне: интернет и рендер друг другу не мешают.
+        # Одновременно идёт только одна загрузка; при её ошибке нарезка просто скачивается заново обычным путём.
+        prefetch={}
+        def start_prefetch(j):
+            if local_name or fast_test or j>len(rows) or j in prefetch:return
+            nrow=rows[j-1];nstem=clip_stem(j,nrow)
+            if locate_clip_file(folder,nstem+'.mp4') or locate_clip_file(folder,nstem+'.txt') or (folder/(nstem+'.pipeline.json')).exists():return
+            nb,ne=full_cycle.download_bounds(nrow['start'],nrow['end'])
+            nraw=work/(f'clip-{j:04}.mp4');ntemp=work/(f'clip-{j:04}.download.mp4')
+            state={'done':threading.Event(),'error':None}
+            def run():
+                try:
+                    if ntemp.exists():ntemp.unlink()
+                    if nraw.exists():nraw.unlink()
+                    self.download(vod_id,quality,ntemp,begin=nb,end=ne,cli=cli,threads=threads)
+                    media_duration(ntemp);os.replace(ntemp,nraw)
+                except Exception as exc:
+                    state['error']=exc
+                finally:
+                    state['done'].set()
+            threading.Thread(target=run,name=f'prefetch-clip-{j}',daemon=True).start()
+            prefetch[j]=state
+        try:
+            for i,row in enumerate(rows,1):
+                progress('Нарезка',f"{i}/{len(rows)} · {({'reaction':'Реакция','discussion':'Обсуждение/момент','game':'Игра'}.get(row.get('type'),'Момент'))} · {timestamp(row['start'])}–{timestamp(row['end'])}")
+                stem=clip_stem(i,row); output=folder/(stem+'.mp4'); meta=folder/(stem+'.pipeline.json'); txt=folder/(stem+'.txt')
+                old_output=locate_clip_file(folder,stem+'.mp4'); old_txt=locate_clip_file(folder,stem+'.txt')
+                hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
+                if banner_cfg.get('enabled',False):hash_data['banner_blur']=banner_cfg
+                config_hash=hashlib.sha256(json.dumps(hash_data,sort_keys=True).encode()).hexdigest()
+                previous=load_json(meta)
+                if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
+                    media_duration(old_output); outputs.append(str(old_output)); continue
+                if old_output or meta.exists() or old_txt: raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
+                begin,end=full_cycle.download_bounds(row['start'],row['end'])
+                raw=work/(f'clip-{i:04}.mp4'); temp=work/(f'clip-{i:04}.download.mp4'); rendered=folder/(stem+'.rendering.mp4')
+                if rendered.exists():rendered.unlink()
+                if local_name:
+                    check_local()
+                    render_source=src; offset=0
+                elif fast_test:
+                    progress('Скачивание',f'Нарезка {i}/{len(rows)}: быстрый тест — режу из записи 160p без повторной загрузки')
+                    render_source=src; offset=0
+                else:
+                    pre=prefetch.pop(i,None)
+                    if pre is not None:
+                        if not pre['done'].is_set():
+                            progress('Скачивание',f'Нарезка {i}/{len(rows)}: фрагмент {timestamp(begin)}–{timestamp(end)} уже качается в фоне — дожидаюсь')
+                            with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Фоновая загрузка фрагмента ещё выполняется'):
+                                pre['done'].wait()
+                        if pre['error'] is not None or not raw.exists():
+                            progress('Скачивание',f"Нарезка {i}/{len(rows)}: фоновая загрузка не удалась ({type(pre['error']).__name__ if pre['error'] else 'нет файла'}) — качаю заново")
+                            pre=None
+                        else:
+                            progress('Скачивание',f'Нарезка {i}/{len(rows)}: фрагмент уже скачан в фоне, пока рендерилась предыдущая')
+                    if pre is None:
+                        if temp.exists():temp.unlink()
+                        if raw.exists():raw.unlink()
+                        progress('Скачивание',f'Нарезка {i}/{len(rows)}: загрузка фрагмента {timestamp(begin)}–{timestamp(end)} через TwitchDownloader')
+                        with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader ещё выполняется'):
+                            self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
+                        media_duration(temp); os.replace(temp,raw)
+                    render_source=raw; offset=begin
+                start_prefetch(i+1)  # следующая нарезка качается, пока рендерится эта
+                progress('Рендер',f'Нарезка {i}/{len(rows)}')
+                if self.renderer is render_clip:
+                    def render_progress(detail): progress('Рендер',f'Нарезка {i}/{len(rows)} · {detail}')
+                    keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress,banner_cfg=banner_cfg)
+                else:
+                    keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
                 check_local()
-                render_source=src; offset=0
-            else:
-                if temp.exists():temp.unlink()
-                if raw.exists():raw.unlink()
-                progress('Скачивание',f'Нарезка {i}/{len(rows)}: загрузка фрагмента {timestamp(begin)}–{timestamp(end)} через TwitchDownloader')
-                with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader ещё выполняется'):
-                    self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
-                media_duration(temp); os.replace(temp,raw)
-                render_source=raw; offset=begin
-            progress('Рендер',f'Нарезка {i}/{len(rows)}')
-            if self.renderer is render_clip:
-                def render_progress(detail): progress('Рендер',f'Нарезка {i}/{len(rows)} · {detail}')
-                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}),progress_callback=render_progress,banner_cfg=banner_cfg)
-            else:
-                keeps,actual=self.renderer(render_source,rendered,row,offset,cfg.get('silence',{}))
-            check_local()
-            progress('Проверка нарезки',f'Нарезка {i}/{len(rows)} · проверка таймкодов')
-            mapped,planned=full_cycle.remap_segments(segs,offset,keeps,rendered_timeline=getattr(keeps,'rendered_timeline',None))
-            if abs(actual-planned)>.5:
-                raise PipelineError(f'Длительность видео {actual:.2f} с не совпала с монтажной картой {planned:.2f} с; таймкоды не сохранены')
-            mapped=full_cycle.clip_segments(mapped,actual)
-            # A partial render is never presented as completed.
-            os.replace(rendered,output)
-            warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
-            category={'reaction':'Реакция на видео','discussion':'Обсуждение / другой интересный момент'}.get(row.get('type'))
-            heading=('Тип момента: '+category+'\n' if category else '')+'Транскрипт готовой нарезки; времена от начала видео.\n\n'
-            txt.write_text(heading+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
-            banner_scan=getattr(keeps,'banner_scan',None)
-            if banner_scan is not None:
-                banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
-            atomic_json(meta,{'banner_scan':banner_scan,'banner_mode':('manual' if banner_scan is not None else None),'banner_login':banner_cfg.get('login',''),'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
-            if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
-            outputs.append(str(output))
+                progress('Проверка нарезки',f'Нарезка {i}/{len(rows)} · проверка таймкодов')
+                mapped,planned=full_cycle.remap_segments(segs,offset,keeps,rendered_timeline=getattr(keeps,'rendered_timeline',None))
+                if abs(actual-planned)>.5:
+                    raise PipelineError(f'Длительность видео {actual:.2f} с не совпала с монтажной картой {planned:.2f} с; таймкоды не сохранены')
+                mapped=full_cycle.clip_segments(mapped,actual)
+                # A partial render is never presented as completed.
+                os.replace(rendered,output)
+                warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
+                category={'reaction':'Реакция на видео','discussion':'Обсуждение / другой интересный момент','game':'Игра целиком'}.get(row.get('type'))
+                heading=('Тип момента: '+category+'\n' if category else '')+'Транскрипт готовой нарезки; времена от начала видео.\n\n'
+                txt.write_text(heading+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
+                banner_scan=getattr(keeps,'banner_scan',None)
+                if banner_scan is not None:
+                    banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
+                atomic_json(meta,{'banner_scan':banner_scan,'banner_mode':('manual' if banner_scan is not None else None),'banner_login':banner_cfg.get('login',''),'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
+                if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
+                outputs.append(str(output))
+        finally:
+            # Ошибка задания: дожидаемся фоновой загрузки, чтобы её файлы не мешали повторной попытке.
+            for state in prefetch.values():state['done'].wait()
         progress('Организация файлов','Собираются готовые нарезки и таймкоды удалённых пауз')
         ready,outputs=organize_clips(folder,job,rows,bool(cfg.get('silence',{}).get('enabled',True)))
-        # Preview failures never trigger a replay of the expensive ChatGPT call.
-        # No preview is applied to YouTube. All candidates require human review.
+        # Previews: ChatGPT remakes a template thumbnail with this clip's caption and context.
+        # Failures never stop the job; previews can be regenerated later from the «Превью» screen.
         preview_cfg=cfg.get('preview',{})
         if preview_cfg.get('enabled',False):
-            import reaction_previews
-            preview_login=preview_cfg.get('test_streamer','') if local_name else login
+            import gpt_previews
+            preview_login=(preview_cfg.get('test_streamer','') if local_name else login) or finder_login
             for i,(row,video) in enumerate(zip(rows,outputs),1):
-                if row.get('type')!='reaction': continue
                 target=Path(video).with_name(Path(video).stem+' — ИИ-превью.jpg')
-                report=target.with_suffix('.json')
-                if target.exists() or report.exists():
-                    progress('Превью',f'Нарезка {i}: ранее созданные файлы не перезаписываются; проверьте вручную')
-                    continue
-                progress('Превью',f'Нарезка {i}/{len(rows)}: поиск видео и сборка превью')
+                if target.exists():
+                    progress('Превью',f'Нарезка {i}: превью уже есть; не перезаписываю');continue
+                progress('Превью',f'Нарезка {i}/{len(rows)}: генерирую превью в ChatGPT')
                 try:
-                    info=reaction_previews.generate(self.root,preview_login,row,segs,target)
-                    atomic_json(report,info)
-                    progress('Превью',f'Нарезка {i}: превью сохранено, источник требует проверки')
-                    for warning in info.get('warnings',[]): progress('Превью',f'Нарезка {i}: {warning}')
+                    info=gpt_previews.generate(self.root,self.finder,preview_login,row,target,preview_cfg,log=lambda m,i=i:progress('Превью',f'Нарезка {i}: {m}'))
+                    progress('Превью',f"Нарезка {i}: превью сохранено (шаблон {info['template']})")
                 except Exception as exc:
                     progress('Превью',f'Нарезка {i}: превью не готово ({type(exc).__name__}): {str(exc)[:250]}')
         progress('Готово',f'Найдено моментов: {len(rows)}; сохранено видео: {len(outputs)}')
