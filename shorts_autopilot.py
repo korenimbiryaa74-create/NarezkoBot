@@ -26,6 +26,7 @@ import upload_limits
 DEFAULT_FACTORY = str(Path.home() / 'Desktop' / 'ShortsFactory')
 MODES = [('stream', 'Моменты со стримов'), ('mixed', 'Мои посты, потом сам'), ('auto', 'Только сам: научные факты'), ('queue', 'Только мои посты и факты')]
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+QUEUE_LIMIT = 50  # max queued Shorts per streamer; extra ones from the oldest streams are deleted
 FINISH_TIMEOUT = 1800  # max wait for YouTube to finish uploading/processing a Short before leaving Chrome open
 
 
@@ -149,6 +150,37 @@ class ShortsStore:
         sets = ','.join(f'{k}=?' for k in fields)
         with self._db() as db:
             db.execute(f'UPDATE items SET {sets},updated_at=? WHERE id=?', (*fields.values(), time.time(), item_id))
+
+    def trim_queue(self, limit=QUEUE_LIMIT):
+        """Не больше limit шортсов в очереди на стримера. Лишние удаляются из самых старых стримов,
+        внутри стрима — сначала самые слабые (моменты стрима добавляются от сильных к слабым)."""
+        removed, files = {}, []
+        with self._db() as db:
+            over = db.execute("SELECT profile, COUNT(*) n FROM items WHERE status='queued' GROUP BY profile HAVING n>?", (limit,)).fetchall()
+            for r in over:
+                rows = db.execute("SELECT id, source_key, video_path FROM items WHERE profile=? AND status='queued' ORDER BY id", (r['profile'],)).fetchall()
+                groups = {}
+                for x in rows:  # группа = стрим (moment:<vod>:<start>), остальное — по одному
+                    key = str(x['source_key'] or '')
+                    g = key.split(':')[1] if key.startswith('moment:') and key.count(':') >= 2 else 'id%d' % x['id']
+                    groups.setdefault(g, []).append(x)
+                extra, drop = r['n'] - limit, []
+                for g in groups.values():  # в порядке появления: старые стримы первыми
+                    for x in reversed(g):
+                        if len(drop) >= extra:
+                            break
+                        drop.append(x)
+                    if len(drop) >= extra:
+                        break
+                db.executemany("DELETE FROM items WHERE id=? AND status='queued'", [(x['id'],) for x in drop])
+                files += [x['video_path'] for x in drop if x['video_path']]
+                removed[r['profile']] = len(drop)
+        for f in files:
+            try:
+                Path(f).unlink()
+            except OSError:
+                pass
+        return removed
 
     def delete_item(self, item_id):
         with self._db() as db:
@@ -295,6 +327,7 @@ class ShortsAutopilot:
         if not self.enabled:
             self.status = 'Выключено'
             return
+        self._trim_queue()
         channels = [c for c in self.store.channels() if c['enabled'] and c['profile'] in linked]
         now = time.time()
         if not channels:
@@ -313,6 +346,13 @@ class ShortsAutopilot:
         self._process(min(due, key=lambda c: c['next_due']))
 
     _extract_failed = {}
+
+    def _trim_queue(self):
+        try:
+            for profile, n in self.store.trim_queue().items():
+                self.log(f'{profile}: в очереди шортсов больше {QUEUE_LIMIT} — удалено старых: {n}')
+        except Exception as exc:
+            self.log(f'Очередь шортсов: не удалось сократить — {type(exc).__name__}: {exc}')
 
     def _extract_moments(self, channels):
         """Нарезанный стрим стримера с каналом в режиме «Моменты со стримов» → ChatGPT размечает моменты → очередь.
@@ -346,6 +386,7 @@ class ShortsAutopilot:
                     self.store.set_title(profile, key, f"{m['title']} · {stsh.hms(m['start'])} · {m['score']}/10")
                     added += 1
             self.log(f"{profile}: из стрима {s['vod_id']} в очередь шортсов добавлено моментов — {added}")
+        self._trim_queue()
         self.wake.set()
         return True
 

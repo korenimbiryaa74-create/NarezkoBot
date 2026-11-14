@@ -1062,15 +1062,42 @@ def validate_publication_plan(row):
         raise StudioError('У старого задания нет расписания для этой нарезки; создайте новое задание')
 
 
+def _reattach_studio_tab(browser,tab):
+    """Та же вкладка заново, а если её закрыли — любая открытая вкладка Studio этого Chrome."""
+    try:
+        tab.reconnect();return tab
+    except Exception:
+        pass
+    if browser.port:
+        try:
+            pages=local_json(f'http://127.0.0.1:{browser.port}/json/list')
+            page=next((p for p in pages if p.get('type')=='page' and p.get('webSocketDebuggerUrl')
+                       and p.get('url','').startswith('https://studio.youtube.com/')),None)
+            if page:
+                new=CDP(page['webSocketDebuggerUrl']);new.call('Runtime.enable')
+                browser.tab=new
+                return new
+        except (OSError,ValueError,KeyError):
+            pass
+    return tab
+
+
 class YouTubeStudio:
     def __init__(self,root): self.root=Path(root)
     def connect(self,profile,ready_event,opened_event=None,timeout=600):
         with profile_lock(profile):
-            with Browser(self.root,profile) as tab:
+            browser=Browser(self.root,profile)
+            with browser as tab:
                 if opened_event is not None: opened_event.set()
                 if not ready_event.wait(timeout):
                     raise StudioError('Время входа истекло; повторите подключение')
-                return channel_ready(tab,timeout=30)
+                # Пока человек минутами входит в Google, соединение с вкладкой часто рвётся
+                # (ConnectionAbortedError). Проверка канала только читает страницу — переподключаемся.
+                for attempt in range(3):
+                    try:return channel_ready(tab,timeout=30)
+                    except Exception as exc:
+                        if attempt==2 or not CDP.is_disconnect(exc):raise
+                    tab=_reattach_studio_tab(browser,tab)
     def submit(self,tab,browser,row,progress=None):
         validate_publication_plan(row)
         expected=row['channel_id']
