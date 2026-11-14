@@ -390,6 +390,28 @@ class UploadLimitReached(StudioError):
     """Channel's daily upload limit: Studio keeps a draft but will not upload it for 24 hours."""
 
 
+LIMIT_MESSAGE=('YouTube: исчерпан дневной лимит загрузок канала («Загрузка недоступна… через 24 часа»). '
+               'Удалите черновик этой нарезки в Studio; остальные нарезки остаются в очереди. '
+               'Лимит снимается через 24 часа или после расширенной проверки канала')
+
+
+def raise_if_limit(tab):
+    if tab.js(_LIMIT_TEXT):raise UploadLimitReached(LIMIT_MESSAGE)
+
+
+_DONE_ENABLED="[...document.querySelectorAll('ytcp-uploads-dialog #done-button button')].some(e=>e.getClientRects().length&&!e.disabled&&e.getAttribute('aria-disabled')!=='true')"
+
+
+def wait_done_enabled(tab,timeout=1800):
+    """Ждём активную «Опубликовать/Сохранить»; баннер дневного лимита появляется и на шаге доступа —
+    тогда кнопка не станет активной никогда, ждать 30 минут бессмысленно."""
+    deadline=time.monotonic()+timeout
+    while not tab.js(_DONE_ENABLED):
+        raise_if_limit(tab)
+        if time.monotonic()>deadline:return
+        time.sleep(1)
+
+
 _LIMIT_TEXT=r"""(()=>{const d=[...document.querySelectorAll('ytcp-uploads-dialog')].find(e=>e.getClientRects().length);
   const t=(d?d.innerText:'')||'';
   return /(?:загрузка недоступна|можно будет через 24 часа|daily upload limit|upload limit reached|try again in 24 hours)/i.test(t)})()"""
@@ -1145,6 +1167,7 @@ class YouTubeStudio:
                 time.sleep(.3)
                 if tab.js(visibility):break
         wait(tab,visibility,30,'Не открылись настройки доступа')
+        raise_if_limit(tab)
         if row['publish_at'] is None:
             radio='tp-yt-paper-radio-button[name="PUBLIC"]'
             click(tab,radio)
@@ -1156,7 +1179,9 @@ class YouTubeStudio:
         channel_ready(tab,expected,timeout=5)
         candidate=upload_video_id(tab)
         # The enabled button can precede upload/check completion.
-        click(tab,'ytcp-uploads-dialog #done-button button',timeout=1800)
+        wait_done_enabled(tab,timeout=1800)
+        raise_if_limit(tab)
+        click(tab,'ytcp-uploads-dialog #done-button button',timeout=60)
         if progress:progress('Запрос публикации отправлен; ожидаю подтверждение Studio')
         try:
             return wait_for_submission(tab,candidate_id=candidate,progress=progress,timeout=90)
