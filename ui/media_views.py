@@ -191,18 +191,36 @@ class BlurView:
                  subtitle='Для каждого стримера настройте профиль или укажите «Без блюра». Сохранённый стример добавляется в мониторинг.'),
         ],spacing=16,scroll=ft.ScrollMode.AUTO,expand=True)
 
+    def _all_logins(self):
+        """Все стримеры из мониторинга и карточек каналов + уже сохранённые профили блюра."""
+        c=self.app.config;names=[]
+        for raw in list(c.get('streamers',[]))+list((c.get('streamer_modes') or {}).keys())+manual_blur.profile_logins(self.app.root):
+            try:n=manual_blur.normalize_login(raw)
+            except ValueError:continue
+            if n!='__test__' and n not in names:names.append(n)
+        return names
+
     def refresh(self,snap):
         rows=[]
-        for name in manual_blur.profile_logins(self.app.root):
+        for name in self._all_logins():
+            if not manual_blur.profile_path(self.app.root,name).exists():
+                rows.append((name,'missing'));continue
             try:n=len(manual_blur.load_profile(self.app.root,name)['boxes'])
             except Exception:n=None
             rows.append((name,n))
+        rows.sort(key=lambda r:(r[1]!='missing',r[0]))    # ненастроенные — сверху
         if rows==self._key:return
         self._key=rows
+        def label(n):
+            if n=='missing':return chip('не настроен','warn')
+            if n==0:return chip('Без блюра','muted')
+            if n is None:return chip('ошибка профиля','error')
+            return chip(f'областей: {n}','info')
         self.profiles.controls=[ft.Container(ft.Row([ft.Icon(ft.Icons.PERSON,size=18,color=MUTED),ft.Text(name,size=14,weight=ft.FontWeight.W_600,expand=True),
-                                                     chip('Без блюра' if n==0 else ('ошибка профиля' if n is None else f'областей: {n}'),'muted' if n==0 else ('error' if n is None else 'info')),
-                                                     ft.IconButton(ft.Icons.EDIT,tooltip='Изменить по последней записи',on_click=lambda e,name=name:self.app.spawn(self._from_twitch,name))],spacing=12),
-                                             padding=ft.Padding.symmetric(horizontal=12,vertical=6),bgcolor='#1d2026',border_radius=10) for name,n in rows] or [empty('Профилей пока нет')]
+                                                     label(n),
+                                                     ft.IconButton(ft.Icons.EDIT,tooltip='Настроить по последней записи',on_click=lambda e,name=name:self.app.spawn(self._from_twitch,name)),
+                                                     ft.IconButton(ft.Icons.BLUR_OFF,tooltip='Без блюра',on_click=lambda e,name=name:self.app.spawn(self._no_blur,name))],spacing=6),
+                                             padding=ft.Padding.symmetric(horizontal=12,vertical=4),bgcolor='#1d2026',border_radius=10) for name,n in rows] or [empty('Стримеров пока нет')]
 
     async def _save(self):
         value=bool(self.enabled.value);login=(self.streamer.value or '').strip().lower()
@@ -227,8 +245,8 @@ class BlurView:
         try:await BlurPicker(self.app,name,image,lambda:self._saved(name)).run()
         except Exception as exc:await self.app.dialogs.error('Блюр',str(exc))
 
-    async def _no_blur(self):
-        name=await self._login()
+    async def _no_blur(self,name=None):
+        name=await self._login(name)
         if not name:return
         if not await self.app.dialogs.confirm('Без блюра',f'Сохранить профиль {name} без блюра? Старые области этого профиля будут заменены.'):return
         try:manual_blur.save_profile(self.app.root,name,[]);self._saved(name)

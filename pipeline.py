@@ -596,7 +596,12 @@ class Pipeline:
             if not blur_login:
                 raise banner_blur.BannerSetupError('Для тестового видео укажите ник стримера в настройках блюра')
             banner_cfg['login']=manual_blur.normalize_login(blur_login)
-            banner_cfg['profile']=manual_blur.load_profile(self.root,blur_login)
+            if manual_blur.profile_path(self.root,blur_login).exists():
+                banner_cfg['profile']=manual_blur.load_profile(self.root,blur_login)
+            else:
+                # Новый стример без профиля: не роняем всю запись, режем без блюра и сообщаем.
+                banner_cfg['enabled']=False
+                progress('Подготовка',f"Блюр для {banner_cfg['login']} не настроен — нарезки без блюра (настройте в разделе «Блюр»)")
         folder=job_output_folder(self.root,job)
         folder.mkdir(parents=True,exist_ok=True)
         work=folder/'_work'; work.mkdir(exist_ok=True)
