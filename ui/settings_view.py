@@ -26,8 +26,13 @@ class SettingsView:
             'onset':T('Порог над шумом, дБ',width=220),'height':T('Максимальная высота видео',width=220),
             'groq_enabled':S('Использовать Groq; при ошибке — локальный Whisper'),
             'groq_api_key':T('Groq API key',password=True,can_reveal_password=True,expand=True),
+            'long_mode':ft.Dropdown(label='Стрим длиннее лимита',width=440,value='normal',
+                                    options=[ft.DropdownOption(key='normal',text='Обычный — только первые N часов'),
+                                             ft.DropdownOption(key='full',text='Запасной — весь стрим частями по очереди')]),
+            'long_hours':T('Лимит, часов',width=160,keyboard_type=ft.KeyboardType.NUMBER),
         }
         f=self.f
+        f['long_mode'].on_select=self._changed
         self.streamer_chips=ft.Column(spacing=6)
         self.new_streamer=ft.TextField(label='Добавить стримера (Twitch-ник)',width=280,on_submit=self._add_streamer)
         self.gpt_list=ft.Column(spacing=8);self.gpt_busy={};self._gpt_key=None
@@ -48,6 +53,11 @@ class SettingsView:
             card(ft.Row([f['quality'],f['threads'],f['min_reaction'],f['bridge']],spacing=12,wrap=True),
                  ft.Row([f['keep_original'],f['remove_donations']],spacing=20,wrap=True),
                  title='Обработка',icon=ft.Icons.MOVIE_FILTER),
+            card(ft.Row([f['long_mode'],f['long_hours']],spacing=12,wrap=True),
+                 muted('Для всех стримеров. Обычный: если стрим длиннее лимита, скачиваются и обрабатываются только первые N часов. '
+                       'Запасной (например, на выход GTA 6): весь стрим делится на части не длиннее N часов — 40 ч → 4 части, 30 ч → 3 — '
+                       'и части по очереди отправляются в ChatGPT; лимит нарезок стримера действует на каждую часть.',size=12),
+                 title='Длинные стримы',icon=ft.Icons.SCHEDULE),
             card(f['silence'],ft.Row([f['min_cut'],f['max_gap'],f['onset'],f['height']],spacing=12,wrap=True),
                  title='Удаление тишины',icon=ft.Icons.GRAPHIC_EQ),
             card(f['groq_enabled'],ft.Row([f['groq_api_key'],ft.OutlinedButton('Импорт из старого config.json',icon=ft.Icons.FILE_OPEN,on_click=lambda e:app.spawn(self._import_groq))],spacing=12),
@@ -99,7 +109,9 @@ class SettingsView:
                 'groq_enabled':p['speech']['groq_enabled'],'groq_api_key':p['speech']['groq_api_key'],
                 'quality':p['quality'],'threads':p['download_threads'],'min_reaction':p['min_reaction_minutes'],'bridge':p['bridge_minutes'],
                 'silence':s['enabled'],'min_cut':s['min_cut'],'max_gap':s['max_gap'],'onset':s['onset_db'],'height':s['max_height'],
-                'keep_original':p['keep_original'],'remove_donations':p['remove_donations']}
+                'keep_original':p['keep_original'],'remove_donations':p['remove_donations'],
+                'long_mode':(p.get('long_stream') or {}).get('mode','normal'),
+                'long_hours':f"{float((p.get('long_stream') or {}).get('limit_hours',10)):g}"}
         for k,v in values.items():
             f[k].value=bool(v) if isinstance(f[k],ft.Switch) else ('' if v is None else str(v))
         self.streamers=list(c['streamers'])
@@ -123,7 +135,8 @@ class SettingsView:
             c['monitor'].update(interval=t('interval'))
             c['proxy']={'enabled':bool(v('proxy_enabled')),'url':t('proxy_url'),'twitch_api':bool(v('proxy_twitch')),'chatgpt':bool(v('proxy_chatgpt')),'groq':bool(v('proxy_groq'))}
             p=c['pipeline'];p.update(quality=t('quality'),download_threads=t('threads'),min_reaction_minutes=t('min_reaction'),bridge_minutes=t('bridge'),
-                                     keep_original=bool(v('keep_original')),remove_donations=bool(v('remove_donations')))
+                                     keep_original=bool(v('keep_original')),remove_donations=bool(v('remove_donations')),
+                                     long_stream={'mode':v('long_mode') or 'normal','limit_hours':t('long_hours') or '10'})
             p['speech'].update(groq_enabled=bool(v('groq_enabled')),groq_api_key=t('groq_api_key'))
             p['silence'].update(enabled=bool(v('silence')),min_cut=t('min_cut'),max_gap=t('max_gap'),onset_db=t('onset'),max_height=t('height'))
             self.app.config=self.app.settings.save(c);self.app.service.settings_changed()

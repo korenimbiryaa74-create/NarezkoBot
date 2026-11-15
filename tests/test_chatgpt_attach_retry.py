@@ -149,6 +149,7 @@ class AttachRetryTests(unittest.TestCase):
                     text='prompt' if not self.clicks else text_after_click
                     return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':text,'key':'a','hit':False,'users':0,'assistants':0}
                 if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                if self_web.JS_DISMISS in expr:return {'items':[]}  # popup check, not a send click
                 self.clicks+=1;return True
         self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt'
         def sleep(delay):clock[0]+=delay
@@ -201,6 +202,7 @@ class AttachRetryTests(unittest.TestCase):
                     self.polls+=1
                     return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':'prompt','key':str(self.polls),'hit':False,'users':1 if self.clicks else 0,'assistants':0}
                 if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                if self_web.JS_DISMISS in expr:return {'items':[]}  # popup check, not a send click
                 self.clicks+=1;return True
         self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt';self.web._send_baseline={'users':0,'assistants':0}
         def sleep(delay):clock[0]+=delay

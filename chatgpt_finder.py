@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 import full_cycle
+import long_streams
 import reactions
 
 class ChatGPTFinder:
@@ -250,21 +251,30 @@ class ChatGPTFinder:
             names={'reaction':'реакции','discussion':'разговоры','game':'игры'}
             progress('Поиск реакций','Для стримера включены: '+', '.join(names[k] for k in kinds))
         if int(mode.get('max_clips') or 0):progress('Поиск реакций',f"Лимит стримера: не больше {int(mode['max_clips'])} нарезок за стрим")
-        game_doc=''
+        manual=cfg.get('_manual_reactions')
+        # «Запасной» режим длинных стримов: весь стрим частями по очереди (сохранённый ручной ответ — как раньше, целиком).
+        n_parts=1 if manual is not None else long_streams.full_parts(cfg,duration)
+        game_doc='';game_info=None
         if want_g and cfg.get('_vod_id') and cfg.get('_work') and cfg.get('_cli'):
             # Chat and Twitch chapters are fetched only for streamers with «Игры» enabled.
             import twitch_vod
-            try:game_doc=twitch_vod.game_context(cfg['_vod_id'],cfg['_work'],cfg['_cli'],duration,
-                                                    progress=lambda m:progress('Поиск реакций',m))
+            try:
+                if n_parts>1:game_info=long_streams.game_data(cfg['_vod_id'],cfg['_work'],cfg['_cli'],duration,
+                                                             progress=lambda m:progress('Поиск реакций',m))
+                else:game_doc=twitch_vod.game_context(cfg['_vod_id'],cfg['_work'],cfg['_cli'],duration,
+                                                      progress=lambda m:progress('Поиск реакций',m))
             except Exception as exc:
                 progress('Поиск реакций',f'Чат Twitch недоступен ({type(exc).__name__}: {str(exc)[:150]}); игры ищу только по речи')
         elif want_g:
             progress('Поиск реакций','Тестовый файл: данных чата нет, игры ищу только по речи')
-        manual=cfg.get('_manual_reactions')
         if manual is not None: progress('Поиск реакций','Используется сохранённый ответ ChatGPT; повторного запроса не будет')
         import youtube_titles
         import lang as lang_mod
         display=lang_mod.display_name(streamer,youtube_titles.ALIASES) if streamer else ''
+        if n_parts>1:
+            if int(mode.get('max_clips') or 0):progress('Поиск реакций','Лимит нарезок стримера действует на каждую часть отдельно')
+            return long_streams.find_in_parts(video,segs,duration,settings,n_parts,self._ask_document,who=display,
+                                              game=game_info,work=cfg.get('_work'),log=lambda message:progress('Поиск реакций',message))
         result=reactions.find_reactions_whole(video,segs,duration,settings,
             extra={'chatgpt_doc':self._ask_document,'game_doc':game_doc},who=display, manual_answer=manual,
             log=lambda message:progress('Поиск реакций',message))

@@ -7,6 +7,7 @@ from monitor import normalize_login
 from pipeline import atomic_json
 from proxy_setup import parse_proxy
 from youtube_descriptions import DEFAULT_FOOTER
+import long_streams
 
 DEFAULTS={
  'twitch':{'client_id':'','client_secret':''},
@@ -16,7 +17,7 @@ DEFAULTS={
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
              'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
-             'keep_original':False,'remove_donations':True,'preview':{'enabled':False,'test_streamer':'','templates':{},'prompts':{}},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
+             'keep_original':False,'remove_donations':True,'long_stream':dict(long_streams.DEFAULT),'preview':{'enabled':False,'test_streamer':'','templates':{},'prompts':{}},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
 
 def merge(base, override):
     result=copy.deepcopy(base)
@@ -62,6 +63,7 @@ def validate(config):
         q[key]=float(q[key])
         if not 0<=q[key]<=180: raise ValueError('Время реакции: от 0 до 180 минут')
     if not isinstance(q['remove_donations'],bool): raise ValueError('Некорректная настройка удаления донатов')
+    q['long_stream']=long_streams.normalize(q.get('long_stream'))
     preview=q.get('preview')
     if not isinstance(preview,dict) or not isinstance(preview.get('enabled'),bool): raise ValueError('Некорректная настройка превью')
     test_login=preview.get('test_streamer','')

@@ -1047,7 +1047,7 @@ def _log_coverage(ans, dur, offset, log):
         pass
 
 
-def find_reactions_whole(video, segs, dur, cfg, proxies=None, extra=None, who='', log=print, offset=0.0, manual_answer=None):
+def find_reactions_whole(video, segs, dur, cfg, proxies=None, extra=None, who='', log=print, offset=0.0, manual_answer=None, note=''):
     rc = dict(DEFAULTS, **{k: v for k, v in (cfg.get('reactions') or {}).items() if k in DEFAULTS})
     if not segs:
         raise ReactionsError('в транскрипте не нашлось речи')
@@ -1073,6 +1073,8 @@ def find_reactions_whole(video, segs, dur, cfg, proxies=None, extra=None, who=''
     missing = [k for k in ('reaction', 'discussion') if k not in kinds]
     if missing:
         instr += '\nДля этого стримера НЕ нужны фрагменты ' + ' и '.join(KIND_NAMES[k] for k in missing) + ' — не добавляй их.\n'
+    if note:
+        instr += note  # long stream part (long_streams.find_in_parts)
     _last_request[video] = (instr, doc, fname)
     if manual_answer is not None:
         used, ans = ('ответ вручную', parse_reaction_answer(manual_answer))
@@ -1080,7 +1082,10 @@ def find_reactions_whole(video, segs, dur, cfg, proxies=None, extra=None, who=''
         fn = (extra or {}).get('chatgpt_doc')
         if not fn:
             raise ReactionsError('для этой кнопки нужен ChatGPT через аккаунты бота')
-        log(f'[RX] ChatGPT: один файл, полный транскрипт — {len(segs)} фраз, {len(doc)} знаков; без разбиения')
+        if note:
+            log(f'[RX] ChatGPT: часть длинного стрима — {len(segs)} фраз, {len(doc)} знаков')
+        else:
+            log(f'[RX] ChatGPT: один файл, полный транскрипт — {len(segs)} фраз, {len(doc)} знаков; без разбиения')
         raw = fn(instr, doc, fname, int(rc.get('chatgpt_timeout') or 900), log=log, need='reactions')
         try:
             with open(os.path.splitext(video)[0] + '.rx_reactions_chatgpt.txt', 'w', encoding='utf-8') as f:

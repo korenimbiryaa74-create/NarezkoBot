@@ -25,6 +25,7 @@ import stream_cutter
 import transcribe
 import whisper_cpp
 import groq_speech
+import long_streams
 from job_store import JobStore
 
 class PipelineError(RuntimeError): pass
@@ -614,6 +615,7 @@ class Pipeline:
                     raise PipelineError('Не удалось прочитать тестовый файл') from exc
                 if stamp != {'size':job.get('local_size'),'mtime_ns':job.get('local_mtime_ns')}:
                     raise PipelineError('Тестовый файл изменился после постановки в очередь; добавьте его заново')
+        head_limit=None  # «обычный» режим длинных стримов: только первые N часов
         if local_name:
             progress('Скачивание','Проверка локального тестового файла: '+local_name)
             check_local()
@@ -623,6 +625,12 @@ class Pipeline:
             src=work/'full-160p.mp4'
             progress('Скачивание','Загружается запись для транскрибации')
             expected=job.get('duration_seconds')
+            head_limit=long_streams.normal_limit(cfg,expected)
+            if head_limit:
+                progress('Скачивание',f'Стрим {timestamp(float(expected))} длиннее {head_limit/3600:g} ч — режим «обычный»: '
+                                      f'скачиваю и обрабатываю только первые {head_limit/3600:g} ч')
+                if not src.exists():src=work/f'first-{int(head_limit)}s-160p.mp4'
+                expected=head_limit
             def check_duration(path):
                 actual=media_duration(path)
                 if expected and actual < float(expected)-max(5.,float(expected)*.005):
@@ -640,9 +648,17 @@ class Pipeline:
                 temp=work/'full-160p.downloading.mp4'
                 if temp.exists(): temp.unlink() # only our own explicitly named temporary file
                 with report_wait(lambda text:progress('Скачивание',text),'Загрузка VOD через TwitchDownloader ещё выполняется'):
-                    self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
+                    if head_limit and src.name.startswith('first-'):
+                        self.download(vod_id,'160p30',temp,begin=0,end=head_limit,cli=cli,threads=threads)
+                    else:
+                        self.download(vod_id,'160p30',temp,cli=cli,threads=threads)
                 duration=check_duration(temp) # do not promote a partial VOD into the cache
                 os.replace(temp,src)
+        head=long_streams.normal_limit(cfg,duration)
+        if head and duration>head:
+            if not head_limit:
+                progress('Транскрибация',f'Запись {timestamp(duration)} длиннее {head/3600:g} ч — режим «обычный»: обрабатываю только первые {head/3600:g} ч')
+            duration=head
         cache=test_transcript_cache(self.root,src,job,progress,check_local) if local_name else work/'transcripts'
         check_local()
         segs,duration=self.speech(src,cache,cfg.get('speech',{}),progress,duration=duration)
