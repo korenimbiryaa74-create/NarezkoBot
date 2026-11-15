@@ -239,7 +239,7 @@ class ChatGPTWeb:
             self.tab = None
         if self._debug_port_busy() and not self._close_stale_chrome():
             raise ChatGPTWebError('Порт браузера ChatGPT занят; закройте старое окно приложения и повторите')
-        args = [self._chrome_path(), f'--remote-debugging-port={self.port}', '--remote-debugging-address=127.0.0.1', f'--user-data-dir={self.profile}', '--no-first-run', '--no-default-browser-check', '--disable-session-crashed-bubble', '--disable-blink-features=AutomationControlled', '--remote-allow-origins=*', '--window-size=1400,1000']
+        args = [self._chrome_path(), f'--remote-debugging-port={self.port}', '--remote-debugging-address=127.0.0.1', f'--user-data-dir={self.profile}', '--no-first-run', '--no-default-browser-check', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble', '--disable-blink-features=AutomationControlled', '--remote-allow-origins=*', '--window-size=1400,1000']
         if self.headless:
             args.append('--headless=new')
         elif self.offscreen:
@@ -248,6 +248,7 @@ class ChatGPTWeb:
         if bridge_args:
             args.extend(bridge_args)
             self._log(f'прокси: {proxy_setup.describe()}')
+        self._mark_clean_exit()
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _OWN_CHROME_PIDS.add(self.proc.pid)
         self._log(f'Chrome pid {self.proc.pid}')
@@ -258,6 +259,22 @@ class ChatGPTWeb:
             except Exception:
                 time.sleep(0.5)
         raise ChatGPTWebError('Chrome не поднял CDP-порт')
+
+    def _mark_clean_exit(self):
+        """Chrome was killed last time -> it shows «Восстановить страницы?». Mark the profile as cleanly closed."""
+        prefs = os.path.join(self.profile or '', 'Default', 'Preferences')
+        try:
+            with open(prefs, encoding='utf-8') as f:
+                data = json.load(f)
+            prof = data.setdefault('profile', {})
+            if prof.get('exit_type') == 'Normal' and prof.get('exited_cleanly') is True:
+                return
+            prof['exit_type'] = 'Normal'
+            prof['exited_cleanly'] = True
+            with open(prefs, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _open_tab(self, url: str) -> Tab:
         try:
@@ -451,6 +468,71 @@ class ChatGPTWeb:
     ))
     JS_CLICK_SEND = "(()=>{\nconst state=%s;\nconst b=Array.from(document.querySelectorAll('button')).find(n=>n.dataset.twlSend===state.key);\nif(!b||b.disabled||b.getAttribute('aria-disabled')==='true'||!b.getClientRects().length)return false;\nb.click();return true;\n})()"
 
+    # Promo/upsell modals («Получите месяц ChatGPT Plus бесплатно» и т.п.) steal focus from the composer, so the
+    # prompt can't be typed. Close every such window with its own close button (крестик / «Не сейчас»).
+    # Windows about limits, login or upload errors are left alone: other checks read them.
+    JS_DISMISS = r'''((dry)=>{
+const vis=n=>{if(!n||!n.getClientRects().length)return false;const s=getComputedStyle(n);return s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
+const composer=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');
+const keep=/лимит|limit|quota|квот|загрузка не удалась|upload failed|войд|войти|log ?in|sign ?in|сеанс|session|ошибк|error|подтверд|verify|captcha/i;
+const sel='[role="dialog"],[role="alertdialog"],[aria-modal="true"],[data-testid^="modal"],[data-testid*="-modal"]';
+let roots=Array.from(document.querySelectorAll(sel)).filter(vis).filter(d=>!(composer&&d.contains(composer))&&!d.closest('form'));
+if(composer){
+  const r=composer.getBoundingClientRect();
+  if(r.width&&r.height){
+    const h=document.elementFromPoint(r.x+Math.min(r.width/2,200),r.y+r.height/2);
+    if(h&&h!==composer&&!composer.contains(h)&&!h.contains(composer)&&!h.closest('form')){
+      let p=h,fix=null;
+      while(p&&p!==document.body){const cs=getComputedStyle(p);if(cs.position==='fixed')fix=p;p=p.parentElement;}
+      if(fix&&!fix.contains(composer)&&!roots.includes(fix))roots.push(fix);
+    }
+  }
+}
+roots=roots.filter(d=>!roots.some(o=>o!==d&&o.contains(d)));
+const lab=n=>(n.getAttribute('aria-label')||n.getAttribute('title')||'').trim();
+const closeLabel=/^(?:close|закрыть|dismiss|скрыть|hide)\b/i;
+const closeText=/^(?:close|закрыть|dismiss|maybe later|not now|не сейчас|позже|может быть,? позже|нет,? спасибо|no,? thanks|skip|пропустить|got it|понятно|ок|ok)$/i;
+const items=[];
+for(const d of roots){
+  const text=(d.innerText||'').trim().replace(/\s+/g,' ');
+  if(keep.test(text)){items.push({text:text.slice(0,90),kept:true});continue;}
+  const btns=Array.from(d.querySelectorAll('button,[role="button"]')).filter(vis);
+  let b=btns.find(n=>closeLabel.test(lab(n))||/close/i.test(n.getAttribute('data-testid')||''));
+  if(!b)b=btns.find(n=>closeText.test((n.innerText||'').trim()));
+  if(!b){const r=d.getBoundingClientRect();b=btns.find(n=>{const q=n.getBoundingClientRect();return !(n.innerText||'').trim()&&n.querySelector('svg')&&q.top-r.top<80&&r.right-q.right<80;});}
+  if(b&&!dry)b.click();
+  items.push({text:text.slice(0,90),button:b?(lab(b)||(b.innerText||'').trim()||'крестик'):null});
+}
+return {items};
+})'''
+
+    def _dismiss_popups(self, force: bool=False) -> int:
+        """Close promo/upsell popups that block the composer. Returns how many were closed."""
+        now = time.monotonic()
+        if not force and now - getattr(self, '_last_dismiss', 0.0) < 2.0:
+            return 0
+        self._last_dismiss = now
+        try:
+            res = self.tab.js('(' + self.JS_DISMISS + ')(false)') or {}
+        except Exception:
+            return 0
+        items = res.get('items') or [] if isinstance(res, dict) else []
+        closed = [i for i in items if i.get('button')]
+        stuck = [i for i in items if not i.get('button') and not i.get('kept')]
+        for i in closed:
+            self._log(f'закрыл всплывающее окно «{i.get("text", "")[:70]}» (кнопка: {i.get("button")})')
+        if stuck:
+            try:
+                for kind in ('keyDown', 'keyUp'):
+                    self.tab.call('Input.dispatchKeyEvent', type=kind, key='Escape', code='Escape',
+                                  windowsVirtualKeyCode=27, nativeVirtualKeyCode=27)
+                self._log(f'окно без крестика «{stuck[0].get("text", "")[:70]}» — нажал Escape')
+            except Exception:
+                pass
+        if closed or stuck:
+            time.sleep(0.8)
+        return len(closed)
+
     def _wait_ready(self, wait: int=None, settle: float=2.5) -> dict | None:
         deadline = time.time() + self._remaining(wait or self.load_timeout)
         mark, since = (None, 0.0)
@@ -459,6 +541,7 @@ class ChatGPTWeb:
             if time.monotonic() >= next_status:
                 self._status('ожидаю готовности поля ввода в браузере')
                 next_status=time.monotonic()+15
+            self._dismiss_popups()
             try:
                 st = self.tab.js(self.JS_READY) or {}
             except Exception:
@@ -521,6 +604,7 @@ class ChatGPTWeb:
         tab = self.tab
         want = self._norm(prompt)
         for attempt in range(3):
+            self._dismiss_popups(force=True)
             box = tab.js("(()=>{const e=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');if(!e)return null;e.scrollIntoView({block:'center'});e.focus();const r=e.getBoundingClientRect();return {x:r.x+Math.min(r.width/2,200),y:r.y+r.height/2};})()")
             if not box:
                 self._wait_ready(30)
@@ -558,6 +642,7 @@ class ChatGPTWeb:
         except Exception:
             pass
         while time.monotonic() < deadline:
+            self._dismiss_popups()
             st = tab.js(self.JS_SEND_STATE) or {}
             if int(st.get('users', 0)) > before_users or int(st.get('assistants', 0)) > before_assistants or (st.get('stop') and (clicks or not baseline.get('stop'))):
                 self._send_uncertain = False
@@ -711,6 +796,7 @@ class ChatGPTWeb:
                 raise ChatGPTWebError('не залогинились в ChatGPT — куки протухли, переэкспортируй их из браузера')
             self._status('чат готов, проверяю интерфейс')
             tab = self.tab
+            self._dismiss_popups(force=True)
             page = self._page_id()
             self._send_baseline = tab.js(self.JS_SEND_STATE) or {}
             known = set(tab.js(self.JS_IMGS) or [])
