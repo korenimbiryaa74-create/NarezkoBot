@@ -66,6 +66,8 @@ def parse_count(text):
 
 
 def _initial(html):
+    if 'consent.youtube.com' in html[:2000]:
+        raise StatsError('YouTube показал страницу согласия с cookies (consent) вместо канала')
     m = re.search(r'(?:var ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*?\});\s*</script>', html, re.S)
     if not m:
         raise StatsError('YouTube вернул страницу без данных канала')
@@ -131,6 +133,10 @@ def _session():
     if s is None:
         s = _local.session = requests.Session()
         s.headers.update(HEADERS)
+        # Без этих cookies YouTube (ЕС и др.) перенаправляет на consent.youtube.com — страницу
+        # согласия без ytInitialData, и статистика падает с «страницей без данных канала».
+        for name, value in (('SOCS', 'CAI'), ('CONSENT', 'YES+cb')):
+            s.cookies.set(name, value, domain='.youtube.com', path='/')
     return s
 
 

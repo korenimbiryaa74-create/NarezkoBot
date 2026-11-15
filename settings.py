@@ -2,6 +2,7 @@
 from __future__ import annotations
 import copy
 import json
+import re
 from pathlib import Path
 from monitor import normalize_login
 from pipeline import atomic_json
@@ -75,6 +76,11 @@ def validate(config):
     prompts=preview.get('prompts') if isinstance(preview.get('prompts'),dict) else {}
     preview['prompts']={normalize_login(k):str(v).replace('\r\n','\n').strip()[:2000] for k,v in prompts.items()
                         if str(k).strip() and isinstance(v,str) and v.strip()}
+    # Per-streamer YouTube channels to take preview samples from (links, @handles or UC ids).
+    chans=preview.get('channels') if isinstance(preview.get('channels'),dict) else {}
+    preview['channels']={normalize_login(k):[str(x).strip() for x in (v if isinstance(v,list) else re.split(r'[\s,;]+',str(v or ''))) if str(x).strip()][:20]
+                         for k,v in chans.items() if str(k).strip() and v}
+    preview['channels']={k:v for k,v in preview['channels'].items() if v}
     if not isinstance(q['banner_blur'],dict) or not isinstance(q['banner_blur'].get('enabled'),bool): raise ValueError('Некорректная настройка блюра баннеров')
     q['banner_blur']['interval']=int(q['banner_blur']['interval'])
     if not 1<=q['banner_blur']['interval']<=60: raise ValueError('Интервал поиска баннеров: от 1 до 60 секунд')

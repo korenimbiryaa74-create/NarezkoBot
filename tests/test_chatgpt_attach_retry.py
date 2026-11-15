@@ -168,6 +168,52 @@ class AttachRetryTests(unittest.TestCase):
         self.assertEqual(self._send_with_fake('prompt'),3)
         self.assertTrue(any('нажимаю «Отправить» ещё раз' in event for event in self.events))
 
+    def _send_with_probe(self,landed,send_after=None):
+        # landed: does the page register the press on the button; send_after: press number that finally sends
+        clock=[0.0]
+        class Fake:
+            def __init__(self):self.clicks=0;self.pclick=0;self.times=[]
+            def call(self,*a,**kw):return {}
+            def js(self,expr):
+                if expr==self_web.JS_SEND_STATE:
+                    sent=send_after is not None and self.clicks>=send_after
+                    return {'has':True,'disabled':False,'stop':False,'uploading':False,'text':'' if sent else 'prompt',
+                            'key':'a','hit':False,'users':1 if sent else 0,'assistants':0,'pclick':self.pclick,'pdown':self.pclick}
+                if expr==chatgpt_attach.JS_QUOTA:return {'blocked':False}
+                if self_web.JS_DISMISS in expr:return {'items':[]}
+                self.clicks+=1;self.times.append(clock[0])
+                if landed:self.pclick+=1
+                return True
+        self_web=self.web;self.web.tab=Fake();self.web._pending_prompt='prompt';self.web._send_baseline={'users':0,'assistants':0}
+        def sleep(delay):clock[0]+=delay
+        with patch('chatgpt_web.time.monotonic',side_effect=lambda:clock[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+            if send_after:result=self.web._send(wait_upload=60)
+            else:
+                with self.assertRaises(ChatGPTWebError):self.web._send(wait_upload=60)
+                result=None
+        return self.web.tab,result
+
+    def test_click_that_missed_button_is_retried_quickly(self):
+        tab,_=self._send_with_probe(landed=False)
+        self.assertEqual(tab.clicks,4)  # first press + 3 quick retries, then stop
+        self.assertLess(tab.times[1]-tab.times[0],3)
+        self.assertTrue(any('клик не дошёл до кнопки' in e for e in self.events))
+
+    def test_landed_click_without_send_waits_before_retry(self):
+        tab,_=self._send_with_probe(landed=True)
+        self.assertEqual(tab.clicks,3)
+        self.assertGreaterEqual(tab.times[1]-tab.times[0],8)
+        self.assertTrue(any('клик дошёл до кнопки' in e for e in self.events))
+        self.assertTrue(any('повторного клика не будет' in e for e in self.events))
+
+    def test_retry_stops_once_sent(self):
+        tab,result=self._send_with_probe(landed=True,send_after=2)
+        self.assertTrue(result);self.assertEqual(tab.clicks,2)
+
+    def test_probe_is_injected_into_send_state(self):
+        self.assertIn('__twlProbe',self.web.JS_SEND_STATE)
+        self.assertIn('pclick:pr.click',self.web.JS_SEND_STATE)
+
     def test_upload_failure_is_retryable(self):
         from chatgpt_errors import ChatGPTUploadFailed
         class Fake:

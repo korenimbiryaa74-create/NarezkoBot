@@ -89,7 +89,8 @@ class SettingsView:
             kind='гибрид' if r and d else ('только реакции' if r else 'только разговоры')
             rows.append(ft.Container(ft.Row([ft.Icon(ft.Icons.PERSON,size=18,color=MUTED),ft.Text(n,size=14,weight=ft.FontWeight.W_600,width=160),
                 muted(kind,size=12,expand=True),
-                ft.IconButton(ft.Icons.CLOSE,icon_size=16,tooltip='Убрать из мониторинга',on_click=lambda e,n=n:self._remove_streamer(n))],
+                ft.IconButton(ft.Icons.DELETE_OUTLINE,icon_size=18,icon_color='#ff8a8a',tooltip='Удалить стримера полностью',
+                              on_click=lambda e,n=n:self.app.spawn(self._remove_streamer,n))],
                 spacing=12,vertical_alignment=ft.CrossAxisAlignment.CENTER),bgcolor='#1d2026',border_radius=10,padding=ft.Padding.symmetric(horizontal=12,vertical=2)))
         self.streamer_chips.controls=rows or [muted('Список пуст',size=12)]
 
@@ -98,8 +99,35 @@ class SettingsView:
         if name and name not in self.streamers:self.streamers.append(name);self._render_streamers();self._changed()
         self.new_streamer.value='';self.app.page.update()
 
-    def _remove_streamer(self,name):
-        if name in self.streamers:self.streamers.remove(name);self._render_streamers();self._changed();self.app.page.update()
+    async def _remove_streamer(self,name):
+        # Полное удаление стримера отовсюду и сразу, без кнопки «Сохранить».
+        if name not in self.streamers:return
+        if not await self.app.dialogs.confirm('Удалить стримера',
+            f'Удалить «{name}» полностью?\n\nОн пропадёт из мониторинга, Shorts (канал, очередь и готовые ролики), YouTube '
+            '(привязка канала, очередь и история публикаций), превью, блюра, статистики и заданий; его настройки '
+            '(режимы, язык, промпт превью) тоже удалятся.\n\nЗаписи стримов в папке recordings и видео на YouTube не удаляются.',
+            'Удалить'):return
+        low=name.lower()
+        try:res=self.app.service.delete_streamer(low,shorts=getattr(self.app,'shorts',None))
+        except ValueError as exc:await self.app.dialogs.error('Удаление стримера',str(exc));return
+        def mutate(c):
+            c['streamers']=[x for x in c['streamers'] if x.lower()!=low]
+            (c.get('streamer_modes') or {}).pop(low,None)
+            (c.get('languages') or {}).pop(low,None)
+            p=c.get('pipeline') or {}
+            pv=p.get('preview') or {}
+            (pv.get('templates') or {}).pop(low,None);(pv.get('prompts') or {}).pop(low,None)
+            if pv.get('test_streamer')==low:pv['test_streamer']=''
+            bb=p.get('banner_blur') or {}
+            if bb.get('test_streamer')==low:bb['test_streamer']=''
+        self.streamers=[x for x in self.streamers if x.lower()!=low];self._render_streamers()
+        saved=self.app.save_config(mutate)
+        try:  # статистика каналов на экране «Каналы» держит данные в памяти
+            st=self.app.views['channels'].stats_card.stats
+            st.data['channels']=[c for c in st.data.get('channels') or [] if str((c or {}).get('profile','')).lower()!=low];st.version+=1
+        except Exception:pass
+        if saved:self.app.dialogs.toast(f'{name} удалён полностью','ok')
+        self.app.refresh_soon();self.app.page.update()
 
     def load(self,force=False):
         if self.dirty and not force:return
@@ -129,9 +157,10 @@ class SettingsView:
         try:
             c=copy.deepcopy(self.app.config)
             c['twitch']={'client_id':t('client_id'),'client_secret':t('client_secret')}
+            removed=[x for x in c['streamers'] if x not in self.streamers]
             c['streamers']=list(self.streamers)
-            # modes are edited in the YouTube screen; only drop entries of removed streamers
-            c['streamer_modes']={k:v for k,v in (c.get('streamer_modes') or {}).items() if k in self.streamers}
+            # Режимы (реакции/разговоры) редактируются в разделе YouTube и не зависят от мониторинга:
+            # не удаляем их, иначе стример пропадал и из «Превью», и терял настройки.
             c['monitor'].update(interval=t('interval'))
             c['proxy']={'enabled':bool(v('proxy_enabled')),'url':t('proxy_url'),'twitch_api':bool(v('proxy_twitch')),'chatgpt':bool(v('proxy_chatgpt')),'groq':bool(v('proxy_groq'))}
             p=c['pipeline'];p.update(quality=t('quality'),download_threads=t('threads'),min_reaction_minutes=t('min_reaction'),bridge_minutes=t('bridge'),
@@ -140,6 +169,7 @@ class SettingsView:
             p['speech'].update(groq_enabled=bool(v('groq_enabled')),groq_api_key=t('groq_api_key'))
             p['silence'].update(enabled=bool(v('silence')),min_cut=t('min_cut'),max_gap=t('max_gap'),onset_db=t('onset'),max_height=t('height'))
             self.app.config=self.app.settings.save(c);self.app.service.settings_changed()
+            if removed:self.app.service.forget_streamers(removed)
         except Exception as exc:return str(exc) or type(exc).__name__
         self.load(force=True);return None
 

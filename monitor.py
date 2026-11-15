@@ -111,8 +111,8 @@ class Monitor:
                     (stream_id,login,user_id,title,started_at,state,updated_at) VALUES (?,?,?,?,?,'live',?)''',
                     (stream_id,login,user_id,str(live.get('title') or ''),str(live['started_at']),now))
                 if inserted.rowcount:self.store._notification(db,now,f'{login}: обнаружен эфир.',f'stream:{stream_id}:live')
-                # If a stream reappears before its VOD was queued, continue observing it.
-                db.execute("UPDATE observed_streams SET state='live',offline_count=0,ended_at=NULL,candidate_id=NULL,candidate_duration=NULL,stable_since=NULL,updated_at=? WHERE stream_id=? AND state='waiting_vod'",(now,stream_id))
+                # If a stream reappears before its VOD was queued (or the streamer was re-added mid-stream), continue observing it.
+                db.execute("UPDATE observed_streams SET state='live',offline_count=0,ended_at=NULL,candidate_id=NULL,candidate_duration=NULL,stable_since=NULL,last_error='',updated_at=? WHERE stream_id=? AND state IN ('waiting_vod','removed')",(now,stream_id))
             db.commit()
         self.poll_pending(login)
         return live

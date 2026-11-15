@@ -366,6 +366,25 @@ class YouTubeQueue:
             row = db.execute('SELECT * FROM youtube_profiles WHERE profile=?', (profile_key(profile),)).fetchone()
             return dict(row) if row else None
 
+    def upload_in_progress(self, profile):
+        with self._connect() as db:
+            return bool(db.execute("SELECT 1 FROM youtube_uploads WHERE profile=? AND state='uploading' AND tracking=1 LIMIT 1",
+                                   (profile_key(profile),)).fetchone())
+
+    def remove_profile(self, profile):
+        """Полное удаление стримера: привязка YouTube-канала и все записи его публикаций (очередь и история).
+        Видео в YouTube Studio не удаляются. Идущую прямо сейчас загрузку не трогаем — удаление отклоняется."""
+        profile = profile_key(profile)
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM youtube_uploads WHERE profile=? AND state='uploading' AND tracking=1 LIMIT 1", (profile,)).fetchone():
+                db.rollback()
+                raise ValueError('Сейчас идёт загрузка видео этого стримера на YouTube — удалите после её завершения')
+            uploads = db.execute('DELETE FROM youtube_uploads WHERE profile=?', (profile,)).rowcount
+            bound = db.execute('DELETE FROM youtube_profiles WHERE profile=?', (profile,)).rowcount
+            db.commit()
+        return {'uploads': uploads, 'bound': bound}
+
     def confirm_reviewed(self, upload_id, video_id):
         # This is a human attestation after checking channel, video and visibility.
         if not _VIDEO_ID.fullmatch(str(video_id)):

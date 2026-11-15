@@ -75,6 +75,84 @@ class Service:
             self._watch_generation+=1; self._watch_state.clear()
         self.wake.set()
 
+    def forget_streamers(self, logins):
+        """Стример убран из мониторинга: больше не следим за его текущим эфиром и не ждём его VOD.
+        Профили блюра, режимы, язык, YouTube-канал и уже готовые/поставленные задания не трогаем."""
+        names=sorted({str(x).strip().lower() for x in logins if str(x).strip()})
+        if not names: return 0
+        marks=','.join('?'*len(names))
+        with self.store._connect() as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observed_streams'").fetchone(): return 0
+            db.execute('BEGIN IMMEDIATE')
+            cur=db.execute(f"UPDATE observed_streams SET state='removed',last_error='Стример убран из мониторинга',updated_at=? "
+                           f"WHERE login IN ({marks}) AND state IN ('live','waiting_vod')",(time.time(),*names))
+            db.commit()
+        with self._lock:
+            for n in names:
+                self._watch_state.pop(n,None); self._monitor_failures.discard(n)
+        self.log('Убраны из мониторинга: '+', '.join(names))
+        self.wake.set()
+        return cur.rowcount
+
+    def delete_streamer(self, login, shorts=None):
+        """Полное удаление стримера отовсюду: мониторинг, YouTube-канал и публикации, Shorts, задания,
+        профиль блюра, ссылки Twitch, шаблоны превью, лимит загрузок и статистика канала.
+        Настройки в config.json чистит вызывающий (UI). Записи стримов в recordings и видео на YouTube не удаляются.
+        Если прямо сейчас идёт нарезка, загрузка или Shorts этого стримера — ValueError, ничего не меняется."""
+        import json, os, shutil
+        from pathlib import Path
+        import upload_limits, manual_blur, gpt_previews
+        name=str(login or '').strip().lower()
+        if not name or name.startswith('__'): raise ValueError('Некорректный ник стримера')
+        with self.store._connect() as db:
+            if db.execute("SELECT 1 FROM jobs WHERE lower(streamer)=? AND state='running' LIMIT 1",(name,)).fetchone():
+                raise ValueError('Сейчас нарезается стрим этого стримера — удалите после завершения обработки')
+        if shorts is not None and shorts.busy_with(name):
+            raise ValueError('Сейчас делается Shorts этого стримера — удалите после завершения')
+        if self.youtube_queue.upload_in_progress(name):
+            raise ValueError('Сейчас идёт загрузка видео этого стримера на YouTube — удалите после её завершения')
+        result={'uploads':0,'shorts':0,'jobs':0,'files':0}
+        result['uploads']=self.youtube_queue.remove_profile(name)['uploads']
+        if shorts is not None: result['shorts']=shorts.forget_profile(name)
+        now=time.time()
+        with self.store._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            # Строки заданий не удаляем (защита от повторной нарезки того же VOD), только отменяем ожидающие и скрываем.
+            db.execute("UPDATE jobs SET state='cancelled',stage='Отменено',detail='Стример удалён',updated_at=? "
+                       "WHERE lower(streamer)=? AND state IN ('queued','retry')",(now,name))
+            result['jobs']=db.execute("UPDATE jobs SET hidden=1 WHERE lower(streamer)=? AND hidden=0 AND state!='running'",(name,)).rowcount
+            db.commit()
+        self.forget_streamers([name])
+        try: upload_limits.clear(name)
+        except Exception: pass
+        paths=[]
+        try: paths.append(manual_blur.profile_path(self.root,name))
+        except Exception: pass
+        paths.append(Path(self.root)/'state'/'twitch_links'/(name+'.json'))
+        for p in paths:
+            try:
+                if p.is_file(): p.unlink(); result['files']+=1
+            except OSError: pass
+        for d in (gpt_previews.manual_dir(self.root,name),gpt_previews.auto_dir(self.root,name)):
+            try:
+                if d.is_dir(): shutil.rmtree(d); result['files']+=1
+            except OSError: pass
+        stats=self.root/'state'/'channel_stats.json'
+        try:
+            data=json.loads(stats.read_text(encoding='utf-8'))
+            chans=data.get('channels') or []
+            keep=[c for c in chans if not (isinstance(c,dict) and str(c.get('profile','')).lower()==name)]
+            hist=0
+            for h in data.get('history') or []:  # точки роста по каналам: {'t':..., 'p': {профиль: итоги}}
+                if isinstance(h,dict) and isinstance(h.get('p'),dict) and name in h['p']: h['p'].pop(name); hist+=1
+            if len(keep)!=len(chans) or hist:
+                data['channels']=keep; tmp=stats.with_name(stats.name+'.tmp')
+                tmp.write_text(json.dumps(data,ensure_ascii=False),encoding='utf-8'); os.replace(tmp,stats)
+        except (OSError,ValueError,AttributeError): pass
+        self.log(f"Стример {name} удалён полностью: публикаций {result['uploads']}, Shorts {result['shorts']}, заданий {result['jobs']}")
+        self.wake.set()
+        return result
+
     def _watch_update(self, name, state, generation, stream_id=''):
         with self._lock:
             if generation==self._watch_generation:

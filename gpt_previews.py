@@ -60,6 +60,24 @@ EN_ALIASES={'kaicenat':['kai cenat'],'caseoh_':['caseoh'],'zackrawrr':['asmongol
             'ishowspeed':['ishowspeed'],'xqc':['xqc'],'tfue':['tfue'],'adinross':['adin ross'],'sketch':['sketch']}
 
 
+_TR=(('shch','щ'),('sch','щ'),('yo','ё'),('yu','ю'),('ya','я'),('ye','е'),('zh','ж'),('kh','х'),('ts','ц'),('ch','ч'),('sh','ш'),('ck','к'),
+     ('a','а'),('b','б'),('c','к'),('d','д'),('e','е'),('f','ф'),('g','г'),('h','х'),('i','и'),('j','дж'),('k','к'),('l','л'),('m','м'),
+     ('n','н'),('o','о'),('p','п'),('q','к'),('r','р'),('s','с'),('t','т'),('u','у'),('v','в'),('w','в'),('x','кс'),('y','й'),('z','з'))
+
+
+def _translit(name):
+    """strogo → строго: русское написание латинского ника (для поиска и узнавания в русских названиях)."""
+    s=re.sub(r'[\d_]+',' ',str(name or '').lower()).strip()
+    if not s or not re.fullmatch(r'[a-z ]+',s):return ''
+    out='';i=0
+    while i<len(s):
+        for lat,cyr in _TR:
+            if s.startswith(lat,i):out+=cyr;i+=len(lat);break
+        else:
+            out+=s[i];i+=1
+    return out.strip()
+
+
 def _aliases(login):
     """Имена стримера: логин, варианты из EN_ALIASES / config.preview_aliases; последнее — для поисковых запросов."""
     l=str(login).lower().strip()
@@ -78,7 +96,8 @@ def _aliases(login):
     extra+=EN_ALIASES.get(l) or []
     plain=re.sub(r'_+',' ',l).strip()    # caseoh_ → caseoh
     query=str(alias or (extra[0] if extra else plain)).lower().strip()
-    names=[n for n in dict.fromkeys(str(x).lower().strip() for x in [l,plain,*extra,alias or ''] if x) if n and n!=query]
+    cyr=_translit(plain) if not (alias or extra) else ''
+    names=[n for n in dict.fromkeys(str(x).lower().strip() for x in [l,plain,*extra,alias or '',cyr] if x) if n and n!=query]
     return names+[query]
 
 
@@ -151,6 +170,53 @@ def _streamer_channel_ids(root,login):
     return ids
 
 
+# ---------- каналы-образцы, заданные вручную ----------
+def pinned_channels(login,cfg=None):
+    """Каналы для образцов превью, заданные вручную: config.json → pipeline.preview.channels[login].
+    Ссылки (https://www.youtube.com/@xQcOW/videos), @handle или UC-id; берутся всегда, даже канал самого стримера."""
+    if cfg is None:
+        try:
+            import lang
+            cfg=((lang._config().get('pipeline') or {}).get('preview')) or {}
+        except Exception:
+            cfg={}
+    v=((cfg or {}).get('channels') or {}).get(str(login or '').lower())
+    if isinstance(v,str):v=re.split(r'[\s,;]+',v)
+    return list(dict.fromkeys(str(x).strip() for x in (v or []) if str(x).strip()))
+
+
+def _channel_url(ref):
+    r=str(ref).strip()
+    if re.fullmatch(r'UC[\w-]{22}',r):return f'https://www.youtube.com/channel/{r}'
+    if r.startswith('@'):return 'https://www.youtube.com/'+r
+    if not re.match(r'https?://',r):r='https://'+r.lstrip('/')
+    return r
+
+
+def resolve_channel_id(client,ref):
+    """Ссылка / @handle / UC-id канала → UC-id."""
+    r=str(ref).strip()
+    if re.fullmatch(r'UC[\w-]{22}',r):return r
+    m=re.search(r'/channel/(UC[\w-]{22})',r)
+    if m:return m.group(1)
+    html=client.page(_channel_url(r))
+    for pat in (r'"externalId":"(UC[\w-]{22})"',r'itemprop="identifier" content="(UC[\w-]{22})"',
+                r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',r'"channelId":"(UC[\w-]{22})"'):
+        m=re.search(pat,html)
+        if m:return m.group(1)
+    raise RuntimeError('не удалось определить канал по ссылке')
+
+
+def _source_row(p,extra=None):
+    recent=p['videos'][:12]
+    ages=[v['age'] for v in recent if v['age'] is not None]
+    views=sorted(v['views'] for v in recent[:10])
+    row={'id':p['id'],'title':p['title'],'subs':p['subs'],'median_views':views[len(views)//2] if views else 0,
+         'last_days':min(ages) if ages else None,'about':1.0,'score':None,'videos':p['videos']}
+    row.update(extra or {})
+    return row
+
+
 def _channel_profile(client,cid):
     import channel_stats as cs
     html=client.page(f'https://www.youtube.com/channel/{cid}/videos')
@@ -182,7 +248,8 @@ def rank_clip_channels(root,login,log=print,limit=12):
     queries=([f'{alias} clips',f'{alias} highlights',f'{alias} funny moments',f'{alias} best moments',f'best of {alias}',
               f'{alias} clip channel',f'{alias} reacts',f'{alias} rage moments']+
              ([f'{names[0]} clips',f'{names[0]} highlights'] if names[0]!=alias else []) if en else
-             [f'{alias} нарезки',f'нарезки {alias}',f'{login} нарезки',f'{alias} смотрит',f'{alias} лучшие моменты'])
+             [f'{alias} нарезки',f'нарезки {alias}',f'{login} нарезки',f'{alias} смотрит',f'{alias} лучшие моменты']+
+             [q for n in names if re.search('[а-яё]',n) for q in (f'{n} нарезки',f'нарезки {n}',f'{n} смотрит',f'{n} реакция',f'{n} лучшие моменты')])
     hits={};names_seen={}
     for q in dict.fromkeys(queries):
         try:data=_ytdlp_json([('ytsearch50:' if en else 'ytsearch30:')+q],timeout=120,lang='en' if en else 'ru')
@@ -238,44 +305,82 @@ def find_clip_channels(root,login,log=print):
     return [(r['id'],r['title'],r['score']) for r in rank_clip_channels(root,login,log)[:4]]
 
 
-def refresh_auto(root,login,log=print,limit=TAKE):
-    """Последние превью (по умолчанию 10) с лучшего канала-нарезчика стримера; старые образцы сверх KEEP удаляются."""
+AUTO_WITH_PINNED=2    # сколько лучших найденных нарезчиков добавлять к каналам, заданным вручную
+AUTO_NO_PINNED=3      # без ручных каналов — до стольких лучших нарезчиков (не слабее 70% от лучшего)
+
+
+def refresh_auto(root,login,log=print,limit=TAKE,cfg=None):
+    """Последние превью с каналов-образцов: заданные вручную (pipeline.preview.channels) + лучшие найденные нарезчики.
+    Без ручных каналов — как раньше, только лучший нарезчик. Старые образцы сверх KEEP удаляются."""
     from reaction_previews import download_thumbnail
-    ranked=rank_clip_channels(root,login,log)
-    if not ranked:raise RuntimeError(f'Не найдено чужих каналов с нарезками {login} на YouTube')
-    best=ranked[0]
-    log(f"Лучший нарезчик: «{best['title']}» — подписчиков {best['subs']}, медиана просмотров {best['median_views']}, "
-        f"последнее видео {('%.0f дн. назад' % best['last_days']) if best['last_days'] is not None else 'неизвестно'}")
-    folder=auto_dir(root,login);folder.mkdir(parents=True,exist_ok=True)
-    saved=0
-    for v in best['videos'][:limit]:
-        target=folder/f"{best['id']}_{v['id']}.jpg"
-        if target.exists():continue
+    import channel_stats as cs
+    pins=pinned_channels(login,cfg);client=cs._Client();sources=[]
+    for ref in pins:
         try:
-            image,_=download_thumbnail(v['id']);image.save(target,'JPEG',quality=92);saved+=1
-        except Exception:
-            continue
-    # В пуле — только превью выбранного нарезчика: картинки прежних (худших) каналов убираются.
+            cid=resolve_channel_id(client,ref)
+            if cid in {s['id'] for s in sources}:continue
+            p=_channel_profile(client,cid)
+        except Exception as exc:
+            log(f'Канал {ref}: не прочитан ({type(exc).__name__}: {str(exc)[:120]})');continue
+        if not p['videos']:
+            log(f'Канал {ref}: нет длинных видео — пропускаю');continue
+        sources.append(_source_row(p,{'title':p['title'] or ref,'pinned':True}))
+        log(f"Свой канал-образец: «{sources[-1]['title']}» — видео на странице {len(p['videos'])}")
+    ranked=[]
+    try:ranked=rank_clip_channels(root,login,log)
+    except Exception as exc:
+        if not sources:raise
+        log(f'Автопоиск нарезчиков не удался: {type(exc).__name__}: {str(exc)[:150]}')
+    fresh=[r for r in ranked if r['last_days'] is not None and r['last_days']<=STALE_DAYS] or ranked
+    top=fresh[0]['score'] if fresh and fresh[0]['score'] else 0
+    picked=fresh[:AUTO_WITH_PINNED] if sources else [r for r in fresh[:AUTO_NO_PINNED] if r is fresh[0] or (r['score'] or 0)>=top*0.7]
+    for r in picked:
+        if r['id'] in {s['id'] for s in sources}:continue
+        sources.append(r)
+        log(f"Нарезчик: «{r['title']}» — подписчиков {r['subs']}, медиана просмотров {r['median_views']}, "
+            f"последнее видео {('%.0f дн. назад' % r['last_days']) if r['last_days'] is not None else 'неизвестно'}")
+    if not sources:
+        raise RuntimeError(f'Не найдено каналов с нарезками {login} на YouTube: укажите каналы-образцы в разделе «Превью»')
+    best=sources[0]
+    folder=auto_dir(root,login);folder.mkdir(parents=True,exist_ok=True)
+    per=max(3,min(limit,KEEP//len(sources)))
+    saved=0;per_source={}
+    for s in sources:
+        got=0
+        for v in s['videos'][:per]:
+            target=folder/f"{s['id']}_{v['id']}.jpg"
+            if target.exists():got+=1;continue
+            try:
+                image,_=download_thumbnail(v['id']);image.save(target,'JPEG',quality=92);saved+=1;got+=1
+            except Exception:
+                continue
+        per_source[s['id']]=got
+    ids={s['id'] for s in sources}
+    # В пуле — только превью выбранных каналов: картинки прежних каналов убираются.
     for img in list_images(folder):
-        if not os.path.basename(str(img)).startswith(best['id']+'_'):
+        if os.path.basename(str(img))[:24] not in ids:
             try:os.remove(img)
             except OSError:pass
-    files=sorted(list_images(folder),key=lambda f:os.path.getmtime(f),reverse=True)
-    for old in files[KEEP:]:
-        try:os.remove(old)
-        except OSError:pass
+    for cid in ids:    # у каждого канала — не больше per свежих образцов
+        files=sorted((f for f in list_images(folder) if f.name.startswith(cid+'_')),key=lambda f:os.path.getmtime(f),reverse=True)
+        for old in files[per:]:
+            try:os.remove(old)
+            except OSError:pass
+    total=len(list_images(folder))
     info={'updated':time.time(),'channel':{k:best[k] for k in ('id','title','subs','median_views','last_days','score')},
+          'pinned':pins,
           'candidates':[{k:r[k] for k in ('id','title','subs','median_views','last_days','about','score')} for r in ranked[:6]],
-          'channels':[{'id':best['id'],'name':best['title']}]}
+          'channels':[{'id':s['id'],'name':s['title'],'pinned':bool(s.get('pinned')),'templates':per_source.get(s['id'],0)} for s in sources]}
     (folder/'channels.json').write_text(json.dumps(info,ensure_ascii=False,indent=1),encoding='utf-8')
-    log(f"Канал «{best['title']}»: новых образцов {saved}, всего в папке {min(len(files),KEEP)}")
-    return saved,[best['title']]
+    log(f"Каналы-образцы: {', '.join(s['title'] for s in sources)}; новых образцов {saved}, всего в папке {total}")
+    return saved,[s['title'] for s in sources]
 
 
-def auto_needs_refresh(root,login):
+def auto_needs_refresh(root,login,cfg=None):
     try:
         info=json.loads((auto_dir(root,login)/'channels.json').read_text(encoding='utf-8'))
         if 'channel' not in info:return True        # выбран старым способом — пересобрать
+        if list(info.get('pinned') or [])!=pinned_channels(login,cfg):return True    # список своих каналов изменился
         return time.time()-float(info.get('updated') or 0)>REFRESH_DAYS*86400
     except (OSError,ValueError):
         return True
@@ -287,9 +392,9 @@ def pick_templates(root,login,cfg,log=print,count=3):
     if mode=='manual':
         pool=manual or auto
     else:
-        if not auto or auto_needs_refresh(root,login):
+        if not auto or auto_needs_refresh(root,login,cfg):
             log('Обновляю образцы превью с лучшего канала нарезок' if auto else 'Шаблонов с чужих каналов ещё нет — ищу каналы нарезок на YouTube')
-            try:refresh_auto(root,login,log);auto=list_images(auto_dir(root,login))
+            try:refresh_auto(root,login,log,cfg=cfg);auto=list_images(auto_dir(root,login))
             except Exception as exc:log(f'Автопоиск шаблонов не удался: {exc}')
         pool=auto or manual
     if not pool:

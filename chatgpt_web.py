@@ -466,6 +466,30 @@ class ChatGPTWeb:
          '[data-content-search-unit-key$=":user"]\';return Array.from(document.querySelectorAll(s)).filter(n=>visible(n)&&'
          '!n.closest(\'form\')&&!(n.parentElement&&n.parentElement.closest(s))).length;})()'),
     ))
+    # Click probe: a capturing listener counts every pointerdown/click that really reaches the send button.
+    # After a press we then know whether the button got the click (the page just ignored it) or the click
+    # never landed on it at all (overlay, re-render) — and can safely press again.
+    JS_SEND_STATE = _patch_js(JS_SEND_STATE, (
+        ('let x=null,y=null,hit=false,key=null;',
+         "const pr=window.__twlProbe||(()=>{const p=window.__twlProbe={down:0,click:0};"
+         "const sel='button[data-testid=\"send-button\"],button[data-testid=\"composer-submit-button\"],button#composer-submit-button,button[data-twl-send]';"
+         "const on=k=>ev=>{const t=ev.target&&ev.target.closest&&ev.target.closest('button');if(t&&t.matches(sel))p[k]++;};"
+         "document.addEventListener('pointerdown',on('down'),true);document.addEventListener('click',on('click'),true);return p;})();\n"
+         'let x=null,y=null,hit=false,key=null;'),
+        ('uploading,uploadError,text,x,y,hit,key,', 'uploading,uploadError,text,x,y,hit,key,pdown:pr.down,pclick:pr.click,'),
+    ))
+
+    @staticmethod
+    def _click_landed(st: dict, base) -> bool | None:
+        """True — the page received the click on the send button, False — it did not, None — unknown."""
+        try:
+            now, before = int(st['pclick']), int(base)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if now < before:  # page reloaded, the counter restarted
+            return None
+        return now > before
+
     JS_CLICK_SEND = "(()=>{\nconst state=%s;\nconst b=Array.from(document.querySelectorAll('button')).find(n=>n.dataset.twlSend===state.key);\nif(!b||b.disabled||b.getAttribute('aria-disabled')==='true'||!b.getClientRects().length)return false;\nb.click();return true;\n})()"
 
     # Promo/upsell modals («Получите месяц ChatGPT Plus бесплатно» и т.п.) steal focus from the composer, so the
@@ -633,6 +657,11 @@ return {items};
         expected = self._norm(getattr(self, '_pending_prompt', '') or initial.get('text', ''))
         clicks = 0
         last_click = 0.0
+        missed = 0          # presses that never reached the button
+        probe_base = None   # click counter of the button right before the last press
+        probe_down = None
+        confirmed = False   # the last press reached the button
+        use_dom = False     # alternate the press method on retries
         stable_key = None
         stable = 0
         next_log = 0.0
@@ -654,26 +683,47 @@ return {items};
                     raise ChatGPTUploadFailed('ChatGPT: «Загрузка не удалась» — файл не принят, запрос НЕ отправлен')
                 raise ChatGPTWebError('ChatGPT сообщил об ошибке загрузки файла; запрос НЕ отправлен')
             current = self._norm(st.get('text', ''))
+            # Nothing was sent: no new turn, no generation, the same full text is still in the field, button active.
+            unsent = bool(st.get('has') and not st.get('stop') and not st.get('disabled') and not st.get('uploading')
+                          and current and (not expected or current == expected))
             reclick = False
             if clicks:
-                # The click sometimes does not register (screen shows the full prompt still in the field).
-                # Only when nothing was sent — no new turn, no generation, the same full text is still in the
-                # field and the button is active — is it safe to press again.
-                unsent = st.get('has') and not st.get('stop') and not st.get('disabled') and not st.get('uploading') \
-                    and current and (not expected or current == expected)
-                if unsent and clicks < 3 and time.monotonic() - last_click >= 8:
+                since = time.monotonic() - last_click
+                landed = self._click_landed(st, probe_base)
+                if landed and not confirmed:
+                    confirmed = True
+                    self._log('клик дошёл до кнопки «Отправить» — страница получила нажатие')
+                real = clicks - missed  # presses that reached the button (or unknown)
+                if unsent and landed is False and since >= 1.0 and missed < 3:
                     reclick = True
-                    self._status('кнопка не сработала — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
-                    self._log(f'после нажатия прошло {int(time.monotonic() - last_click)} с, но текст в поле и новых сообщений нет — '
-                              f'нажимаю ещё раз ({clicks + 1}/3)')
-            if clicks and not reclick:
-                if time.monotonic() >= next_log:
-                    self._status('кнопка нажата; жду подтверждения отправки, повторного клика не будет')
-                    self._log('кнопка нажата; жду подтверждения, повторно НЕ отправляю')
-                    next_log = time.monotonic() + 10
-                time.sleep(0.5)
-                continue
-            ready = st.get('has') and (not st.get('stop')) and (not st.get('disabled')) and (not st.get('uploading')) and current and (not expected or current == expected)
+                    missed += 1
+                    use_dom = not use_dom
+                    redraw = self._click_landed({'pclick': st.get('pdown')}, probe_down)
+                    why = 'кнопка перерисовалась во время нажатия' if redraw else 'нажатие перехватил другой элемент'
+                    self._status('клик не дошёл до кнопки — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
+                    self._log(f'клик не дошёл до кнопки ({why}); запрос точно не ушёл — '
+                              f'нажимаю ещё раз {"через DOM" if use_dom else "мышью"} ({missed}/3)')
+                elif unsent and landed is not False and real < 3 and since >= 8:
+                    reclick = True
+                    use_dom = not use_dom
+                    self._status('кнопка нажата, но запрос не ушёл — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
+                    self._log(f'после нажатия прошло {int(since)} с ({"клик дошёл до кнопки" if landed else "доход клика неизвестен"}), '
+                              f'но текст в поле и новых сообщений нет — нажимаю ещё раз ({real + 1}/3)')
+                if not reclick:
+                    if time.monotonic() >= next_log:
+                        seen = ' (клик дошёл до кнопки)' if landed else ' (проверяю, дошёл ли клик)' if landed is False else ''
+                        can_retry = (missed < 3) if landed is False else (real < 3)
+                        if unsent and can_retry:
+                            left = max(1, int(8 - since)) if landed is not False else 1
+                            self._status(f'кнопка нажата{seen}; жду отправку, если не уйдёт — через {left} с нажму ещё раз ({real + 1}/3)')
+                        else:
+                            why = 'попытки нажатия исчерпаны' if unsent else 'поле изменилось — запрос, вероятно, ушёл'
+                            self._status(f'кнопка нажата{seen}; жду подтверждения отправки, повторного клика не будет ({why})')
+                        self._log('кнопка нажата; жду подтверждения отправки')
+                        next_log = time.monotonic() + 10
+                    time.sleep(0.5)
+                    continue
+            ready = unsent
             # The page may replace the button on every render. Stabilize the payload,
             # then use the current button identity for the single click.
             fingerprint = current
@@ -692,23 +742,36 @@ return {items};
             if can_click:
                 previous_uncertainty = getattr(self, '_send_uncertain', False)
                 self._send_uncertain = True
-                if st.get('hit') and (st.get('x') is not None):
+                base_click, base_down = st.get('pclick'), st.get('pdown')
+                mouse = st.get('hit') and (st.get('x') is not None)
+                done = False
+                if mouse and not use_dom:
                     x, y = (st['x'], st['y'])
                     tab.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
                     tab.call('Input.dispatchMouseEvent', type='mousePressed', x=x, y=y, button='left', clickCount=1)
                     tab.call('Input.dispatchMouseEvent', type='mouseReleased', x=x, y=y, button='left', clickCount=1)
-                    self._status('кнопка нажата; проверяю подтверждение отправки')
-                    self._log('нажал кнопку отправки мышью; проверяю доставку')
-                else:
-                    if not tab.js(self.JS_CLICK_SEND % json.dumps({'key': st.get('key')})):
-                        self._send_uncertain = previous_uncertainty
-                        stable = 0
-                        time.sleep(0.5)
-                        continue
-                    self._status('кнопка нажата; проверяю подтверждение отправки')
-                    self._log('нажал кнопку отправки через DOM; проверяю доставку')
+                    self._log('нажал кнопку отправки мышью; проверяю, дошёл ли клик')
+                    done = True
+                elif tab.js(self.JS_CLICK_SEND % json.dumps({'key': st.get('key')})):
+                    self._log('нажал кнопку отправки через DOM; проверяю, дошёл ли клик')
+                    done = True
+                elif mouse:
+                    x, y = (st['x'], st['y'])
+                    tab.call('Input.dispatchMouseEvent', type='mouseMoved', x=x, y=y)
+                    tab.call('Input.dispatchMouseEvent', type='mousePressed', x=x, y=y, button='left', clickCount=1)
+                    tab.call('Input.dispatchMouseEvent', type='mouseReleased', x=x, y=y, button='left', clickCount=1)
+                    self._log('кнопка через DOM не нажалась — нажал мышью; проверяю, дошёл ли клик')
+                    done = True
+                if not done:
+                    self._send_uncertain = previous_uncertainty
+                    stable = 0
+                    time.sleep(0.5)
+                    continue
+                self._status('кнопка нажата; проверяю, дошёл ли клик и ушёл ли запрос')
                 clicks += 1
                 last_click = time.monotonic()
+                probe_base, probe_down, confirmed = base_click, base_down, False
+                next_log = 0.0
                 stable = 0
             time.sleep(0.5)
         if clicks:

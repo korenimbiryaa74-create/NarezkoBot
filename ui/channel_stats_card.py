@@ -80,10 +80,17 @@ class ChannelStatsCard:
         self.app.refresh_soon()
 
     def refresh(self):
-        if not self._auto_done and self._targets():
+        targets = self._targets()
+        if not self._auto_done and targets:
             self._auto_done = True
             if self.stats.stale():
                 self.update_now(auto=True)
+        # Новый привязанный канал, которого ещё нет в статистике, — собрать сразу, не дожидаясь устаревания.
+        have = {c.get('profile') for c in self.stats.data.get('channels') or [] if isinstance(c, dict)}
+        missing = frozenset(c['profile'] for c in targets) - have
+        if missing and not self.stats.running and missing != getattr(self, '_missing_tried', None):
+            self._missing_tried = missing
+            self.update_now(auto=True)
         s = self.stats
         self.btn.disabled = s.running
         if s.running:

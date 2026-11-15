@@ -54,7 +54,7 @@ class PreviewView:
             try:channels=[c['name'] for c in json.loads((gp.auto_dir(root,login)/'channels.json').read_text(encoding='utf-8')).get('channels',[])]
             except (OSError,ValueError):channels=[]
             data.append((login,gp.template_mode(cfg,login),tuple(p.name for p in manual),tuple(p.name for p in auto),tuple(channels),login in self.busy,
-                         gp.prompt_intro(cfg,login),login in (cfg.get('prompts') or {})))
+                         gp.prompt_intro(cfg,login),login in (cfg.get('prompts') or {}),tuple(gp.pinned_channels(login,cfg))))
         key=tuple(data)
         if key==self._key:return
         self._key=key
@@ -68,7 +68,7 @@ class PreviewView:
             except Exception:self._thumbs[k]=None
         return self._thumbs[k]
 
-    def _row(self,login,mode,manual,auto,channels,busy,intro='',custom=False):
+    def _row(self,login,mode,manual,auto,channels,busy,intro='',custom=False,pinned=()):
         import gpt_previews as gp
         app=self.app;root=app.root
         seg=ft.SegmentedButton(segments=[ft.Segment(value='auto',label=ft.Text('Авто')),ft.Segment(value='manual',label=ft.Text('Вручную'))],
@@ -88,6 +88,12 @@ class PreviewView:
         if mode=='auto' and channels:body.append(muted('Каналы: '+', '.join(channels),size=12))
         body.append(ft.Row(tiles,spacing=8,wrap=True) if tiles else muted('Шаблонов пока нет — '+('нажмите «Найти каналы нарезок»' if mode=='auto' else 'положите картинки в папку своих шаблонов'),size=12))
         body.append(ft.Row(actions,spacing=8,wrap=True))
+        # YouTube channels whose thumbnails are always used as samples (even the streamer's own channel).
+        pins=ft.TextField(label='Каналы-образцы превью (ссылки YouTube, каждая с новой строки)',value='\n'.join(pinned),multiline=True,min_lines=1,max_lines=6,text_size=13)
+        save_pins=ft.FilledTonalButton('Сохранить каналы и обновить',icon=ft.Icons.SAVE,disabled=busy,on_click=lambda e,l=login,f=pins:app.spawn(self._save_channels,l,f.value))
+        body.append(pins)
+        body.append(ft.Row([save_pins,muted('Образцы берутся с этих каналов + с лучших найденных нарезчиков.',size=12)],spacing=8,wrap=True,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER))
         # Opening of the ChatGPT request for this streamer; caption and context are appended by the bot.
         field=ft.TextField(label='Промпт превью (начало запроса)',value=intro,multiline=True,min_lines=2,max_lines=6,text_size=13)
         save=ft.FilledTonalButton('Сохранить промпт',icon=ft.Icons.SAVE,on_click=lambda e,l=login,f=field:app.spawn(self._save_prompt,l,f.value))
@@ -114,6 +120,19 @@ class PreviewView:
         if self.app.save_config(change):
             self.app.dialogs.toast(f'{login}: '+('свой промпт сохранён' if text else 'стандартный промпт'),'ok')
             self._key=None;self.app.refresh_soon()
+
+    async def _save_channels(self,login,value):
+        items=[x.strip() for x in re.split(r'[\s,;]+',value or '') if x.strip()]
+        bad=[x for x in items if not re.search(r'youtube\.com/|youtu\.be/|^@[\w.-]+$|^UC[\w-]{22}$',x)]
+        if bad:await self.app.dialogs.error('Каналы-образцы','Не похоже на ссылку на YouTube-канал: '+', '.join(bad[:3]));return
+        def change(c):
+            chans=c['pipeline']['preview'].setdefault('channels',{})
+            if items:chans[login]=items
+            else:chans.pop(login,None)
+        if self.app.save_config(change):
+            self.app.dialogs.toast(f'{login}: каналов-образцов {len(items)}, обновляю шаблоны','ok')
+            self._key=None
+            await self._refresh_auto(login)
 
     def _open_manual(self,login):
         import gpt_previews as gp

@@ -197,6 +197,21 @@ class ShortsStore:
         with self._db() as db:
             db.execute("UPDATE items SET status='queued',detail='Работа прервана закрытием программы',updated_at=? WHERE status='working'", (time.time(),))
 
+    def delete_profile(self, profile):
+        """Полное удаление стримера: канал Shorts, вся его очередь/история и темы. Возвращает (кол-во, файлы роликов)."""
+        with self._db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                files = [r['video_path'] for r in db.execute("SELECT video_path FROM items WHERE profile=? AND video_path!=''", (profile,))]
+                n = db.execute('DELETE FROM items WHERE profile=?', (profile,)).rowcount
+                db.execute('DELETE FROM topics WHERE profile=?', (profile,))
+                db.execute('DELETE FROM channels WHERE profile=?', (profile,))
+                db.execute('COMMIT')
+            except Exception:
+                db.execute('ROLLBACK')
+                raise
+        return n, files
+
     def topics(self, profile, limit=80):
         with self._db() as db:
             return [r['topic'] for r in db.execute('SELECT topic FROM topics WHERE profile=? ORDER BY created_at DESC LIMIT ?', (profile, limit))][::-1]
@@ -259,6 +274,32 @@ class ShortsAutopilot:
         if profile not in self.manual:
             self.manual.append(profile)
         self.wake.set()
+
+    def busy_with(self, profile):
+        cur = self.current
+        return bool(cur and str(cur.get('profile') or '').lower() == str(profile).lower())
+
+    def forget_profile(self, profile):
+        """Стример удалён полностью: убираем его канал Shorts, очередь, историю и готовые ролики в state/stream_shorts."""
+        profile = str(profile).strip().lower()
+        if self.busy_with(profile):
+            raise ValueError('Сейчас делается Shorts этого стримера — удалите после завершения')
+        self.manual = [p for p in self.manual if p != profile]
+        n, files = self.store.delete_profile(profile)
+        folder = (self.root / 'state' / 'stream_shorts').resolve()
+        own = re.compile(re.escape(profile) + r'_\d+\.mp4$', re.I)
+        paths = {Path(f) for f in files}
+        if folder.is_dir():
+            paths |= {p for p in folder.iterdir() if own.fullmatch(p.name)}
+        for p in paths:
+            try:
+                if p.resolve().parent == folder:  # только наши рендеры, чужие файлы не трогаем
+                    p.unlink()
+            except OSError:
+                pass
+        self.log(f'{profile}: стример удалён — убраны канал Shorts и {n} записей очереди/истории')
+        self.wake.set()
+        return n
 
     def profiles(self):
         return self.service.youtube_queue.list_profiles()
