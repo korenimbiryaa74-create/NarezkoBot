@@ -706,6 +706,21 @@ def measured_timeline(groups, part_info, output_info):
         raise InvalidRenderTimeline(f'После склейки длительность {actual:.3f} с, сумма частей {cursor:.3f} с; таймкоды не подтверждены')
     return timeline
 
+PROBE_WORKERS = 8
+
+def probe_parts(parts: list[str], ffprobe: str, progress_callback=None) -> list[dict]:
+    """ffprobe of every rendered part in parallel (ported from v2, R1). Order of results = order of parts;
+    progress messages and the first error are the same as in the old one-by-one loop."""
+    out: list[dict] = []
+    if not parts:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, min(PROBE_WORKERS, len(parts)))) as ex:
+        for index, info in enumerate(ex.map(lambda p: probe(p, ffprobe), parts), 1):
+            out.append(info)
+            if progress_callback and (index % 20 == 0 or index == len(parts)):
+                progress_callback(f'Проверено частей: {index}/{len(parts)}')
+    return out
+
 def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=None) -> str:
     src, keep = (res['src'], res['keep'])
     out = args.out or os.path.splitext(src)[0] + '_cut' + os.path.splitext(src)[1]
@@ -793,11 +808,7 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
         if getattr(args,'map_timeline',False):
             if args.fast: raise InvalidRenderTimeline('Измеренная монтажная карта недоступна в режиме копирования')
             if progress_callback: progress_callback('Проверка длительности частей и таймкодов')
-            part_info=[]
-            for index,part in enumerate(parts,1):
-                part_info.append(probe(part,ffprobe))
-                if progress_callback and (index%20==0 or index==len(parts)):
-                    progress_callback(f'Проверено частей: {index}/{len(parts)}')
+            part_info=probe_parts(parts,ffprobe,progress_callback)
             output_info=probe(out,ffprobe)
             res['render_timeline']=measured_timeline(groups,part_info,output_info)
     print(f'готово      : {out}')

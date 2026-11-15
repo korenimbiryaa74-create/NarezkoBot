@@ -356,6 +356,38 @@ def subtract_intervals(keeps, cuts):
         if cursor<b: result.append((cursor,b))
     return result
 
+_HWACCEL_CACHE: dict = {}
+_HWACCEL_LOCK = threading.Lock()
+_HWACCEL_RETRY_CPU = 600.0  # «не получилось» помним 10 мин: видеокарта могла быть занята другим рендером
+
+def source_hwaccel(ffmpeg, src, vcodec, want='auto'):
+    """Аппаратный декод для рендера нарезок (перенесено из v2, R2): cuda/d3d11va/dxva2 или None (CPU).
+
+    Проверяется один раз на источник (путь + размер + время изменения + кодировщик): все нарезки одного VOD
+    берут готовый ответ. Кадры идут через ОЗУ, поэтому блюр и уменьшение кадра работают как раньше;
+    если кусок с аппаратным декодом упадёт, stream_cutter.run_jobs переделает его на CPU.
+    CPU ffmpeg при рендере падает примерно на треть, параллельные задания тормозят меньше.
+    want='none' выключает (pipeline.silence.hwaccel='none' в config.json)."""
+    want = str(want or 'none').lower()
+    if want == 'none':
+        return None
+    try:
+        st = os.stat(src)
+    except OSError:
+        return None
+    key = (os.path.normcase(os.path.abspath(str(src))), st.st_size, st.st_mtime_ns, str(vcodec), want, str(ffmpeg))
+    with _HWACCEL_LOCK:
+        hit = _HWACCEL_CACHE.get(key)
+        if hit is not None and (hit[0] is not None or time.monotonic() - hit[1] < _HWACCEL_RETRY_CPU):
+            return hit[0]
+    try:
+        hw = stream_cutter.detect_hwaccel(ffmpeg, str(src), want, str(vcodec))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        hw = None  # нет ffmpeg/драйвера — рендер на CPU, как раньше
+    with _HWACCEL_LOCK:
+        _HWACCEL_CACHE[key] = (hw, time.monotonic())
+    return hw
+
 def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=None, banner_cfg=None):
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
@@ -402,6 +434,8 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
         detected=[{'start':start,'end':end,'box':box} for box in profile['boxes']]
         args.timed_banners=detected
         if progress_callback:progress_callback(f"Блюр по профилю {banner_cfg.get('login','')}: областей {len(detected)}; действует на всём видео")
+    args.hwaccel_flag=source_hwaccel(ffmpeg,src,args.vcodec,silence_cfg.get('hwaccel','auto'))
+    if progress_callback: progress_callback(f"Декод видео: {args.hwaccel_flag+' (видеокарта)' if args.hwaccel_flag else 'CPU'}")
     if progress_callback: progress_callback('Запуск рендера')
     stream_cutter.render_file(res,args,ffmpeg,ffprobe,progress_callback=progress_callback)
     duration=media_duration(output)
