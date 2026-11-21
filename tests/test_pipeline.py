@@ -47,6 +47,11 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.run_it(renderer=fail)
         self.assertEqual(list((self.root/'recordings').rglob('*.pipeline.json')),[])
         self.assertFalse(any(p.parent.name!='_work' and p.name.endswith('.mp4') for p in (self.root/'recordings').rglob('*.mp4')))
+    def test_failed_render_reuses_valid_raw_range(self):
+        def fail(*a): raise RuntimeError('render')
+        with self.assertRaisesRegex(RuntimeError,'render'): self.run_it(renderer=fail)
+        self.run_it();self.assertEqual(self.downloads,[('160p30',None,None),('1080p60',10,16)])
+
     def test_bad_response_stops_before_clips(self):
         with self.assertRaises(pipeline.PipelineError): self.run_it(finder=lambda *a:[{'start':99,'end':101}])
         self.assertEqual(len(self.downloads),1)

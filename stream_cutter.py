@@ -1,6 +1,9 @@
 # Ported from narezkobot/narezka-restored; comments and docstrings omitted for transport.
 from __future__ import annotations
 import banner_blur
+import clip_recovery as checkpoints
+from contextlib import nullcontext
+from pathlib import Path
 import argparse
 import functools
 from fractions import Fraction
@@ -625,8 +628,10 @@ def item_duration(item) -> float:
         return float(item[1] - item[0])
     return sum((e - s for s, e in item))
 
-def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, hwaccel: str | None, jobs_n: int, progress_callback=None) -> list[str]:
-    results: dict[int, str] = {}
+def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, hwaccel: str | None, jobs_n: int, progress_callback=None, reuse=None) -> list[str]:
+    results: dict[int, str] = dict(reuse or {})
+    for i in results:
+        prog.set(i,item_duration(jobs[i])); prog.complete(i)
     failures: list[str] = []
 
     def worker(idx: int, item):
@@ -651,17 +656,20 @@ def run_jobs(ffmpeg: str, jobs: list, cmd_builder, prog: Progress, tmpdir: str, 
                 except Exception: pass  # Progress reporting must not stop encoding.
     t = threading.Thread(target=printer, daemon=True)
     t.start()
-    with ThreadPoolExecutor(max_workers=jobs_n) as ex:
-        futs = [ex.submit(worker, i, item) for i, item in enumerate(jobs)]
-        for fut in as_completed(futs):
-            idx, out, rc = fut.result()
-            prog.complete(idx)
-            if rc != 0:
-                failures.append(os.path.join(tmpdir, f'log{idx:05d}.txt'))
-            else:
-                results[idx] = out
-    stop.set()
-    t.join(timeout=1)
+    try:
+        with ThreadPoolExecutor(max_workers=jobs_n) as ex:
+            order=sorted((i for i in range(len(jobs)) if i not in results),key=lambda i:-item_duration(jobs[i]))
+            futs = [ex.submit(worker, i, jobs[i]) for i in order]
+            for fut in as_completed(futs):
+                idx, out, rc = fut.result()
+                prog.complete(idx)
+                if rc != 0:
+                    failures.append(os.path.join(tmpdir, f'log{idx:05d}.txt'))
+                else:
+                    results[idx] = out
+    finally:
+        stop.set()
+        t.join(timeout=1)
     print('\r' + ' ' * 90 + '\r', end='', flush=True)
     if failures:
         tail = ''
@@ -677,10 +685,15 @@ def concat_parts(ffmpeg: str, parts: list[str], out: str) -> None:
     lst = os.path.join(os.path.dirname(parts[0]), 'final.txt')
     with open(lst, 'w', encoding='utf-8') as fh:
         for f in parts:
-            fh.write(f"file '{f}'\n")
+            # All generated parts are beside the list. Relative names also handle apostrophes in parent folders.
+            fh.write("file '"+os.path.basename(f).replace("'", "'\\''")+"'\n")
     cmd = [ffmpeg, '-hide_banner', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', lst, '-map', '0', '-c', 'copy', *final_mux_args(out), '-y', out]
-    if run(cmd).returncode != 0:
-        raise CutterError('финальная склейка не удалась')
+    result=run(cmd)
+    if result.returncode != 0:
+        try: space=f'{shutil.disk_usage(os.path.dirname(os.path.abspath(out))).free/2**30:.2f} ГБ'
+        except OSError: space='неизвестно'
+        tail=' | '.join((result.stderr or '').splitlines()[-8:])[-1200:]
+        raise CutterError(f'финальная склейка не удалась: FFmpeg {result.returncode}; свободно {space}; {tail or "stderr пуст"}')
 
 def measured_timeline(groups, part_info, output_info):
     """Map single-range encoded parts using actual concat container durations.
@@ -789,7 +802,14 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
         fps_flags = fps_mode_flag(ffmpeg)
         if fps_src:
             fps_flags = ['-r', str(fps_src)] + fps_flags
-    with tempfile.TemporaryDirectory() as tmpdir:
+    cache_root=getattr(args,'parts_cache',None) if not args.fast else None
+    persistent=None
+    if cache_root:
+        signature=checkpoints.digest([1,os.path.abspath(src),checkpoints.stamp(src),keep,vars(args),fps_flags,
+                                      os.path.abspath(ffmpeg),checkpoints.stamp(ffmpeg),n_audio])
+        persistent=Path(cache_root)/signature[:32]
+        persistent.mkdir(parents=True,exist_ok=True)
+    with (nullcontext(str(persistent)) if persistent else tempfile.TemporaryDirectory()) as tmpdir:
         if args.fast:
             jobs = list(keep)
             total = sum((e - s for s, e, *_ in jobs))
@@ -812,7 +832,21 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
             if fps_flags:
                 print(f"fps         : {' '.join(fps_flags)}")
             print('старт ...', flush=True)
-            parts = run_jobs(ffmpeg, groups, builder, prog, tmpdir, hwaccel, jobs_n, progress_callback)
+            reuse={}
+            if persistent:
+                stamps=checkpoints.read(persistent/'parts.json')
+                if isinstance(stamps,list) and len(stamps)==len(groups):
+                    for i,expected in enumerate(stamps):
+                        p=persistent/f'part{i:05d}.mkv'
+                        try:
+                            if checkpoints.stamp(p)==expected and expected[0]>0:
+                                info=probe(str(p),ffprobe)
+                                if video_stream(info) and len(audio_streams(info))==n_audio and abs(duration_of(info)-item_duration(groups[i]))<.5:
+                                    reuse[i]=str(p)
+                        except (OSError,CutterError,ValueError): pass
+                if reuse and progress_callback: progress_callback(f'Части из кэша: {len(reuse)}/{len(groups)}')
+            parts = run_jobs(ffmpeg, groups, builder, prog, tmpdir, hwaccel, jobs_n, progress_callback, reuse=reuse)
+            if persistent: checkpoints.save(persistent/'parts.json',[checkpoints.stamp(p) for p in parts])
         print('склейка ...', flush=True)
         if progress_callback: progress_callback('Склейка частей')
         concat_parts(ffmpeg, parts, out)
@@ -822,6 +856,7 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
             part_info=probe_parts(parts,ffprobe,progress_callback)
             output_info=probe(out,ffprobe)
             res['render_timeline']=measured_timeline(groups,part_info,output_info)
+    if persistent: shutil.rmtree(persistent,ignore_errors=True)
     print(f'готово      : {out}')
     print(f'              длительность {fmt(duration_of(probe(out, ffprobe)))}')
     return out

@@ -113,10 +113,6 @@ class ChatGPTFinder:
             self._save_state(account,checked_at=time.time(),session=False)
             return False
 
-    SAFETY_TRIES=4  # hidden answers in a row (each time in a fresh chat) before the job fails
-    SAFETY_NOTE=('\n\nВажно: предыдущий ответ скрыл фильтр безопасности ChatGPT. Ответь строго в том же формате, но нейтрально и сухо: '
-                 'не цитируй мат, оскорбления, откровенные или жестокие фразы — описывай такие места обобщённо.')
-
     def _ask_document(self,instructions,document,filename,timeout,log=None,need='reactions',validate_response=None,predicate=None):
         with self._lock:
             import lang as lang_mod
@@ -144,46 +140,38 @@ class ChatGPTFinder:
             from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError, ChatGPTSafetyError
             accounts=self._accounts()
             accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x != self._account]
-            blocked=[]; signed_out=[]; failed=[]; safety=0; ask_prompt=prompt; text=None
+            blocked=[]; signed_out=[]; text=None
             for account in accounts:
                 web=self._browser(account); web.timeout=int(timeout); web.offscreen=False
                 if log: log(f'ChatGPT: профиль {account} — отправка транскрипта и ожидание ответа')
                 web.status_callback=log
                 try:
-                    # Answer hidden by the safety filter: ask again in a fresh chat (twice per profile), then on the next profile.
-                    for same in range(2):
-                        try:
-                            text=(web.ask(ask_prompt,[str(path)],until=predicate).get('text') or '').strip()
-                            break
-                        except ChatGPTSafetyError:
-                            safety+=1
-                            if safety>=self.SAFETY_TRIES:
-                                raise ChatGPTSafetyError(f'ChatGPT скрыл ответ из соображений безопасности {safety} раз подряд — новые чаты и другие профили не помогли. Транскрипт сохранён в кэше')
-                            web._force_new_chat=True
-                            ask_prompt=instructions+self.SAFETY_NOTE+'\n\nПроанализируй приложенный файл с транскриптом.'
-                            if log: log(f'ChatGPT: {account} скрыл ответ из соображений безопасности — открываю новый чат и прошу снова (попытка {safety+1}/{self.SAFETY_TRIES})'+('; дальше — следующий профиль' if same else ''))
-                    if text is not None: break
+                    text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
+                    break
                 except ChatGPTQuotaError:
-                    if getattr(web,'_send_uncertain',False):
+                    if getattr(web,'_send_uncertain',False) or getattr(web,'_sent_confirmed',False):
                         raise RuntimeError('ChatGPT: обнаружен лимит, но отправка могла произойти; проверьте чат вручную')
                     blocked.append(account)
                     if log: log(f'ChatGPT: у {account} лимит загрузок; запрос не отправлен')
                 except ChatGPTLoginError:
+                    if getattr(web,'_send_uncertain',False) or getattr(web,'_sent_confirmed',False):
+                        raise RuntimeError('Вход истёк после отправки; проверьте тот же чат, повтор отключён')
                     signed_out.append(account)
                     if log: log(f'ChatGPT: {account} не авторизован — пропускаю профиль')
                 except ChatGPTSafetyError:
                     raise
                 except Exception as exc:
-                    # Любая другая (непредвиденная) ошибка ChatGPT на этом профиле — просто берём следующий аккаунт.
-                    if 'Порт браузера' in str(exc): raise  # не проблема аккаунта: остальные упадут так же
-                    text=None
-                    failed.append(f'{account}: {type(exc).__name__}: {str(exc)[:120]}')
-                    if log: log(f'ChatGPT: {account} — ошибка ({type(exc).__name__}: {str(exc)[:160]}) — пробую следующий аккаунт')
+                    state='отправка подтверждена' if getattr(web,'_sent_confirmed',False) else 'доставка не подтверждена'
+                    hint=f'ChatGPT: {account}, {state}. Проверьте тот же чат; повторной отправки нет.'
+                    exc.delivery_hint=hint
+                    if log: log(hint)
+                    raise
                 finally:
                     web.status_callback=None
             else:
-                if safety: raise ChatGPTSafetyError(f'ChatGPT скрыл ответ из соображений безопасности ({safety} раз), а других доступных профилей нет. Транскрипт сохранён в кэше')
-                raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'; ошибки: '+(' | '.join(failed) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
+                message='ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')
+                if blocked: raise ChatGPTQuotaError(message)
+                raise ChatGPTLoginError(message)
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
             if validate_response is not None: validate_response(text)
             cache.parent.mkdir(parents=True,exist_ok=True)

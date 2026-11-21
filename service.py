@@ -2,6 +2,8 @@
 from __future__ import annotations
 import copy
 import threading
+import os
+import local_intake
 import time
 from collections import deque
 from job_store import JobStore
@@ -24,6 +26,7 @@ class Service:
         self.stop_event=threading.Event(); self.wake=threading.Event()
         self._threads=[]; self._logs=deque(maxlen=200); self._lock=threading.Lock()
         self._monitor=None; self._monitor_key=None; self._monitor_failures=set()
+        self._input_lock=threading.RLock(); self._pending_inputs=set()
         self._watch_state={}; self._watch_generation=0; self._youtube_wait_message=''; self._youtube_batch_blocked=set()
 
     def log(self,text):
@@ -42,7 +45,7 @@ class Service:
         with self._lock: return list(self._logs)
     def recover_interrupted(self):
         if any(t.is_alive() for t in self._threads): return 0
-        interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов','Готово'))
+        interrupted=self.store.recover_interrupted(safe_stages=('Запуск','Скачивание','Транскрибация','Нарезка','Рендер','Проверка нарезки','Организация файлов','Готово'))
         youtube_interrupted=self.youtube_queue.recover_interrupted()
         detached=self.youtube_queue.detach_previous_submitted()
         if detached:self.log(f'YouTube: прежних отправленных видео {detached}; статус после перезапуска не подтверждён, новые публикации не блокируются')
@@ -65,6 +68,7 @@ class Service:
             self._watch_generation+=1; self._watch_state.clear()
         self._threads=[threading.Thread(target=self._monitor_loop,name='twitch-monitor',daemon=True),
                        threading.Thread(target=self._worker_loop,name='clip-worker',daemon=True),
+                       threading.Thread(target=self._input_loop,name='local-input-check',daemon=True),
                        threading.Thread(target=self._youtube_loop,name='youtube-worker',daemon=True),
                        threading.Thread(target=self._copyright_loop,name='copyright-doctor',daemon=True)]
         for t in self._threads:t.start()
@@ -197,18 +201,42 @@ class Service:
             api=self.api_factory(tw['client_id'],tw['client_secret'],proxy)
             self._monitor=Monitor(self.store,api); self._monitor_key=key
         return self._monitor
-    def queue_test_inputs(self):
+    @property
+    def pending_input_count(self):
+        with self._input_lock: return len(self._pending_inputs)
+
+    def _input_loop(self):
+        while not self.stop_event.wait(3):
+            if self.pending_input_count:
+                try: self.queue_test_inputs(pending_only=True)
+                except OSError as exc: self.log(f'Проверка test_input: {type(exc).__name__}')
+
+    def queue_test_inputs(self,pending_only=False):
+        with self._input_lock: return self._queue_inputs_locked(pending_only)
+
+    def _queue_inputs_locked(self,pending_only):
         folder=self.root/'test_input'; folder.mkdir(parents=True,exist_ok=True)
-        extensions={'.mp4','.mkv','.mov','.webm','.m4v','.avi'}
         added=0; active=0
-        for path in sorted(folder.iterdir(),key=lambda p:p.name.casefold()):
-            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in extensions: continue
-            st=path.stat()
-            if st.st_size <= 0: continue
-            _,created=self.store.add_local(path.name,st.st_size,st.st_mtime_ns)
+        paths=self._pending_inputs.copy() if pending_only else folder.iterdir()
+        for path in sorted(paths,key=lambda p:p.name.casefold()):
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in local_intake.EXTENSIONS:
+                self._pending_inputs.discard(path); continue
+            try:
+                with local_intake.ready_reader(path) as f:
+                    st=os.fstat(f.fileno())
+                    if st.st_size<=0: self._pending_inputs.discard(path); continue
+                    _,created=self.store.add_local(path.name,st.st_size,st.st_mtime_ns)
+            except OSError as exc:
+                if getattr(exc,'winerror',0) not in (32,33):
+                    self._pending_inputs.discard(path)
+                    if isinstance(exc,FileNotFoundError): continue
+                    raise
+                if path not in self._pending_inputs: self.log(f'{path.name}: файл ещё копируется, повторная проверка автоматически')
+                self._pending_inputs.add(path); continue
+            self._pending_inputs.discard(path)
             if created: added+=1
             else: active+=1
-        if added: self.log(f'Тестовых видео добавлено в очередь: {added}')
+        if added: self.log(f'Тестовых видео добавлено в очередь: {added}'); self.wake.set()
         return added,active
 
     def save_manual_reactions(self, job_id, text):
@@ -372,6 +400,7 @@ class Service:
         except Exception as exc:
             # No replay without reconciliation: a web request may have been delivered.
             detail=redact(f'{type(exc).__name__}: {str(exc)[:2000]}')
+            if getattr(exc,'delivery_hint',''): detail+='\n'+redact(exc.delivery_hint)
             # Defensive redact of configured secrets and proxy credentials.
             for saved in (cfg,):
                 try:
@@ -379,6 +408,10 @@ class Service:
                         if secret: detail=detail.replace(secret,'[скрыто]')
                 except (TypeError,KeyError): pass
             current=next((x for x in self.store.list_jobs(1000) if x['id']==job['id']),None)
+            draft=getattr(exc,'manual_draft',None)
+            if isinstance(draft,str) and 0<len(draft)<=1_000_000:
+                try: atomic_json(manual_answer_path(self.root,job['id']).with_suffix('.draft.json'),{'job':job_identity(job),'text':draft})
+                except OSError: pass
             safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов') and not isinstance(exc,(InvalidRenderTimeline,BannerSetupError,BannerResponseError))
             # Сразу после конца стрима Twitch ещё собирает запись: TwitchDownloader отвечает
             # «Invalid VOD, deleted/expired VOD possibly?». Это не ошибка — ждём дольше и повторяем.

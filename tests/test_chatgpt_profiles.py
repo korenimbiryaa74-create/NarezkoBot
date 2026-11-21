@@ -31,6 +31,8 @@ class ProfileTests(unittest.TestCase):
                 if outcome=='login':raise ChatGPTLoginError('login')
                 if outcome=='uncertain':self._send_uncertain=True;raise ChatGPTQuotaError('quota')
                 if outcome=='network':raise RuntimeError('network')
+                if outcome=='sent_timeout': self._sent_confirmed=True; raise TimeoutError('answer timed out')
+                if outcome=='sent_limit': self._sent_confirmed=True; raise ChatGPTQuotaError('quota')
                 return {'text':'{"reactions":[]}'}
             def close(self):outer.closed.append(self.account)
         self.finder=ChatGPTFinder(self.root,web_factory=Web)
@@ -57,6 +59,14 @@ class ProfileTests(unittest.TestCase):
                 self.attempts.clear();self.outcomes['acc_01']=outcome
                 with self.assertRaises(RuntimeError):self.ask()
                 self.assertEqual(self.attempts,['acc_01'])
+    def test_confirmed_send_never_replayed_on_second_profile(self):
+        self.add('acc_02')
+        for outcome,error in [('sent_timeout',TimeoutError),('sent_limit',RuntimeError)]:
+            with self.subTest(outcome=outcome):
+                self.attempts.clear(); self.outcomes['acc_01']=outcome
+                with self.assertRaises(error):self.ask()
+                self.assertEqual(self.attempts,['acc_01'])
+
     def test_no_unregistered_profile(self):
         (self.root/'gpt_accounts'/'acc_02').mkdir(parents=True)
         self.outcomes['acc_01']='quota'
@@ -82,7 +92,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_busy_port_prevents_attaching_to_wrong_profile(self):
         web=ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),verbose=False)
-        with patch.object(web,'_debug_port_busy',return_value=True), patch('chatgpt_web.subprocess.Popen') as popen:
+        with patch.object(web,'_debug_port_busy',return_value=True), patch.object(web,'_close_stale_chrome',return_value=False), patch('chatgpt_web.subprocess.Popen') as popen:
             with self.assertRaisesRegex(Exception,'занят'): web.start()
             popen.assert_not_called()
 

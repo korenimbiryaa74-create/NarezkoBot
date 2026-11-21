@@ -1139,7 +1139,11 @@ def find_reactions_whole(video, segs, dur, cfg, proxies=None, extra=None, who=''
         if clean and (row['start'], row['end']) == (clean[-1]['start'], clean[-1]['end']):
             continue
         if clean and row['start'] < clean[-1]['end']:
-            raise ReactionsError('ChatGPT вернул перекрывающиеся реакции; не режу по сомнительным границам')
+            def describe(r):
+                return f"{tr.fmt_short(r['start']+offset)} .. {tr.fmt_short(r['end']+offset)}: {r['title'][:80]}"
+            err=ReactionsError('ChatGPT вернул перекрывающиеся реакции:\n'+describe(clean[-1])+'\n'+describe(row)+'\nИсправьте границы в полном ответе, затем повторите задание.')
+            if not note: err.manual_draft=manual_answer if manual_answer is not None else raw
+            raise err
         clean.append(row)
     for n, row in enumerate(clean):
         row['_grp'] = n  # parts of one split discussion share it (kept or dropped together)

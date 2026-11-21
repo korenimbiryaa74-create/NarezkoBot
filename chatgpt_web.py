@@ -448,7 +448,9 @@ class ChatGPTWeb:
     JS_IMGS = "(()=>{const rx=/oaiusercontent|estuary\\/content|\\/backend-api\\/files|persistent\\.oaistatic|videos\\.openai/;return Array.from(document.querySelectorAll('img')).map(i=>i.currentSrc||i.src||'').filter(u=>rx.test(u));})()"
     JS_COMPOSER = "document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea')"
     JS_READY = '(()=>{\nconst e=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nconst hydrated=!!e&&(!!e.pmViewDesc||Object.keys(e).some(k=>k.startsWith(\'__reactProps$\')||k.startsWith(\'__reactFiber$\')));\nif(!hydrated||document.readyState===\'loading\'||!e.getClientRects().length||e.disabled)return {ok:false};\nif(!e.dataset.twl){e.dataset.twl=String(Math.random());}\nconst busy=!!document.querySelector(\'button[data-testid="stop-button"]\');\nreturn {ok:true,mark:e.dataset.twl,busy:busy,\n page:window.__twlPage||(window.__twlPage=String(Math.random())),\n path:location.pathname,\n msgs:document.querySelectorAll(\'[data-message-author-role],[data-turn="user"],[data-turn="assistant"]\').length};\n})()'
-    JS_COMPOSER_TEXT = "(()=>{const e=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');return e?(e.innerText||e.value||''):null;})()"
+    _EDITOR = "Array.from(document.querySelectorAll('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea')).find(e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden'&&!e.disabled&&!e.readOnly&&(e.isContentEditable||e.tagName==='TEXTAREA'))"
+    JS_COMPOSER_TEXT = "(()=>{const e="+_EDITOR+";return e?(e.tagName==='TEXTAREA'?e.value:e.innerText):null;})()"
+    JS_FOCUS_EDITOR = "(()=>{const e="+_EDITOR+";if(!e)return false;e.scrollIntoView({block:'center'});e.focus();if(!e.contains(document.activeElement))return false;if(e.tagName==='TEXTAREA')e.select();else{const r=document.createRange();r.selectNodeContents(e);const s=getSelection();s.removeAllRanges();s.addRange(r);}return true;})()"
     JS_USER_MSGS = 'document.querySelectorAll(\'[data-message-author-role="user"],[data-turn="user"]\').length'
     JS_SEND_STATE = '(()=>{\nconst e=document.querySelector(\'#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea\');\nconst visible=n=>!!n&&n.getClientRects().length>0&&getComputedStyle(n).visibility!==\'hidden\';\nconst label=n=>(n.getAttribute(\'aria-label\')||n.getAttribute(\'title\')||\'\').trim();\nconst stopLabel=n=>/^(?:stop(?:\\s|$)|остановить(?:\\s|$)|прекратить(?:\\s|$))/i.test(label(n));\nconst sendLabel=n=>/^(?:send(?:\\s|$)|submit(?:\\s|$)|отправить(?:\\s|$))/i.test(label(n));\nconst known=\'button[data-testid="send-button"],button[data-testid="composer-submit-button"],button#composer-submit-button\';\nlet scope=e?(e.closest(\'form\')||e.parentElement):null;\nif(scope&&!scope.matches(\'form\')){\n  for(let i=0;i<5&&scope;i++){\n    if(scope.querySelector(known)||Array.from(scope.querySelectorAll(\'button\')).some(sendLabel))break;\n    scope=scope.parentElement;\n  }\n}\nscope=scope||document;\nconst buttons=Array.from(scope.querySelectorAll(\'button\')).filter(visible);\nconst stop=Array.from(document.querySelectorAll(\'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],button[data-testid="stop-generating"]\')).some(visible)||buttons.some(stopLabel);\nconst b=buttons.find(n=>n.matches(known)&&!stopLabel(n))||buttons.find(n=>sendLabel(n)&&!stopLabel(n))||\n  (scope.tagName===\'FORM\'?buttons.find(n=>n.type===\'submit\'&&!stopLabel(n)):null);\nconst uploading=Array.from(scope.querySelectorAll(\'[role="progressbar"],[aria-busy="true"],.animate-spin,[data-state="uploading"]\')).some(visible);\nconst alerts=Array.from(scope.querySelectorAll(\'[role="alert"],[data-testid="file-upload-error"],[data-testid="upload-error"],[data-state="error"]\')).filter(visible).map(n=>n.innerText||\'\').join(\' \');\nconst uploadError=/(?:upload|file|файл|загруз)/i.test(alerts)&&/(?:error|fail|ошиб|не удалось|невозможно)/i.test(alerts);\nconst text=e?(e.value!==undefined?e.value:(e.innerText||e.textContent||\'\')):\'\';\nlet x=null,y=null,hit=false,key=null;\nif(b){\n  if(!b.dataset.twlSend)b.dataset.twlSend=String(Math.random());key=b.dataset.twlSend;\n  const r=b.getBoundingClientRect();x=r.x+r.width/2;y=r.y+r.height/2;\n  const top=document.elementFromPoint(x,y);hit=!!top&&(top===b||b.contains(top));\n}\nreturn {has:!!b,disabled:!b||b.disabled||b.getAttribute(\'aria-disabled\')===\'true\',stop,\n uploading,uploadError,text,x,y,hit,key,\n users:document.querySelectorAll(\'[data-message-author-role="user"],[data-turn="user"]\').length,\n assistants:document.querySelectorAll(\'[data-message-author-role="assistant"],[data-turn="assistant"]\').length};\n})()'
     # 2026-11 markup: user turns are data-user-message-bubble / ...:user; network upload failures are shown as a
@@ -634,13 +636,9 @@ return {items};
         want = self._norm(prompt)
         for attempt in range(3):
             self._dismiss_popups(force=True)
-            box = tab.js("(()=>{const e=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');if(!e)return null;e.scrollIntoView({block:'center'});e.focus();const r=e.getBoundingClientRect();return {x:r.x+Math.min(r.width/2,200),y:r.y+r.height/2};})()")
-            if not box:
+            if not tab.js(self.JS_FOCUS_EDITOR):
                 self._wait_ready(30)
                 continue
-            tab.call('Input.dispatchMouseEvent', type='mousePressed', x=box['x'], y=box['y'], button='left', clickCount=1)
-            tab.call('Input.dispatchMouseEvent', type='mouseReleased', x=box['x'], y=box['y'], button='left', clickCount=1)
-            tab.js("(()=>{const e=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');if(e&&(e.innerText||e.value||'').trim()){e.focus();document.execCommand('selectAll',false,null);}})()")
             tab.call('Input.insertText', text=prompt)
             time.sleep(0.8 + attempt)
             got = self._norm(tab.js(self.JS_COMPOSER_TEXT) or '')
@@ -681,12 +679,13 @@ return {items};
             if int(st.get('users', 0)) > before_users or int(st.get('assistants', 0)) > before_assistants or (st.get('stop') and (clicks or not baseline.get('stop'))):
                 self._send_uncertain = False
                 self._log('отправка подтверждена: новый ход чата / генерация')
+                self._sent_confirmed = True
                 return True
             self._check_upload_quota()
             if st.get('uploadError'):
                 if not clicks:
                     raise ChatGPTUploadFailed('ChatGPT: «Загрузка не удалась» — файл не принят, запрос НЕ отправлен')
-                raise ChatGPTWebError('ChatGPT сообщил об ошибке загрузки файла; запрос НЕ отправлен')
+                raise ChatGPTWebError('Ошибка загрузки после клика; доставка неизвестна. Проверьте открытый чат')
             current = self._norm(st.get('text', ''))
             # Nothing was sent: no new turn, no generation, the same full text is still in the field, button active.
             unsent = bool(st.get('has') and not st.get('stop') and not st.get('disabled') and not st.get('uploading')
@@ -708,16 +707,10 @@ return {items};
                     self._status('клик не дошёл до кнопки — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
                     self._log(f'клик не дошёл до кнопки ({why}); запрос точно не ушёл — '
                               f'нажимаю ещё раз {"через DOM" if use_dom else "мышью"} ({missed}/3)')
-                elif unsent and landed is not False and real < 3 and since >= 8:
-                    reclick = True
-                    use_dom = not use_dom
-                    self._status('кнопка нажата, но запрос не ушёл — текст всё ещё в поле; нажимаю «Отправить» ещё раз')
-                    self._log(f'после нажатия прошло {int(since)} с ({"клик дошёл до кнопки" if landed else "доход клика неизвестен"}), '
-                              f'но текст в поле и новых сообщений нет — нажимаю ещё раз ({real + 1}/3)')
                 if not reclick:
                     if time.monotonic() >= next_log:
                         seen = ' (клик дошёл до кнопки)' if landed else ' (проверяю, дошёл ли клик)' if landed is False else ''
-                        can_retry = (missed < 3) if landed is False else (real < 3)
+                        can_retry = landed is False and missed < 3
                         if unsent and can_retry:
                             left = max(1, int(8 - since)) if landed is not False else 1
                             self._status(f'кнопка нажата{seen}; жду отправку, если не уйдёт — через {left} с нажму ещё раз ({real + 1}/3)')
@@ -829,6 +822,7 @@ return {items};
     def ask(self, prompt: str, files: list=None, until=None) -> dict:
         with self._profile_lock:
             self._send_uncertain = False
+            self._sent_confirmed = False
             self._answer_unreadable = False
             self.last_answer = ''
             self._pending_prompt = ''
@@ -843,7 +837,7 @@ return {items};
                         return self._ask_locked(prompt, files, until)
                     except ChatGPTUploadFailed as exc:
                         # Nothing was sent: reload the page and attach + send again.
-                        if upload_try == 2 or self._remaining(60) < 30:
+                        if self._send_uncertain or self._sent_confirmed or upload_try == 2 or self._remaining(60) < 30:
                             raise
                         self._log(f'{exc}; перезагружаю страницу и отправляю заново ({upload_try + 2}/3)')
                         self._status('загрузка файла не удалась — перезагружаю страницу и отправляю заново')

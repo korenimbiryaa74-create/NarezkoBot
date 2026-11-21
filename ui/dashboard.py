@@ -35,6 +35,7 @@ class Dashboard:
             ft.Row([s1,s2,s3],spacing=16),
             card(ft.Row([
                 ft.FilledTonalButton('Тест из папки',icon=ft.Icons.SCIENCE,on_click=lambda e:app.spawn(self._start_test)),
+                ft.OutlinedButton('Импорт видео',icon=ft.Icons.FILE_OPEN,on_click=lambda e:app.spawn(self._import_video)),
                 ft.FilledTonalButton('Запись Twitch по ссылке',icon=ft.Icons.LINK,on_click=lambda e:app.spawn(self._add_vod)),
                 ft.FilledTonalButton('Продолжить очередь',icon=ft.Icons.PLAY_CIRCLE_OUTLINE,on_click=lambda e:app.spawn(self._resume)),
                 ft.OutlinedButton('Папка тестовых видео',icon=ft.Icons.FOLDER_OPEN,on_click=lambda e:app.open_folder('test_input')),
@@ -101,12 +102,13 @@ class Dashboard:
         app=self.app;acts=[]
         if j['state']=='failed':
             acts+=[ft.IconButton(ft.Icons.REPLAY,tooltip='Повторить задание',on_click=lambda e,j=j:app.spawn(self._retry,j)),
-                   ft.IconButton(ft.Icons.CONTENT_PASTE,tooltip='Вставить ответ ChatGPT из буфера',on_click=lambda e,j=j:app.spawn(self._import_answer,j))]
+                   ft.IconButton(ft.Icons.CONTENT_PASTE,tooltip='Проверить и исправить ответ ChatGPT',on_click=lambda e,j=j:app.spawn(self._import_answer,j))]
         if j['state']=='done':
             acts.append(ft.IconButton(ft.Icons.INVENTORY_2,tooltip='Собрать готовые файлы',on_click=lambda e,j=j:app.spawn(self._organize,j)))
         if j.get('output_dir'):
             acts.append(ft.IconButton(ft.Icons.FOLDER_OPEN,tooltip='Открыть папку',on_click=lambda e,j=j:app.open_path(j['output_dir'])))
         acts.append(ft.IconButton(ft.Icons.CONTENT_COPY,tooltip='Скопировать подробности',on_click=lambda e,j=j:app.spawn(self._copy_job,j)))
+        acts.append(ft.IconButton(ft.Icons.TIMER,tooltip='Время этапов и кэш',on_click=lambda e,j=j:app.spawn(self._timing,j)))
         vod='локально' if j.get('local_name') else str(j['vod_id'])
         return ft.Container(ft.Row([
             muted('№'+str(j['id']),size=12,width=44),
@@ -123,10 +125,25 @@ class Dashboard:
         if not await app.ensure_settings_saved():return
         try:
             added,active=app.service.queue_test_inputs()
-            if not added and not active:await app.dialogs.info('Тест','Поместите видео в папку test_input и запустите тест снова.');return
+            pending=app.service.pending_input_count
+            if not added and not active and not pending:await app.dialogs.info('Тест','Поместите видео в папку test_input и запустите тест снова.');return
             if not app.service.start():await app.dialogs.info('Тест','Задание в очереди; дождитесь остановки и нажмите «Продолжить очередь».');return
-            app.dialogs.toast(f'Тест: добавлено {added}, уже в очереди {active}','ok');app.refresh_soon()
+            app.dialogs.toast(f'Тест: добавлено {added}, уже в очереди {active}, ещё копируются {pending}','ok');app.refresh_soon()
         except Exception as exc:await app.dialogs.error('Тест',str(exc))
+
+    async def _import_video(self):
+        import local_intake
+        app=self.app
+        files=await app.file_picker.pick_files(dialog_title='Импорт в test_input',allowed_extensions=sorted(x[1:] for x in local_intake.EXTENSIONS))
+        if not files or not files[0].path:return
+        try: path=await asyncio.to_thread(local_intake.import_file,files[0].path,app.root/'test_input')
+        except (OSError,ValueError) as exc: await app.dialogs.error('Импорт видео',str(exc));return
+        await app.dialogs.info('Импорт видео',f'{path.name} скопирован. Теперь можно нажать «Тест из папки».')
+
+    async def _timing(self,j):
+        from job_timing import summary
+        events=await asyncio.to_thread(self.app.service.store.events,j['id'])
+        await self.app.dialogs.info(f"Время этапов · №{j['id']}",summary(events))
 
     async def _add_vod(self):
         """Process any Twitch VOD by link (e.g. to test game clips on a streamer that is not monitored)."""
@@ -190,10 +207,13 @@ class Dashboard:
 
     async def _import_answer(self,j):
         app=self.app
-        text=(await app.clipboard.get()) or ''
-        if not text.strip():await app.dialogs.error('Ответ ChatGPT','Буфер обмена пуст. Скопируйте полный ответ из нужного чата.');return
-        if not await app.dialogs.confirm('Ответ ChatGPT',f'Это полный ответ о реакциях или донатах именно для задания №{j["id"]}? '
-                                         'Он будет использован вместо нового запроса к ChatGPT.','Использовать'):return
+        from pipeline import load_json,manual_answer_path,job_identity
+        draft=load_json(manual_answer_path(app.root,j['id']).with_suffix('.draft.json')) or {}
+        text=draft.get('text','') if draft.get('job')==job_identity(j) else ''
+        field=ft.TextField(label='Полный ответ для этого задания',value=text or (await app.clipboard.get()) or '',multiline=True,min_lines=5,max_lines=12)
+        body=ft.Column([ft.Text(str(j.get('detail') or ''),selectable=True),field],tight=True,scroll=ft.ScrollMode.AUTO)
+        if await app.dialogs._show(f"Ответ ChatGPT · №{j['id']}",body,[('Отмена',None,False),('Проверить и сохранить','ok',True)],width=720)!='ok':return
+        text=field.value or ''
         try:
             count=app.service.save_manual_reactions(int(j['id']),text)
             await app.dialogs.info('Ответ ChatGPT',f'Ответ сохранён; интервалов: {count}. Теперь повторите задание и продолжите очередь.')

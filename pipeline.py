@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import full_cycle
+import clip_recovery as checkpoints
 import publication_guard
 import banner_blur
 import manual_blur
@@ -285,7 +286,7 @@ def _download_status(log, total, count, concat, threads):
     except OSError: pass
     if concat and not stage: stage='склейка'
     gb=total/1024**3
-    parts=[(stage+' '+pct).strip() if (stage or pct) else 'скачано', (f'{gb:.1f} ГБ' if gb>=1 else f'{total/1024**2:.0f} МБ'), f'частей {count}', f'{threads} потоков']
+    parts=[(stage+' '+pct).strip() if (stage or pct) else 'скачано', (f'{gb:.1f} ГБ' if gb>=1 else f'{total/1024**2:.0f} МБ') if count else '', f'частей {count}' if count else '', f'{threads} потоков']
     return ' · '.join(p for p in parts if p)
 
 def _run_download(command, cli, run_env, output, stall=None, concat_stall=None, attempts=None, poll=15):
@@ -302,23 +303,32 @@ def _run_download(command, cli, run_env, output, stall=None, concat_stall=None, 
             # stdout goes to the same log: its [STATUS] lines give the real progress percentage.
             proc=subprocess.Popen(command+['--temp-path',str(parts)],cwd=str(Path(cli).parent),env=run_env,stdout=err,stderr=err,creationflags=low_impact.creation_flags())
             try:
-                last=None; changed=time.monotonic()
+                changed=time.monotonic(); last=None; last_parts=None; next_scan=changed
+                total=count=0; concat=False
                 while proc.poll() is None:
-                    time.sleep(poll)
-                    total,count,concat=_parts_state(parts)
-                    DOWNLOAD_STATUS[str(output)]=_download_status(log,total,count,concat,threads)
+                    try: proc.wait(timeout=poll); break
+                    except subprocess.TimeoutExpired: pass
+                    now=time.monotonic()
+                    status=_download_status(log,0,0,False,threads)
                     try: out_size=os.path.getsize(output)
                     except OSError: out_size=0
-                    state=(total,count,out_size)
-                    if state!=last: last=state; changed=time.monotonic()
-                    elif time.monotonic()-changed>(concat_stall if concat else stall):
+                    state=(status,out_size)
+                    if state!=last: last=state; changed=now
+                    if now>=next_scan and now-changed>=min(60,stall/2):
+                        total,count,concat=_parts_state(parts); next_scan=now+min(60,stall/2)
+                        if (total,count)!=last_parts: last_parts=(total,count); changed=now
+                    DOWNLOAD_STATUS[str(output)]=status
+                    combining=concat or 'склейка' in status or 'завершение' in status
+                    if now-changed>(concat_stall if combining else stall):
                         stalled=True; _kill_tree(proc.pid)
                         try: proc.wait(timeout=60)
                         except Exception: pass
                         break
             except BaseException:
                 _kill_tree(proc.pid); raise
-        try: stderr=log.read_text(encoding='utf8',errors='replace')
+        try:
+            with log.open('rb') as fh:
+                fh.seek(max(0,fh.seek(0,2)-65536)); stderr=fh.read().decode('utf8','replace')
         except OSError: stderr=''
         DOWNLOAD_STATUS.pop(str(output),None)
         shutil.rmtree(parts,ignore_errors=True)
@@ -519,6 +529,7 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     ffmpeg,ffprobe=stream_cutter.require_tools()
     args=stream_cutter.parse_args([])
     args.out=str(output)
+    args.parts_cache=str(Path(output).parent/'_work'/'render-parts')
     # Keep the cutter's generated timeline away from the user's input file.
     args.timeline=str(Path(output).parent/'_work'/(Path(output).stem+'.timeline.json'))
     args.min_cut=float(silence_cfg.get('min_cut',1.5)); args.max_gap=float(silence_cfg.get('max_gap',2.0))
@@ -798,7 +809,8 @@ class Pipeline:
             if chat_mode.get('game',False):
                 try:
                     import twitch_vod
-                    twitch_vod.prefetch_chat(vod_id,work,cli,log=lambda m:progress('Скачивание',m))
+                    # Background chat updates must never overwrite the foreground GPT/recovery stage.
+                    twitch_vod.prefetch_chat(vod_id,work,cli,log=lambda m:None)
                 except Exception as exc:
                     progress('Скачивание',f'Фоновая загрузка чата не запущена ({type(exc).__name__}) — чат скачается позже')
             expected=job.get('duration_seconds')
@@ -817,6 +829,7 @@ class Pipeline:
                 # Preserve old downloads for inspection but do not reuse a known short file.
                 try:
                     duration=check_duration(src)
+                    progress('Скачивание','Исходная запись для транскрибации из кэша')
                 except IncompleteVod:
                     import uuid
                     os.replace(src,work/('full-160p.incomplete-'+uuid.uuid4().hex+'.mp4'))
@@ -875,19 +888,28 @@ class Pipeline:
         # Пока рендерится нарезка, следующая уже скачивается в фоне: интернет и рендер друг другу не мешают.
         # Одновременно идёт только одна загрузка; при её ошибке нарезка просто скачивается заново обычным путём.
         prefetch={}
+        def get_fragment(j,b,e):
+            raw=work/f'clip-{j:04}.mp4'; temp=work/f'clip-{j:04}.download.mp4'
+            ident=[vod_id,quality,b,e]; minimum=rows[j-1]['end']-b
+            try: hit=checkpoints.cached_fragment(raw,ident,minimum,media_duration)
+            except stream_cutter.CutterError: hit=False
+            if hit: return True
+            remove_temp(temp)
+            self.download(vod_id,quality,temp,begin=b,end=e,cli=cli,threads=threads)
+            actual=media_duration(temp)
+            if actual+.3<minimum: raise IncompleteVod('Скачанный фрагмент короче найденного интервала')
+            os.replace(temp,raw)
+            checkpoints.save(raw.with_suffix('.source.json'),{'identity':ident,'stamp':checkpoints.stamp(raw),'duration':actual})
+            return False
         def start_prefetch(j):
             if local_name or fast_test or j>len(rows) or j in prefetch:return
             nrow=rows[j-1];nstem=clip_stem(j,nrow)
             if locate_clip_file(folder,nstem+'.mp4') or locate_clip_file(folder,nstem+'.txt') or (folder/(nstem+'.pipeline.json')).exists():return
             nb,ne=full_cycle.download_bounds(nrow['start'],nrow['end'])
-            nraw=work/(f'clip-{j:04}.mp4');ntemp=work/(f'clip-{j:04}.download.mp4')
             state={'done':threading.Event(),'error':None}
             def run():
                 try:
-                    if ntemp.exists():ntemp.unlink()
-                    if nraw.exists():nraw.unlink()
-                    self.download(vod_id,quality,ntemp,begin=nb,end=ne,cli=cli,threads=threads)
-                    media_duration(ntemp);os.replace(ntemp,nraw)
+                    state['cached']=get_fragment(j,nb,ne)
                 except Exception as exc:
                     state['error']=exc
                 finally:
@@ -902,8 +924,14 @@ class Pipeline:
                 hash_data={'row':row,'quality':quality,'silence':cfg.get('silence',{})}
                 if banner_cfg.get('enabled',False):hash_data['banner_blur']=banner_cfg
                 config_hash=hashlib.sha256(json.dumps(hash_data,sort_keys=True).encode()).hexdigest()
+                journal=work/(stem+'.commit.json'); rendered=folder/(stem+'.rendering.mp4')
+                if journal.exists():
+                    checkpoints.complete_bundle(journal,config_hash,rendered,output,txt,meta,media_duration)
+                    progress('Проверка нарезки',f'Нарезка {i}: метаданные восстановлены без рендера')
+                    old_output,old_txt=output,txt
                 previous=load_json(meta)
                 if old_output and old_txt and isinstance(previous,dict) and previous.get('key')==config_hash:
+                    progress('Нарезка',f'Нарезка {i}: готовое видео из кэша')
                     media_duration(old_output); outputs.append(str(old_output)); continue
                 if old_output or meta.exists() or old_txt: raise PipelineError('Найдены ранее созданные файлы с другими настройками; не перезаписываю')
                 begin,end=full_cycle.download_bounds(row['start'],row['end'])
@@ -926,14 +954,13 @@ class Pipeline:
                             progress('Скачивание',f"Нарезка {i}/{len(rows)}: фоновая загрузка не удалась ({type(pre['error']).__name__ if pre['error'] else 'нет файла'}) — качаю заново")
                             pre=None
                         else:
-                            progress('Скачивание',f'Нарезка {i}/{len(rows)}: фрагмент уже скачан в фоне, пока рендерилась предыдущая')
+                            msg='фрагмент из кэша' if pre.get('cached') else 'фрагмент уже скачан в фоне'
+                            progress('Скачивание',f'Нарезка {i}/{len(rows)}: {msg}')
                     if pre is None:
-                        if temp.exists():temp.unlink()
-                        if raw.exists():raw.unlink()
                         progress('Скачивание',f'Нарезка {i}/{len(rows)}: загрузка фрагмента {timestamp(begin)}–{timestamp(end)} через TwitchDownloader')
                         with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader',detail=lambda:DOWNLOAD_STATUS.get(str(temp),'')):
-                            self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
-                        media_duration(temp); os.replace(temp,raw)
+                            cached=get_fragment(i,begin,end)
+                        if cached: progress('Скачивание',f'Нарезка {i}: использован фрагмент из кэша')
                     render_source=raw; offset=begin
                 start_prefetch(i+1)  # следующая нарезка качается, пока рендерится эта
                 progress('Рендер',f'Нарезка {i}/{len(rows)}')
@@ -949,16 +976,18 @@ class Pipeline:
                     raise PipelineError(f'Длительность видео {actual:.2f} с не совпала с монтажной картой {planned:.2f} с; таймкоды не сохранены')
                 mapped=full_cycle.clip_segments(mapped,actual)
                 # A partial render is never presented as completed.
-                os.replace(rendered,output)
                 warning=('Внимание: в нарезке есть сегмент с исправленной границей времени; текст и время рядом с ней требуют проверки.\n\n' if any(x.get('timing_warning')=='end_clipped' for x in mapped) else '')
                 category={'reaction':'Реакция на видео','discussion':'Обсуждение / другой интересный момент','game':'Игра целиком'}.get(row.get('type'))
                 heading=('Тип момента: '+category+'\n' if category else '')+'Транскрипт готовой нарезки; времена от начала видео.\n\n'
-                txt.write_text(heading+warning+transcribe.to_txt(mapped),encoding='utf-8-sig')
+                transcript=heading+warning+transcribe.to_txt(mapped)
                 banner_scan=getattr(keeps,'banner_scan',None)
                 if banner_scan is not None:
                     banner_scan=[dict(d,start=round(d['start']+offset,3),end=round(d['end']+offset,3)) for d in banner_scan]
-                atomic_json(meta,{'banner_scan':banner_scan,'banner_mode':('manual' if banner_scan is not None else None),'banner_login':banner_cfg.get('login',''),'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))})
-                if not local_name and not cfg.get('keep_original',False): raw.unlink(missing_ok=True)
+                metadata={'banner_scan':banner_scan,'banner_mode':('manual' if banner_scan is not None else None),'banner_login':banner_cfg.get('login',''),'banner_scan_interval':cfg.get('banner_blur',{}).get('interval',5),'key':config_hash,'vod_id':vod_id,'reaction':row,'keep':keeps,'render_timeline':getattr(keeps,'rendered_timeline',None),'duration':actual,'transcript':txt.name,'silence_enabled':bool(cfg.get('silence',{}).get('enabled',True))}
+                checkpoints.save(journal,{'key':config_hash,'output':output.name,'stamp':checkpoints.stamp(rendered),'meta':metadata,'text':transcript})
+                checkpoints.complete_bundle(journal,config_hash,rendered,output,txt,meta)
+                if not local_name and not cfg.get('keep_original',False):
+                    raw.unlink(missing_ok=True); raw.with_suffix('.source.json').unlink(missing_ok=True)
                 outputs.append(str(output))
         finally:
             # Ошибка задания: дожидаемся фоновой загрузки, чтобы её файлы не мешали повторной попытке.

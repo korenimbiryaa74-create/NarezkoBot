@@ -487,11 +487,11 @@ class App:
         if not self.save(): return
         try:
             added,active=self.service.queue_test_inputs()
-            if not added and not active:
+            if not added and not active and not self.service.pending_input_count:
                 messagebox.showinfo('Тест','Поместите видео в папку test_input и запустите тест снова.'); return
             if not self.service.start():
                 messagebox.showwarning('Остановка','Задание в очереди; дождитесь остановки и нажмите «Продолжить очередь».'); return
-            self.status.set(f'Тест: добавлено {added}, уже в очереди {active}')
+            self.status.set(f'Тест: добавлено {added}, уже в очереди {active}, ещё копируются {self.service.pending_input_count}')
         except Exception as exc: messagebox.showerror('Тест',str(exc))
 
     def _blur_login(self):

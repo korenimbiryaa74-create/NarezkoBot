@@ -163,10 +163,9 @@ class AttachRetryTests(unittest.TestCase):
         self.assertTrue(self.web._send_uncertain)
         self.assertTrue(any('повторного клика не будет' in event for event in self.events))
 
-    def test_reclicks_when_click_did_not_register(self):
-        # The full prompt is still in the field and nothing new appeared: the click did not register.
-        self.assertEqual(self._send_with_fake('prompt'),3)
-        self.assertTrue(any('нажимаю «Отправить» ещё раз' in event for event in self.events))
+    def test_unchanged_text_is_not_proof_of_non_delivery(self):
+        self.assertEqual(self._send_with_fake('prompt'),1)
+        self.assertTrue(self.web._send_uncertain)
 
     def _send_with_probe(self,landed,send_after=None):
         # landed: does the page register the press on the button; send_after: press number that finally sends
@@ -199,15 +198,14 @@ class AttachRetryTests(unittest.TestCase):
         self.assertLess(tab.times[1]-tab.times[0],3)
         self.assertTrue(any('клик не дошёл до кнопки' in e for e in self.events))
 
-    def test_landed_click_without_send_waits_before_retry(self):
+    def test_landed_click_without_confirmation_is_not_replayed(self):
         tab,_=self._send_with_probe(landed=True)
-        self.assertEqual(tab.clicks,3)
-        self.assertGreaterEqual(tab.times[1]-tab.times[0],8)
+        self.assertEqual(tab.clicks,1)
         self.assertTrue(any('клик дошёл до кнопки' in e for e in self.events))
         self.assertTrue(any('повторного клика не будет' in e for e in self.events))
 
     def test_retry_stops_once_sent(self):
-        tab,result=self._send_with_probe(landed=True,send_after=2)
+        tab,result=self._send_with_probe(landed=False,send_after=2)
         self.assertTrue(result);self.assertEqual(tab.clicks,2)
 
     def test_probe_is_injected_into_send_state(self):
