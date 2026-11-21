@@ -26,6 +26,7 @@ import transcribe
 import whisper_cpp
 import groq_speech
 import long_streams
+import low_impact
 from job_store import JobStore
 
 class PipelineError(RuntimeError): pass
@@ -59,7 +60,7 @@ def load_json(path):
     except (OSError,ValueError): return None
 
 @contextmanager
-def report_wait(callback, description, interval=20):
+def report_wait(callback, description, interval=20, detail=None):
     """Report elapsed waiting time, not a fabricated percentage."""
     if callback is None:
         yield
@@ -67,7 +68,12 @@ def report_wait(callback, description, interval=20):
     stop=threading.Event(); started=time.monotonic()
     def report():
         while not stop.wait(interval):
-            try: callback(f'{description} · ожидание {timestamp(time.monotonic()-started)}')
+            try:
+                extra=''
+                if detail is not None:
+                    try: extra=detail() or ''
+                    except Exception: extra=''
+                callback(f'{description} · '+(extra+' · ' if extra else '')+f'ожидание {timestamp(time.monotonic()-started)}')
             except Exception: return
     thread=threading.Thread(target=report,daemon=True);thread.start()
     try: yield
@@ -179,22 +185,30 @@ def validate_intervals(rows,duration,min_seconds=0):
 
 def validate_donation_cuts(cuts, rows):
     if not isinstance(cuts,list): raise PipelineError('Некорректный список донатов')
+    # Донаты — необязательная чистка: сомнительный интервал пропускается (донат останется в видео),
+    # задание из-за него не останавливается.
     clean=[]
     for c in cuts:
-        if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or not 1<=c['reaction']<=len(rows): raise PipelineError('Некорректный номер реакции доната')
-        if rows[c['reaction']-1].get('type','reaction')!='reaction':
-            raise PipelineError('Донат указан для обсуждения; не выполняю монтаж')
+        if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or not 1<=c['reaction']<=len(rows): continue
+        if rows[c['reaction']-1].get('type','reaction')!='reaction': continue
         try:
             if isinstance(c['start'],bool) or isinstance(c['end'],bool): raise ValueError()
             a,b=float(c['start']),float(c['end']);row=rows[c['reaction']-1]
-            if not math.isfinite(a) or not math.isfinite(b) or a<row['start'] or b>row['end'] or b<=a or b-a>180 or b-a>(row['end']-row['start'])*.5: raise ValueError()
-        except (ValueError,KeyError,TypeError,OverflowError): raise PipelineError('Некорректные границы доната; не выполняю монтаж') from None
+            if not math.isfinite(a) or not math.isfinite(b): raise ValueError()
+            a=max(a,float(row['start']));b=min(b,float(row['end']))
+            if b-a<.5 or b-a>180 or b-a>(row['end']-row['start'])*.5: raise ValueError()
+        except (ValueError,KeyError,TypeError,OverflowError): continue
         clean.append({'reaction':c['reaction'],'start':a,'end':b})
     clean.sort(key=lambda x:(x['reaction'],x['start']))
-    if any(a['reaction']==b['reaction'] and b['start']<a['end'] for a,b in zip(clean,clean[1:])): raise PipelineError('Интервалы донатов пересекаются')
+    merged=[]
+    for c in clean:
+        if merged and merged[-1]['reaction']==c['reaction'] and c['start']<merged[-1]['end']: merged[-1]['end']=max(merged[-1]['end'],c['end'])
+        else: merged.append(dict(c))
+    clean=[]
     for i,row in enumerate(rows,1):
-        if sum(c['end']-c['start'] for c in clean if c['reaction']==i)>(row['end']-row['start'])*.5:
-            raise PipelineError('Суммарно интервалы донатов занимают более половины реакции; проверьте ответ вручную')
+        own=[c for c in merged if c['reaction']==i]
+        if sum(c['end']-c['start'] for c in own)>(row['end']-row['start'])*.5: continue
+        clean.extend(own)
     return clean
 
 def media_duration(path):
@@ -206,17 +220,129 @@ def media_duration(path):
     if not math.isfinite(duration) or duration<=0: raise PipelineError('Некорректная длительность видео')
     return duration
 
+# TwitchDownloaderCLI sometimes stops receiving parts from a Twitch CDN server without exiting:
+# the process then hangs forever with no new bytes. We watch its parts folder and restart it.
+DOWNLOAD_STALL_SECONDS=8*60          # no new parts for this long while downloading -> restart
+DOWNLOAD_CONCAT_STALL_SECONDS=40*60  # ffmpeg concat of a very long VOD may legitimately be quiet
+DOWNLOAD_ATTEMPTS=3
+_NO_WINDOW=getattr(subprocess,'CREATE_NO_WINDOW',0)
+
+def _kill_tree(pid):
+    try: subprocess.run(['taskkill','/PID',str(pid),'/T','/F'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=_NO_WINDOW,timeout=30)
+    except Exception: pass
+
+def kill_stale_downloaders(output):
+    """Stop a TwitchDownloaderCLI left over from a previous bot run that still holds this output file."""
+    if os.name!='nt': return 0
+    target=str(Path(output)).lower(); killed=0
+    script=("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+            "Get-CimInstance Win32_Process -Filter \"Name='TwitchDownloaderCLI.exe'\" | % { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+    try:
+        out=subprocess.run(['powershell','-NoProfile','-Command',script],capture_output=True,text=True,encoding='utf8',errors='replace',creationflags=_NO_WINDOW,timeout=60).stdout
+    except Exception: return 0
+    for line in (out or '').splitlines():
+        pid,_,cmd=line.partition('\t')
+        if pid.strip().isdigit() and target in cmd.lower() and int(pid)!=os.getpid():
+            _kill_tree(int(pid)); killed+=1
+    if killed: time.sleep(2)
+    return killed
+
+def remove_temp(path):
+    """Delete our own temp file; if an orphaned downloader still holds it, stop that downloader first."""
+    path=Path(path)
+    if not path.exists(): return
+    try: path.unlink()
+    except PermissionError:
+        kill_stale_downloaders(path); path.unlink()
+
+def _parts_state(folder):
+    total=count=0; concat=False
+    for root,_dirs,files in os.walk(folder):
+        for name in files:
+            if name=='concat.txt': concat=True
+            try: total+=os.path.getsize(os.path.join(root,name)); count+=1
+            except OSError: pass
+    return total,count,concat
+
+class _DownloadResult:
+    def __init__(self, returncode, stderr, stalled):
+        self.returncode=returncode; self.stderr=stderr; self.stalled=stalled
+
+# Live progress of running TwitchDownloader videodownloads, by output path: shown in the UI instead of a bare timer.
+DOWNLOAD_STATUS={}
+_STAGES={'downloading':'скачано','verifying':'проверка частей','combining':'склейка','finalizing':'завершение'}
+
+def _download_status(log, total, count, concat, threads):
+    pct=''; stage=''
+    try:
+        with open(log,'rb') as f:
+            f.seek(0,2); size=f.tell(); f.seek(max(0,size-4096))
+            tail=f.read().decode('utf8','replace')
+        lines=[l for l in re.split(r'[\r\n]+',tail) if '[STATUS]' in l]
+        if lines:
+            m=re.search(r'\[STATUS\]\s*-\s*([A-Za-z]+)[^\d]*(\d+)%',lines[-1])
+            if m: stage=_STAGES.get(m.group(1).lower(),m.group(1).lower()); pct=m.group(2)+'%'
+    except OSError: pass
+    if concat and not stage: stage='склейка'
+    gb=total/1024**3
+    parts=[(stage+' '+pct).strip() if (stage or pct) else 'скачано', (f'{gb:.1f} ГБ' if gb>=1 else f'{total/1024**2:.0f} МБ'), f'частей {count}', f'{threads} потоков']
+    return ' · '.join(p for p in parts if p)
+
+def _run_download(command, cli, run_env, output, stall=None, concat_stall=None, attempts=None, poll=15):
+    stall=stall or DOWNLOAD_STALL_SECONDS; concat_stall=concat_stall or DOWNLOAD_CONCAT_STALL_SECONDS
+    attempts=attempts or DOWNLOAD_ATTEMPTS
+    parts=output.with_name(output.name+'.parts'); log=output.with_name(output.name+'.log')
+    result=_DownloadResult(-1,'',False)
+    try: threads=command[command.index('-t')+1]
+    except (ValueError,IndexError): threads='?'
+    for _attempt in range(attempts):
+        shutil.rmtree(parts,ignore_errors=True); remove_temp(output); parts.mkdir(parents=True,exist_ok=True)
+        stalled=False
+        with open(log,'w',encoding='utf8',errors='replace') as err:
+            # stdout goes to the same log: its [STATUS] lines give the real progress percentage.
+            proc=subprocess.Popen(command+['--temp-path',str(parts)],cwd=str(Path(cli).parent),env=run_env,stdout=err,stderr=err,creationflags=low_impact.creation_flags())
+            try:
+                last=None; changed=time.monotonic()
+                while proc.poll() is None:
+                    time.sleep(poll)
+                    total,count,concat=_parts_state(parts)
+                    DOWNLOAD_STATUS[str(output)]=_download_status(log,total,count,concat,threads)
+                    try: out_size=os.path.getsize(output)
+                    except OSError: out_size=0
+                    state=(total,count,out_size)
+                    if state!=last: last=state; changed=time.monotonic()
+                    elif time.monotonic()-changed>(concat_stall if concat else stall):
+                        stalled=True; _kill_tree(proc.pid)
+                        try: proc.wait(timeout=60)
+                        except Exception: pass
+                        break
+            except BaseException:
+                _kill_tree(proc.pid); raise
+        try: stderr=log.read_text(encoding='utf8',errors='replace')
+        except OSError: stderr=''
+        DOWNLOAD_STATUS.pop(str(output),None)
+        shutil.rmtree(parts,ignore_errors=True)
+        try: log.unlink()
+        except OSError: pass
+        result=_DownloadResult(-1 if stalled else proc.returncode,stderr,stalled)
+        if not stalled: return result
+        remove_temp(output)
+    return result
+
 def default_download(vod_id, quality, output, begin=None, end=None, cli=None, threads=4):
     if not cli or not Path(cli).is_file(): raise PipelineError('Не найден TwitchDownloaderCLI в desktop/tools/TwitchDownloaderCLI. Запустите INSTALL.bat или проверьте установку.')
     output=Path(output)
     if output.exists(): raise PipelineError('Временный файл уже существует; не перезаписываю')
+    # Adaptive: more threads when no game is running, the configured number while gaming (low_impact).
+    threads=low_impact.download_threads(threads)
     command=[str(cli),'videodownload','--id',str(vod_id),'-q',quality,'-t',str(threads),'--collision','Rename','-o',str(output)]
+    command.extend(low_impact.download_extra_args())
     if begin is not None: command.extend(['-b',timestamp(begin),'-e',timestamp(end)])
     # Download does not implicitly inherit proxies; service-specific proxy support must be explicit.
     env={k:v for k,v in os.environ.items() if not k.lower().endswith('_proxy')}
     env['NO_PROXY']='*'; env['no_proxy']='*'
     def run(run_env):
-        return subprocess.run(command,cwd=str(Path(cli).parent),env=run_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,encoding='utf8',errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        return _run_download(command,cli,run_env,output)
     result=run(env)
     if result.returncode or not output.is_file():
         # Some Twitch VOD servers (a CloudFront distribution per recording) drop connections from the
@@ -228,7 +354,7 @@ def default_download(vod_id, quality, output, begin=None, end=None, cli=None, th
         except Exception:
             proxy=''
         if proxy:
-            if output.exists():output.unlink()  # our own partial temp file (checked absent above)
+            remove_temp(output)  # our own partial temp file (checked absent above)
             import proxy_bridge
             bridge=proxy_bridge.ProxyBridge(proxy)
             local=bridge.start()
@@ -240,6 +366,7 @@ def default_download(vod_id, quality, output, begin=None, end=None, cli=None, th
                 bridge.close()
     if result.returncode or not output.is_file():
         reason=[l.strip() for l in (result.stderr or '').splitlines() if 'Exception' in l and ':' in l][:1]
+        if getattr(result,'stalled',False) and not reason: reason=['загрузка зависала без новых данных '+str(DOWNLOAD_STALL_SECONDS//60)+' мин, перезапуски не помогли']
         raise PipelineError('TwitchDownloader не смог скачать VOD (код '+str(result.returncode)+')'+(' — '+reason[0][:160] if reason else '')+('; через прокси тоже' if 'proxy' in locals() and proxy else ''))
 
 def _valid_speech_segments(segments, start, end):
@@ -403,7 +530,9 @@ def render_clip(src, output, row, source_offset, silence_cfg, progress_callback=
     args.blur_regions=[]; args.precise=True; args.fast=False; args.map_timeline=True
     args.scale_height=int(silence_cfg.get('max_height',1080) or 0)
     args.maxrate=silence_cfg.get('maxrate','12M') or None
-    stream_cutter.apply_speed(args,silence_cfg.get('speed','turbo'))
+    # 'auto': eco while a game (Dota 2) is running, turbo otherwise (low_impact); an explicit preset is kept.
+    speed=stream_cutter.apply_speed(args,low_impact.render_speed(silence_cfg.get('speed','auto')))
+    if progress_callback: progress_callback(f'Рендер: пресет {speed} · {low_impact.mode_text()}')
     args.vcodec=stream_cutter.pick_encoder(ffmpeg,args.vcodec)
     start=float(row['start'])-source_offset; end=float(row['end'])-source_offset
     if progress_callback: progress_callback('Проверка видео и подготовка нарезки')
@@ -663,6 +792,15 @@ class Pipeline:
         else:
             src=work/'full-160p.mp4'
             progress('Скачивание','Загружается запись для транскрибации')
+            # Chat is needed later for game clips: download it now, in parallel with the video and
+            # transcription, instead of after them. The finder then takes the ready chat.json.
+            chat_mode=(cfg.get('_streamer_modes') or {}).get(str(login).lower()) or {}
+            if chat_mode.get('game',False):
+                try:
+                    import twitch_vod
+                    twitch_vod.prefetch_chat(vod_id,work,cli,log=lambda m:progress('Скачивание',m))
+                except Exception as exc:
+                    progress('Скачивание',f'Фоновая загрузка чата не запущена ({type(exc).__name__}) — чат скачается позже')
             expected=job.get('duration_seconds')
             head_limit=long_streams.normal_limit(cfg,expected)
             if head_limit:
@@ -685,8 +823,8 @@ class Pipeline:
                     raise
             else:
                 temp=work/'full-160p.downloading.mp4'
-                if temp.exists(): temp.unlink() # only our own explicitly named temporary file
-                with report_wait(lambda text:progress('Скачивание',text),'Загрузка VOD через TwitchDownloader ещё выполняется'):
+                remove_temp(temp) # only our own explicitly named temporary file (stops an orphaned downloader)
+                with report_wait(lambda text:progress('Скачивание',text),'Загрузка VOD через TwitchDownloader',detail=lambda:DOWNLOAD_STATUS.get(str(temp),'')):
                     if head_limit and src.name.startswith('first-'):
                         self.download(vod_id,'160p30',temp,begin=0,end=head_limit,cli=cli,threads=threads)
                     else:
@@ -793,7 +931,7 @@ class Pipeline:
                         if temp.exists():temp.unlink()
                         if raw.exists():raw.unlink()
                         progress('Скачивание',f'Нарезка {i}/{len(rows)}: загрузка фрагмента {timestamp(begin)}–{timestamp(end)} через TwitchDownloader')
-                        with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader ещё выполняется'):
+                        with report_wait(lambda text:progress('Скачивание',f'Нарезка {i}/{len(rows)} · {text}'),'Загрузка фрагмента через TwitchDownloader',detail=lambda:DOWNLOAD_STATUS.get(str(temp),'')):
                             self.download(vod_id,quality,temp,begin=begin,end=end,cli=cli,threads=threads)
                         media_duration(temp); os.replace(temp,raw)
                     render_source=raw; offset=begin

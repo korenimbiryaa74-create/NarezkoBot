@@ -495,6 +495,8 @@ class ChatGPTWeb:
     # Promo/upsell modals («Получите месяц ChatGPT Plus бесплатно» и т.п.) steal focus from the composer, so the
     # prompt can't be typed. Close every such window with its own close button (крестик / «Не сейчас»).
     # Windows about limits, login or upload errors are left alone: other checks read them.
+    # Choice windows without a close button (memory onboarding «Использовать память / Не использовать память»)
+    # are answered with the preferred option, otherwise Escape does not close them and the composer stays blocked.
     JS_DISMISS = r'''((dry)=>{
 const vis=n=>{if(!n||!n.getClientRects().length)return false;const s=getComputedStyle(n);return s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
 const composer=document.querySelector('#prompt-textarea,div.ProseMirror[contenteditable=true],form textarea');
@@ -514,18 +516,21 @@ if(composer){
 }
 roots=roots.filter(d=>!roots.some(o=>o!==d&&o.contains(d)));
 const lab=n=>(n.getAttribute('aria-label')||n.getAttribute('title')||'').trim();
-const closeLabel=/^(?:close|закрыть|dismiss|скрыть|hide)\b/i;
+const closeLabel=/^(?:close|закрыть|dismiss|скрыть|hide)(?![a-zа-яё])/i;
+const prefer=/^(?:использовать память|включить память|use memory|turn on memory|enable memory)(?![a-zа-яё])/i;
+const first=n=>((n.innerText||'').trim().split('\n')[0]||'').trim();
 const closeText=/^(?:close|закрыть|dismiss|maybe later|not now|не сейчас|позже|может быть,? позже|нет,? спасибо|no,? thanks|skip|пропустить|got it|понятно|ок|ok)$/i;
 const items=[];
 for(const d of roots){
   const text=(d.innerText||'').trim().replace(/\s+/g,' ');
   if(keep.test(text)){items.push({text:text.slice(0,90),kept:true});continue;}
   const btns=Array.from(d.querySelectorAll('button,[role="button"]')).filter(vis);
-  let b=btns.find(n=>closeLabel.test(lab(n))||/close/i.test(n.getAttribute('data-testid')||''));
+  let b=btns.find(n=>/memory-choice-true/i.test(n.getAttribute('aria-labelledby')||'')||prefer.test(first(n)));
+  if(!b)b=btns.find(n=>closeLabel.test(lab(n))||/close/i.test(n.getAttribute('data-testid')||''));
   if(!b)b=btns.find(n=>closeText.test((n.innerText||'').trim()));
   if(!b){const r=d.getBoundingClientRect();b=btns.find(n=>{const q=n.getBoundingClientRect();return !(n.innerText||'').trim()&&n.querySelector('svg')&&q.top-r.top<80&&r.right-q.right<80;});}
   if(b&&!dry)b.click();
-  items.push({text:text.slice(0,90),button:b?(lab(b)||(b.innerText||'').trim()||'крестик'):null});
+  items.push({text:text.slice(0,90),button:b?(lab(b)||first(b)||'крестик'):null});
 }
 return {items};
 })'''

@@ -103,8 +103,9 @@ class MomentsTests(unittest.TestCase):
             self.assertEqual(f.find_donations(segs,rows,lambda *a:None),[{'reaction':2,'start':120.,'end':130.}])
             self.assertIn('2: 00:01:40',seen[0]); self.assertNotIn('1: 00:00:00',seen[0])
             bad='{"donation_cuts":[{"reaction":1,"start":"00:00:10","end":"00:00:20","confidence":"high"}]}'
-            with self.assertRaises(reactions.ReactionsError):f.find_donations(segs,rows,lambda *a:None,manual=bad)
-            with self.assertRaises(pipeline.PipelineError):pipeline.validate_donation_cuts([{'reaction':1,'start':10,'end':20}],rows)
+            # Донат в обсуждении не вырезается и задание не падает (раньше это останавливало kussia88).
+            self.assertEqual(f.find_donations(segs,rows,lambda *a:None,manual=bad),[])
+            self.assertEqual(pipeline.validate_donation_cuts([{'reaction':1,'start':10,'end':20}],rows),[])
     def test_only_discussions_no_donation_request_and_silence_setting_preserved(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);job={'vod_id':'123','streamer':'name'}; seen=[]

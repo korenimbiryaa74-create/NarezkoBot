@@ -302,11 +302,63 @@ class Browser:
             self.proc=None
 
 
+# Studio's informational notice about the daily limit of custom thumbnails
+# («Развивайте свой канал … вскоре вы сможете добавлять больше своих значков в день», single «ОК»).
+# It covers the upload dialog, so the next clicks fail. Only this exact notice is closed and only
+# via its single «ОК»/«Got it» button; any other Studio dialog is left untouched.
+_THUMB_NOTICE_JS = r"""((doClick)=>{
+  const vis=e=>!!e.getClientRects().length;
+  const text=/(?:развивайте свой канал|больше своих значков|grow your channel|more (?:of your own |custom )?thumbnails)/i;
+  const okText=/^(?:[oо][kк]|got it|понятно)$/i;
+  const buttons=[...document.querySelectorAll('button,ytcp-button,tp-yt-paper-button,[role="button"]')]
+    .filter(e=>vis(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&okText.test((e.innerText||'').trim()));
+  const hits=buttons.filter(b=>{let p=b.parentElement;
+    for(let i=0;p&&i<10;i++,p=p.parentElement){
+      if(p.matches('ytcp-uploads-dialog,body'))return false;
+      if(text.test(p.innerText||''))return true;}
+    return false;});
+  const leaves=hits.filter(e=>!hits.some(o=>o!==e&&e.contains(o)));
+  if(!leaves.length)return null;
+  if(leaves.length!==1)return {ok:false};
+  const b=leaves[0];b.scrollIntoView({block:'center'});const r=b.getBoundingClientRect();
+  if(doClick)b.click();
+  return {ok:true,x:r.left+r.width/2,y:r.top+r.height/2};
+})"""
+
+
+def dismiss_thumb_notice(tab, progress=None):
+    """Press «ОК» in Studio's thumbnail-limit notice. Returns True if it was shown and closed.
+
+    DOM click first; if Studio ignores it (notice still animating in), a real CDP mouse click."""
+    shown=False
+    for attempt in range(6):
+        try:target=tab.js('('+_THUMB_NOTICE_JS+')(false)')
+        except Exception:return shown
+        if not isinstance(target,dict):return shown
+        if not target.get('ok'):return False  # ambiguous: never click blindly
+        if not shown and progress:
+            progress('YouTube показал уведомление о лимите значков («Развивайте свой канал»); нажимаю «ОК» и продолжаю')
+        shown=True
+        try:
+            if attempt%2==1 and hasattr(tab,'call'):
+                x,y=float(target['x']),float(target['y'])
+                tab.call('Input.dispatchMouseEvent',type='mouseMoved',x=x,y=y)
+                tab.call('Input.dispatchMouseEvent',type='mousePressed',x=x,y=y,button='left',clickCount=1)
+                tab.call('Input.dispatchMouseEvent',type='mouseReleased',x=x,y=y,button='left',clickCount=1)
+            else:
+                tab.js('('+_THUMB_NOTICE_JS+')(true)')
+        except Exception:
+            return shown
+        time.sleep(.7)
+    return shown
+
+
 def wait(tab, expression, timeout, message):
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
         value=tab.js(expression)
         if value: return value
+        dismiss_thumb_notice(tab)
         time.sleep(.6)
     raise StudioError(message)
 
@@ -409,6 +461,7 @@ def wait_done_enabled(tab,timeout=1800):
     while not tab.js(_DONE_ENABLED):
         raise_if_limit(tab)
         if time.monotonic()>deadline:return
+        dismiss_thumb_notice(tab)
         time.sleep(1)
 
 
@@ -637,8 +690,16 @@ def attach_thumbnail(tab,path,progress=None):
         deadline=time.monotonic()+25
         while time.monotonic()<deadline:
             if tab.js(_THUMB_SET):
+                dismiss_thumb_notice(tab,progress=progress)
                 if progress:progress('Превью добавлено как значок видео')
                 return True
+            if dismiss_thumb_notice(tab,progress=progress):
+                time.sleep(1)
+                if tab.js(_THUMB_SET):
+                    if progress:progress('Превью добавлено как значок видео')
+                    return True
+                if progress:progress('Лимит своих значков на сегодня исчерпан; видео загружается без превью')
+                return False
             time.sleep(.5)
         if progress:progress('Превью отправлено, но Studio не показала его за 25 с; проверьте значок в Studio')
         return True
@@ -1140,6 +1201,7 @@ class YouTubeStudio:
             ensure_title(tab,title_selector,row['title'],progress=progress)
         thumb=find_thumbnail(row['file_path'])
         if thumb:attach_thumbnail(tab,thumb,progress=progress)
+        dismiss_thumb_notice(tab,progress=progress)
         audience={'kids':'VIDEO_MADE_FOR_KIDS_MFK','not_kids':'VIDEO_MADE_FOR_KIDS_NOT_MFK'}.get(row['audience'])
         if not audience: raise StudioError('Аудитория не подтверждена')
         radio='tp-yt-paper-radio-button[name="'+audience+'"]'
@@ -1161,6 +1223,7 @@ class YouTubeStudio:
                                              'Удалите черновик этой нарезки в Studio; остальные нарезки остаются в очереди. '
                                              'Лимит снимается через 24 часа или после расширенной проверки канала')
                 if time.monotonic()>deadline:raise StudioError('Кнопка «Далее» в Studio не стала доступной')
+                dismiss_thumb_notice(tab,progress=progress)
                 time.sleep(.5)
             click(tab,'ytcp-uploads-dialog #next-button button',timeout=30)
             for _ in range(20):

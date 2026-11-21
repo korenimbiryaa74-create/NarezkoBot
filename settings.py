@@ -17,7 +17,9 @@ DEFAULTS={
  'proxy':{'enabled':False,'url':'','twitch_api':False,'chatgpt':True,'groq':False},
  'pipeline':{'quality':'1080p60','download_threads':4,'min_reaction_minutes':10,'bridge_minutes':5,
              'speech':{'model':'large-v3-turbo','language':'ru','device':'auto','compute':'auto','beam':1,'groq_enabled':True,'groq_api_key':''},
-             'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'turbo'},
+             'silence':{'enabled':True,'min_cut':1.5,'max_gap':2.0,'onset_db':12.0,'max_height':1080,'speed':'auto'},
+             'low_impact':{'enabled':True,'mode':'auto','games':['dota2.exe'],'cpu_share':0.5,'priority':'below_normal',
+                           'game_speed':'eco','free_speed':'turbo','free_download_threads':16,'free_chat_threads':8,'game_bandwidth_kib':0},
              'keep_original':False,'remove_donations':True,'long_stream':dict(long_streams.DEFAULT),'preview':{'enabled':False,'test_streamer':'','templates':{},'prompts':{}},'banner_blur':{'enabled':False,'interval':5,'test_streamer':''}}}
 
 def merge(base, override):
@@ -93,7 +95,19 @@ def validate(config):
         if not 0<=silence[key]<=120: raise ValueError('Некорректные параметры тишины')
     silence['max_height']=int(silence['max_height'])
     if silence['max_height'] not in (0,480,720,1080,1440,2160): raise ValueError('Некорректное разрешение')
-    if silence['speed'] not in ('quality','fast','max','turbo'): raise ValueError('Некорректная скорость рендера')
+    if silence['speed'] not in ('auto','eco','quality','fast','max','turbo'): raise ValueError('Некорректная скорость рендера')
+    li=q['low_impact']; li['enabled']=bool(li.get('enabled',True))
+    li['cpu_share']=float(li.get('cpu_share',0.5))
+    if not 0.1<=li['cpu_share']<=1: raise ValueError('Доля ядер для бота: от 0.1 до 1')
+    if li.get('priority') not in ('below_normal','idle'): li['priority']='below_normal'
+    if li.get('mode') not in ('auto','always','off'): li['mode']='auto'
+    games=li.get('games') if isinstance(li.get('games'),list) else re.split(r'[\s,;]+',str(li.get('games') or ''))
+    li['games']=[str(g).strip().lower() for g in games if str(g).strip()][:20] or ['dota2.exe']
+    for key,default in (('game_speed','eco'),('free_speed','turbo')):
+        if li.get(key) not in ('eco','quality','fast','max','turbo'): li[key]=default
+    for key,default,lo,hi in (('free_download_threads',16,1,32),('free_chat_threads',8,1,16),('game_bandwidth_kib',0,0,1000000)):
+        try: li[key]=max(lo,min(hi,int(li.get(key,default))))
+        except (TypeError,ValueError): li[key]=default
     return result
 
 def import_legacy_groq_key(path):

@@ -144,7 +144,7 @@ class ChatGPTFinder:
             from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError, ChatGPTSafetyError
             accounts=self._accounts()
             accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x != self._account]
-            blocked=[]; signed_out=[]; safety=0; ask_prompt=prompt; text=None
+            blocked=[]; signed_out=[]; failed=[]; safety=0; ask_prompt=prompt; text=None
             for account in accounts:
                 web=self._browser(account); web.timeout=int(timeout); web.offscreen=False
                 if log: log(f'ChatGPT: профиль {account} — отправка транскрипта и ожидание ответа')
@@ -171,11 +171,19 @@ class ChatGPTFinder:
                 except ChatGPTLoginError:
                     signed_out.append(account)
                     if log: log(f'ChatGPT: {account} не авторизован — пропускаю профиль')
+                except ChatGPTSafetyError:
+                    raise
+                except Exception as exc:
+                    # Любая другая (непредвиденная) ошибка ChatGPT на этом профиле — просто берём следующий аккаунт.
+                    if 'Порт браузера' in str(exc): raise  # не проблема аккаунта: остальные упадут так же
+                    text=None
+                    failed.append(f'{account}: {type(exc).__name__}: {str(exc)[:120]}')
+                    if log: log(f'ChatGPT: {account} — ошибка ({type(exc).__name__}: {str(exc)[:160]}) — пробую следующий аккаунт')
                 finally:
                     web.status_callback=None
             else:
                 if safety: raise ChatGPTSafetyError(f'ChatGPT скрыл ответ из соображений безопасности ({safety} раз), а других доступных профилей нет. Транскрипт сохранён в кэше')
-                raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
+                raise ChatGPTQuotaError('ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')+'; ошибки: '+(' | '.join(failed) or 'нет')+'. Дождитесь сброса или войдите в другой профиль')
             if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
             if validate_response is not None: validate_response(text)
             cache.parent.mkdir(parents=True,exist_ok=True)
@@ -321,24 +329,41 @@ class ChatGPTFinder:
         parsed=reactions.tc.parse_answer(raw)
         cuts=parsed.get('donation_cuts')
         if not isinstance(cuts,list): raise reactions.ReactionsError('Ответ ChatGPT о донатах не содержит donation_cuts')
-        result=[]
+        # Вырезание донатов — необязательное улучшение. Сомнительный интервал из ответа ChatGPT
+        # (не та реакция, обсуждение, неуверенность, выход за границы, слишком длинный) просто
+        # пропускается: лучше оставить донат в видео, чем остановить всё задание.
+        result=[];skipped=[]
         for c in cuts:
             if not isinstance(c,dict) or isinstance(c.get('reaction'),bool) or not isinstance(c.get('reaction'),int) or not 1<=c['reaction']<=len(rows):
-                raise reactions.ReactionsError('Неверный номер реакции в ответе о донатах')
+                skipped.append('неверный номер реакции');continue
             if c.get('confidence') != 'high':
-                raise reactions.ReactionsError('Неуверенный интервал доната: проверьте ответ ChatGPT вручную')
+                skipped.append(f"№{c['reaction']}: неуверенный");continue
             a,b=reactions.reaction_time(c.get('start')),reactions.reaction_time(c.get('end'))
             r=rows[c['reaction']-1]
             if r.get('type','reaction')!='reaction':
-                raise reactions.ReactionsError('Интервал доната указан для обсуждения; донаты из него не удаляются')
-            if a is None or b is None or b<=a or a<r['start'] or b>r['end']:
-                raise reactions.ReactionsError('Интервал доната вне границ реакции или некорректен')
+                skipped.append(f"№{c['reaction']}: это обсуждение, не реакция");continue
+            if a is None or b is None or b<=a:
+                skipped.append(f"№{c['reaction']}: некорректные границы");continue
+            a=max(a,float(r['start']));b=min(b,float(r['end']))
+            if b-a<.5:
+                skipped.append(f"№{c['reaction']}: вне границ реакции");continue
             if b-a>180 or b-a>(r['end']-r['start'])*.5:
-                raise reactions.ReactionsError('Слишком длинный интервал доната; проверьте ответ ChatGPT вручную')
+                skipped.append(f"№{c['reaction']}: слишком длинный");continue
             result.append({'reaction':c['reaction'],'start':round(a,3),'end':round(b,3)})
         result.sort(key=lambda c:(c['reaction'],c['start']))
-        if any(a['reaction']==b['reaction'] and b['start']<a['end'] for a,b in zip(result,result[1:])):
-            raise reactions.ReactionsError('Перекрывающиеся интервалы донатов; проверьте ответ ChatGPT вручную')
+        merged=[]
+        for c in result:
+            if merged and merged[-1]['reaction']==c['reaction'] and c['start']<merged[-1]['end']:
+                merged[-1]['end']=max(merged[-1]['end'],c['end'])
+            else: merged.append(dict(c))
+        result=[]
+        for i,r in enumerate(rows,1):
+            own=[c for c in merged if c['reaction']==i]
+            if own and sum(c['end']-c['start'] for c in own)>(r['end']-r['start'])*.5:
+                skipped.append(f'№{i}: донаты заняли бы больше половины реакции');continue
+            result.extend(own)
+        if skipped:
+            progress('Поиск реакций','ChatGPT: пропущено интервалов донатов '+str(len(skipped))+' ('+'; '.join(skipped[:5])+') — эти донаты останутся в видео')
         progress('Поиск реакций',f'ChatGPT: найдено ответов на донаты {len(result)}; границы могут требовать проверки')
         return result
 

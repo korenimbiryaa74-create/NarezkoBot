@@ -29,7 +29,8 @@ class DonationTests(unittest.TestCase):
         first=f.find_donations(self.segs,self.rows,lambda *a:None)
         second=f.find_donations(self.segs,self.rows,lambda *a:None)
         self.assertEqual(first,[{'reaction':1,'start':3.,'end':6.}]);self.assertEqual(first,second);self.assertEqual(f._web.calls,1)
-    def test_invalid_or_unsafe_intervals_stop(self):
+    def test_invalid_or_unsafe_intervals_are_skipped_not_fatal(self):
+        # Сомнительный донат остаётся в видео, задание не останавливается.
         f=ChatGPTFinder(self.root,web_factory=lambda **kw:self.fail('browser must not be used'))
         for cut in [
             {'reaction':1,'start':2,'end':13,'confidence':'high'},
@@ -38,15 +39,16 @@ class DonationTests(unittest.TestCase):
             {'reaction':1,'start':2,'end':3,'confidence':'low'},
             {'reaction':1,'start':4,'end':3,'confidence':'high'},
         ]:
-            with self.subTest(cut=cut),self.assertRaises(Exception):
-                f.find_donations(self.segs,self.rows,lambda *a:None,manual=json.dumps({'donation_cuts':[cut]}))
+            with self.subTest(cut=cut):
+                self.assertEqual(f.find_donations(self.segs,self.rows,lambda *a:None,manual=json.dumps({'donation_cuts':[cut]})),[])
         with self.assertRaises(Exception): f.find_donations(self.segs,self.rows,lambda *a:None,manual='{"donation_cuts":')
-        with self.assertRaises(Exception):
-            f.find_donations(self.segs,self.rows,lambda *a:None,manual=json.dumps({'donation_cuts':[{'reaction':1,'start':2,'end':4,'confidence':'high'},{'reaction':1,'start':3,'end':5,'confidence':'high'}]}))
+        merged=f.find_donations(self.segs,self.rows,lambda *a:None,manual=json.dumps({'donation_cuts':[{'reaction':1,'start':2,'end':4,'confidence':'high'},{'reaction':1,'start':3,'end':5,'confidence':'high'}]}))
+        self.assertEqual(merged,[{'reaction':1,'start':2.,'end':5.}])
     def test_subtraction_union_and_offset(self):
         self.assertEqual(pipeline.subtract_intervals([(1,4),(6,10)],[(2,7),(8,9)]),[(1,2),(7,8),(9,10)])
-        with self.assertRaises(pipeline.PipelineError): pipeline.validate_donation_cuts([{'reaction':1,'start':2,'end':15}],self.rows)
-        with self.assertRaises(pipeline.PipelineError): pipeline.validate_donation_cuts([{'reaction':1,'start':0,'end':4},{'reaction':1,'start':6,'end':10}],self.rows)
+        self.assertEqual(pipeline.validate_donation_cuts([{'reaction':1,'start':2,'end':15}],self.rows),[])
+        self.assertEqual(pipeline.validate_donation_cuts([{'reaction':1,'start':0,'end':4},{'reaction':1,'start':6,'end':10}],self.rows),[])
+        self.assertEqual(pipeline.validate_donation_cuts([{'reaction':1,'start':3,'end':5}],self.rows),[{'reaction':1,'start':3.,'end':5.}])
     def test_empty_answer_is_not_failure(self):
         f=ChatGPTFinder(self.root)
         self.assertEqual(f.find_donations(self.segs,self.rows,lambda *a:None,manual='{"donation_cuts":[]}'),[])

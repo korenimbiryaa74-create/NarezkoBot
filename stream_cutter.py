@@ -17,6 +17,15 @@ import threading
 import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    import low_impact as _low_impact
+except ImportError:  # stream_cutter можно запускать и отдельно
+    _low_impact = None
+
+def _proc_flags() -> int:
+    if _low_impact is not None:
+        return _low_impact.creation_flags()
+    return getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 ANALYSIS_RATE = 4000
 FRAME = 160
 STRIDE = 2
@@ -25,7 +34,9 @@ FAST = False
 JOBS = 0
 HWACCEL = 'auto'
 SPEED = 'turbo'
-SPEED_PRESETS = {'quality': {'preset': 'veryfast', 'nvenc_preset': 'p5', 'nvenc_jobs': 2, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'fast': {'preset': 'superfast', 'nvenc_preset': 'p3', 'nvenc_jobs': 3, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'max': {'preset': 'ultrafast', 'nvenc_preset': 'p1', 'nvenc_jobs': 3, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'turbo': {'preset': 'ultrafast', 'nvenc_preset': 'p1', 'nvenc_jobs': 4, 'x264_div': 2, 'x264_max_jobs': 12, 'crf_bonus': 3, 'nvenc_tune': 'll'}}
+# eco: 2 процесса NVENC, пресет p4, потоки только из «бюджета» ядер (low_impact): рендер дольше,
+# но процессор и память остаются для игры. turbo: максимум скорости, грузит всё.
+SPEED_PRESETS = {'eco': {'preset': 'superfast', 'nvenc_preset': 'p4', 'nvenc_jobs': 2, 'x264_div': 6, 'x264_max_jobs': 2, 'crf_bonus': 0, 'nvenc_tune': None}, 'quality': {'preset': 'veryfast', 'nvenc_preset': 'p5', 'nvenc_jobs': 2, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'fast': {'preset': 'superfast', 'nvenc_preset': 'p3', 'nvenc_jobs': 3, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'max': {'preset': 'ultrafast', 'nvenc_preset': 'p1', 'nvenc_jobs': 3, 'x264_div': 4, 'x264_max_jobs': 6, 'crf_bonus': 0, 'nvenc_tune': None}, 'turbo': {'preset': 'ultrafast', 'nvenc_preset': 'p1', 'nvenc_jobs': 4, 'x264_div': 2, 'x264_max_jobs': 12, 'crf_bonus': 3, 'nvenc_tune': 'll'}}
 BLUR_REGIONS: list[tuple[int, int, int, int]] = []
 BLUR_STRENGTH = 20
 
@@ -36,7 +47,7 @@ class InvalidRenderTimeline(CutterError):
     pass
 
 def run(cmd: list[str], capture: bool=True, timeout: int | None=None):
-    return subprocess.run(cmd, stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    return subprocess.run(cmd, stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=_proc_flags())
 
 def run_bytes(cmd: list[str], timeout: int | None=None):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -599,7 +610,7 @@ class Progress:
 
 def _exec(cmd: list[str], idx: int, prog: Progress, log_path: str) -> int:
     with open(log_path, 'w', encoding='utf-8', errors='replace') as log:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, encoding='utf-8', errors='replace', creationflags=_proc_flags())
         with p.stdout:
             for line in p.stdout:
                 if line.startswith('out_time_ms='):
@@ -725,7 +736,7 @@ def render_file(res: dict, args, ffmpeg: str, ffprobe: str, progress_callback=No
     src, keep = (res['src'], res['keep'])
     out = args.out or os.path.splitext(src)[0] + '_cut' + os.path.splitext(src)[1]
     n_audio = len(res['streams'])
-    cores = os.cpu_count() or 4
+    cores = (_low_impact.cpu_budget() if _low_impact is not None else os.cpu_count()) or 4
     nvenc_jobs = int(getattr(args, 'nvenc_jobs', 2) or 2)
     jobs_n = args.jobs if args.jobs > 0 else nvenc_jobs if args.vcodec.endswith('_nvenc') else max(2, min(int(getattr(args, 'x264_max_jobs', 6) or 6), cores // int(getattr(args, 'x264_div', 4) or 4)))
     threads = max(1, cores // jobs_n)

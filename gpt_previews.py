@@ -97,7 +97,9 @@ def _aliases(login):
     plain=re.sub(r'_+',' ',l).strip()    # caseoh_ → caseoh
     query=str(alias or (extra[0] if extra else plain)).lower().strip()
     cyr=_translit(plain) if not (alias or extra) else ''
-    names=[n for n in dict.fromkeys(str(x).lower().strip() for x in [l,plain,*extra,alias or '',cyr] if x) if n and n!=query]
+    # «iy» в конце слова — то «ий» (Дмитрий), то «ый» (stariy → Старый): берём оба варианта.
+    cyr2=re.sub(r'ий\b','ый',cyr) if cyr else ''
+    names=[n for n in dict.fromkeys(str(x).lower().strip() for x in [l,plain,*extra,alias or '',cyr,cyr2] if x) if n and n!=query]
     return names+[query]
 
 
@@ -326,6 +328,23 @@ def refresh_auto(root,login,log=print,limit=TAKE,cfg=None):
             log(f'Канал {ref}: нет длинных видео — пропускаю');continue
         sources.append(_source_row(p,{'title':p['title'] or ref,'pinned':True}))
         log(f"Свой канал-образец: «{sources[-1]['title']}» — видео на странице {len(p['videos'])}")
+    folder=auto_dir(root,login);folder.mkdir(parents=True,exist_ok=True)
+
+    def _download(s,per):
+        got=saved=0
+        for v in s['videos'][:per]:
+            target=folder/f"{s['id']}_{v['id']}.jpg"
+            if target.exists():got+=1;continue
+            try:
+                image,_=download_thumbnail(v['id']);image.save(target,'JPEG',quality=92);saved+=1;got+=1
+            except Exception:
+                continue
+        return got,saved
+
+    # Свои каналы-образцы скачиваются сразу: шаблоны появляются, пока идёт долгий автопоиск нарезчиков.
+    early=0
+    for s in sources:early+=_download(s,max(3,min(limit,KEEP//(len(sources)+AUTO_WITH_PINNED))))[1]
+    if sources:log(f'Образцы со своих каналов скачаны ({early} новых), ищу ещё нарезчиков')
     ranked=[]
     try:ranked=rank_clip_channels(root,login,log)
     except Exception as exc:
@@ -342,18 +361,10 @@ def refresh_auto(root,login,log=print,limit=TAKE,cfg=None):
     if not sources:
         raise RuntimeError(f'Не найдено каналов с нарезками {login} на YouTube: укажите каналы-образцы в разделе «Превью»')
     best=sources[0]
-    folder=auto_dir(root,login);folder.mkdir(parents=True,exist_ok=True)
     per=max(3,min(limit,KEEP//len(sources)))
-    saved=0;per_source={}
+    saved=early;per_source={}
     for s in sources:
-        got=0
-        for v in s['videos'][:per]:
-            target=folder/f"{s['id']}_{v['id']}.jpg"
-            if target.exists():got+=1;continue
-            try:
-                image,_=download_thumbnail(v['id']);image.save(target,'JPEG',quality=92);saved+=1;got+=1
-            except Exception:
-                continue
+        got,new=_download(s,per);saved+=new
         per_source[s['id']]=got
     ids={s['id'] for s in sources}
     # В пуле — только превью выбранных каналов: картинки прежних каналов убираются.

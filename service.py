@@ -56,6 +56,10 @@ class Service:
     def start(self):
         if any(t.is_alive() for t in self._threads): return not self.stop_event.is_set()
         self.recover_interrupted()
+        try:
+            import low_impact
+            low_impact.apply(self.settings.load(),self.log)
+        except Exception as exc: self.log(f'Фоновый режим не включён ({type(exc).__name__})')
         self.stop_event.clear(); self._youtube_wait_message=''; self._youtube_batch_blocked.clear()
         with self._lock:
             self._watch_generation+=1; self._watch_state.clear()
@@ -376,7 +380,14 @@ class Service:
                 except (TypeError,KeyError): pass
             current=next((x for x in self.store.list_jobs(1000) if x['id']==job['id']),None)
             safe=current and current['stage'] in ('Скачивание','Транскрибация','Нарезка','Рендер','Организация файлов') and not isinstance(exc,(InvalidRenderTimeline,BannerSetupError,BannerResponseError))
-            if safe and job['attempts']<3:
+            # Сразу после конца стрима Twitch ещё собирает запись: TwitchDownloader отвечает
+            # «Invalid VOD, deleted/expired VOD possibly?». Это не ошибка — ждём дольше и повторяем.
+            not_ready=('Invalid VOD' in detail or 'deleted/expired' in detail)
+            if safe and not_ready and job['attempts']<8:
+                delay=min(3600,600*job['attempts'])
+                self.store.finish(job['id'],'retry',detail,retry_after=delay)
+                self.log(f"VOD {job['vod_id']}: запись на Twitch ещё не готова, повтор через {delay//60} мин")
+            elif safe and job['attempts']<3:
                 delay=60*job['attempts']
                 self.store.finish(job['id'],'retry',detail,retry_after=delay)
                 self.log(f"VOD {job['vod_id']}: повтор через {delay} с — {detail}")
