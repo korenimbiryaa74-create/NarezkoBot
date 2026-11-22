@@ -15,6 +15,7 @@ except ModuleNotFoundError:
     fake.WebSocketTimeoutException=type('WebSocketTimeoutException',(Exception,),{})
     sys.modules['websocket']=fake
 from chatgpt_finder import ChatGPTFinder
+from chatgpt_errors import ChatGPTIncompleteAnswer
 from chatgpt_web import ChatGPTWeb, ChatGPTQuotaError, ChatGPTLoginError
 
 class ProfileTests(unittest.TestCase):
@@ -33,6 +34,10 @@ class ProfileTests(unittest.TestCase):
                 if outcome=='network':raise RuntimeError('network')
                 if outcome=='sent_timeout': self._sent_confirmed=True; raise TimeoutError('answer timed out')
                 if outcome=='sent_limit': self._sent_confirmed=True; raise ChatGPTQuotaError('quota')
+                if outcome=='incomplete': self._sent_confirmed=True; raise ChatGPTIncompleteAnswer('no JSON')
+                if outcome=='placeholder':return {'text':'Анализ завершен'}
+                if outcome=='image':
+                    image=outer.root/'result.png';image.write_bytes(b'test image');return {'images':[str(image)]}
                 return {'text':'{"reactions":[]}'}
             def close(self):outer.closed.append(self.account)
         self.finder=ChatGPTFinder(self.root,web_factory=Web)
@@ -41,9 +46,27 @@ class ProfileTests(unittest.TestCase):
     def test_quota_switches_and_then_cache_reused(self):
         self.add('acc_02');self.outcomes['acc_01']='quota'
         self.assertEqual(self.ask(),'{"reactions":[]}')
-        self.assertEqual(self.attempts,['acc_01','acc_02']);self.assertEqual(self.closed,['acc_01'])
+        self.assertEqual(self.attempts,['acc_01','acc_02']);self.assertEqual(self.closed,self.attempts)
         self.ask();self.assertEqual(len(self.attempts),2)
         self.assertTrue(any('лимит' in x and 'acc_01' in x for x in self.events))
+    def test_completed_but_unusable_reply_switches_once_per_profile(self):
+        self.add('acc_02');self.add('acc_03')
+        self.outcomes={'acc_01':'incomplete','acc_02':'placeholder'}
+        self.assertEqual(self.ask(),'{"reactions":[]}');self.ask()
+        self.assertEqual(self.attempts,['acc_01','acc_02','acc_03']);self.assertEqual(self.closed,self.attempts)
+
+    def test_exhausted_after_incomplete_answers_no_cache(self):
+        self.add('acc_02');self.outcomes={'acc_01':'placeholder','acc_02':'incomplete'}
+        with self.assertRaisesRegex(ChatGPTIncompleteAnswer,'неполный ответ'):self.ask()
+        self.assertEqual(self.attempts,['acc_01','acc_02']);self.assertEqual(self.closed,self.attempts)
+        self.assertFalse((self.root/'gpt_uploads'/'response_cache').exists())
+
+    def test_preview_saved_and_browser_closed(self):
+        self.outcomes={'acc_01':'image'}
+        path,template=self.finder.generate_image('preview',['sample.png'])
+        self.assertEqual(template,'sample.png');self.assertTrue(Path(path).is_file())
+        self.assertEqual(self.closed,['acc_01']);self.assertIsNone(self.finder._web)
+
     def test_all_limited_stop_once(self):
         self.add('acc_02');self.outcomes={'acc_01':'quota','acc_02':'quota'}
         with self.assertRaisesRegex(ChatGPTQuotaError,'нет доступных'):self.ask()

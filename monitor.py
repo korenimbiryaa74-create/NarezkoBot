@@ -95,13 +95,16 @@ class Monitor:
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             # Two successful polls required before transitioning an observed live stream offline.
-            active=db.execute("SELECT * FROM observed_streams WHERE login=? AND state='live'",(login,)).fetchall()
+            active=db.execute("SELECT * FROM observed_streams WHERE login=? AND state IN ('live','skipped_live')",(login,)).fetchall()
             for row in active:
                 if row['stream_id'] == stream_id:
                     db.execute("UPDATE observed_streams SET offline_count=0,updated_at=? WHERE stream_id=?",(now,row['stream_id']))
                 else:
                     count=row['offline_count']+1
                     if count>=self.offline_checks:
+                        if row['state']=='skipped_live':
+                            db.execute("UPDATE observed_streams SET state='skipped',offline_count=?,ended_at=?,updated_at=? WHERE stream_id=?",(count,now,now,row['stream_id']))
+                            continue
                         db.execute("UPDATE observed_streams SET state='waiting_vod',offline_count=?,ended_at=?,updated_at=? WHERE stream_id=?",(count,now,now,row['stream_id']))
                         self.store._notification(db,now,f"{login}: эфир закончился. Ожидается запись Twitch.",f"stream:{row['stream_id']}:ended")
                     else:
@@ -111,6 +114,8 @@ class Monitor:
                     (stream_id,login,user_id,title,started_at,state,updated_at) VALUES (?,?,?,?,?,'live',?)''',
                     (stream_id,login,user_id,str(live.get('title') or ''),str(live['started_at']),now))
                 if inserted.rowcount:self.store._notification(db,now,f'{login}: обнаружен эфир.',f'stream:{stream_id}:live')
+                # A skipped broadcast can briefly disappear and reappear with the same ID.
+                db.execute("UPDATE observed_streams SET state='skipped_live',offline_count=0,ended_at=NULL,updated_at=? WHERE stream_id=? AND state='skipped'",(now,stream_id))
                 # If a stream reappears before its VOD was queued (or the streamer was re-added mid-stream), continue observing it.
                 db.execute("UPDATE observed_streams SET state='live',offline_count=0,ended_at=NULL,candidate_id=NULL,candidate_duration=NULL,stable_since=NULL,last_error='',updated_at=? WHERE stream_id=? AND state IN ('waiting_vod','removed')",(now,stream_id))
             db.commit()

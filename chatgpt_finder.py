@@ -1,6 +1,6 @@
 """Reaction finder using an existing ChatGPT browser profile, without Telegram.
 
-Switch profiles only on an explicit upload limit before a possibly sent request.
+An automatic request owns its browser until the result is saved or the attempt ends.
 The user's login is performed explicitly in a normal browser window.
 """
 from __future__ import annotations
@@ -135,19 +135,26 @@ class ChatGPTFinder:
             # A fixed name prevents untrusted title/path characters entering paths.
             path=folder/'transcript.txt'
             path.write_text(document,encoding='utf8')
-            # The exception is raised only for a visible upload restriction. Never
-            # replay an uncertain or already-sent request on another account.
-            from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError, ChatGPTSafetyError
+            from chatgpt_errors import ChatGPTQuotaError, ChatGPTLoginError, ChatGPTSafetyError, ChatGPTIncompleteAnswer
             accounts=self._accounts()
             accounts=([self._account] if self._account in accounts else [])+[x for x in accounts if x != self._account]
-            blocked=[]; signed_out=[]; text=None
+            blocked=[]; signed_out=[]; incomplete=[]
             for account in accounts:
                 web=self._browser(account); web.timeout=int(timeout); web.offscreen=False
                 if log: log(f'ChatGPT: профиль {account} — отправка транскрипта и ожидание ответа')
                 web.status_callback=log
                 try:
                     text=(web.ask(prompt,[str(path)],until=predicate).get('text') or '').strip()
-                    break
+                    if not valid_cache(text):
+                        raise ChatGPTIncompleteAnswer('Ответ не прошёл проверку формата')
+                    cache.parent.mkdir(parents=True,exist_ok=True)
+                    full_cycle.atomic_json(str(cache),{'key':key,'text':text})
+                    return text
+                except ChatGPTIncompleteAnswer:
+                    incomplete.append(account)
+                    if log:
+                        msg='; пробую следующий профиль' if account!=accounts[-1] else '; профили закончились'
+                        log(f'ChatGPT: {account} закончил ответ без нужных данных'+msg)
                 except ChatGPTQuotaError:
                     if getattr(web,'_send_uncertain',False) or getattr(web,'_sent_confirmed',False):
                         raise RuntimeError('ChatGPT: обнаружен лимит, но отправка могла произойти; проверьте чат вручную')
@@ -168,15 +175,11 @@ class ChatGPTFinder:
                     raise
                 finally:
                     web.status_callback=None
-            else:
-                message='ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')
-                if blocked: raise ChatGPTQuotaError(message)
-                raise ChatGPTLoginError(message)
-            if not predicate(text): raise RuntimeError('ChatGPT вернул неполный ответ; задача остановлена')
-            if validate_response is not None: validate_response(text)
-            cache.parent.mkdir(parents=True,exist_ok=True)
-            full_cycle.atomic_json(str(cache),{'key':key,'text':text})
-            return text
+                    self.close()
+            message='ChatGPT: нет доступных профилей. Лимит: '+(', '.join(blocked) or 'нет')+'; нужен вход: '+(', '.join(signed_out) or 'нет')
+            if incomplete: raise ChatGPTIncompleteAnswer(message+'; неполный ответ: '+', '.join(incomplete))
+            if blocked: raise ChatGPTQuotaError(message)
+            raise ChatGPTLoginError(message)
 
     # ---------- image generation (previews) ----------
     _IMAGE_LIMIT=re.compile(r'(?:лимит|limit|достигли|исчерпа|попробуйте (?:снова|ещё раз) (?:через|позже)|try again (?:later|in)|upgrade|Plus)',re.I)
@@ -219,6 +222,7 @@ class ChatGPTFinder:
                         failed.append(account);break
                     finally:
                         web.status_callback=None
+                        self.close()  # ask() has already downloaded generated images to disk.
                     images=[p for p in (res.get('images') or []) if p and os.path.isfile(p)]
                     if images:
                         self._save_state(account,last_ok=time.time())

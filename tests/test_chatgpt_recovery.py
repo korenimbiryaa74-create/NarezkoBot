@@ -34,6 +34,16 @@ class RecoveryTests(unittest.TestCase):
         with patch('chatgpt_web.time.sleep'), patch.object(web,'_download',side_effect=AssertionError('must not download')):
             text,images=web._wait_answer(until=lambda x:'"reactions"' in x)
         self.assertEqual(text,ANSWER);self.assertEqual(images,[]);self.assertTrue(received)
+    def test_finished_placeholder_is_retryable_but_active_generation_is_not(self):
+        from chatgpt_errors import ChatGPTIncompleteAnswer, ChatGPTWebError
+        web=chatgpt_web.ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),timeout=100,verbose=False)
+        for busy in (False,True):
+            now=[1000];web._read_answer_state=lambda:{'text':'Анализ завершен','busy':busy,'n':1}
+            def sleep(dt):now[0]+=dt
+            with self.subTest(busy=busy),patch('chatgpt_web.time.time',side_effect=lambda:now[0]),patch('chatgpt_web.time.sleep',side_effect=sleep):
+                with self.assertRaises(ChatGPTWebError) as error:web._wait_answer(until=lambda text:False)
+                self.assertEqual(isinstance(error.exception,ChatGPTIncompleteAnswer),not busy)
+
     def test_send_steps_are_visible_without_sensitive_prompt(self):
         web=chatgpt_web.ChatGPTWeb(str(self.root/'cookies'),str(self.root/'out'),profile=str(self.root/'profile'),verbose=False)
         class Tab:

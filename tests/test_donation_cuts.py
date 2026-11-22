@@ -12,6 +12,7 @@ from settings import Settings
 from service import Service
 
 class FakeWeb:
+    def close(self): pass
     def __init__(self,**kw): self.timeout=0;self.calls=0
     def ask(self,prompt,files,until):
         self.calls+=1
@@ -25,10 +26,10 @@ class DonationTests(unittest.TestCase):
         self.rows=[{'start':0.,'end':12.,'title':'Видео'}]
         self.segs=[{'start':1.,'end':2.,'text':'начало'}, {'start':3.,'end':6.,'text':'донат'}, {'start':8.,'end':9.,'text':'продолжение'}]
     def test_valid_request_cache_and_bounds(self):
-        f=ChatGPTFinder(self.root,web_factory=FakeWeb)
+        web=FakeWeb();f=ChatGPTFinder(self.root,web_factory=lambda **kw:web)
         first=f.find_donations(self.segs,self.rows,lambda *a:None)
         second=f.find_donations(self.segs,self.rows,lambda *a:None)
-        self.assertEqual(first,[{'reaction':1,'start':3.,'end':6.}]);self.assertEqual(first,second);self.assertEqual(f._web.calls,1)
+        self.assertEqual(first,[{'reaction':1,'start':3.,'end':6.}]);self.assertEqual(first,second);self.assertEqual(web.calls,1)
     def test_invalid_or_unsafe_intervals_are_skipped_not_fatal(self):
         # Сомнительный донат остаётся в видео, задание не останавливается.
         f=ChatGPTFinder(self.root,web_factory=lambda **kw:self.fail('browser must not be used'))

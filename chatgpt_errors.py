@@ -15,6 +15,9 @@ class ChatGPTQuotaError(ChatGPTWebError):
 class ChatGPTTechnicalError(ChatGPTWebError):
     pass
 
+class ChatGPTIncompleteAnswer(ChatGPTWebError):
+    """The assistant finished the turn without a usable structured answer."""
+
 class ChatGPTUploadFailed(ChatGPTWebError):
     """ChatGPT showed «Загрузка не удалась» (network): the file was not accepted and nothing was sent,
     so the page can be reloaded and the request repeated safely."""

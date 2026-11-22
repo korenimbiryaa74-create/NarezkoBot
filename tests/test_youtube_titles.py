@@ -81,16 +81,16 @@ class DonationCacheTests(unittest.TestCase):
                 return {'text':response}
             def close(self):pass
         with tempfile.TemporaryDirectory() as d:
-            finder=ChatGPTFinder(d,web_factory=Web)
+            web=Web();finder=ChatGPTFinder(d,web_factory=lambda **kw:web)
             segs=[{'start':12.,'end':15.,'text':'текст доната'}]
             moments=[{'type':'reaction','start':10.,'end':100.}]
             events=[];progress=lambda stage,msg:events.append(msg)
             first=finder.find_donations(segs,moments,progress)
             second=finder.find_donations(segs,moments,progress)
-            self.assertEqual(first,second);self.assertEqual(finder._web.calls,1)
+            self.assertEqual(first,second);self.assertEqual(web.calls,1)
             self.assertTrue(any('кэш ответа о донатах' in e for e in events))
             finder.find_donations(segs,[{'type':'reaction','start':10.,'end':101.}],progress)
-            self.assertEqual(finder._web.calls,2)
+            self.assertEqual(web.calls,2)
 
 
 class TitleGenerationCacheTests(unittest.TestCase):
@@ -99,6 +99,7 @@ class TitleGenerationCacheTests(unittest.TestCase):
         answer=json.dumps({'youtube_titles':[{'n':1,'target':'Сюжет о спорте'}]},ensure_ascii=False)
         class Web:
             def __init__(self,**kw):self.calls=0
+            def close(self):pass
             def ask(self,prompt,files,until=None):
                 self.calls+=1
                 self.document=Path(files[0]).read_text(encoding='utf-8')
@@ -107,13 +108,13 @@ class TitleGenerationCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);video=root/'готовое.mp4';video.write_bytes(b'video')
             video.with_suffix('.txt').write_text('Расшифровка готового видео про спорт',encoding='utf-8')
-            finder=ChatGPTFinder(root,web_factory=Web)
+            web=Web();finder=ChatGPTFinder(root,web_factory=lambda **kw:web)
             job={'streamer':'kussia88'};outcome={'outputs':[str(video)],'moments':[{'type':'reaction'}]}
             progress=lambda *args:None
             self.assertEqual(finder.youtube_titles(job,outcome,progress),['КАША РЕАГИРУЕТ НА: Сюжет о спорте'])
             self.assertEqual(finder.youtube_titles(job,outcome,progress),['КАША РЕАГИРУЕТ НА: Сюжет о спорте'])
-            self.assertEqual(finder._web.calls,1)
-            self.assertIn('Расшифровка готового видео',finder._web.document)
+            self.assertEqual(web.calls,1)
+            self.assertIn('Расшифровка готового видео',web.document)
 
 
 if __name__=='__main__':unittest.main()

@@ -166,12 +166,24 @@ class Service:
             if generation==self._watch_generation:
                 self._watch_state[name]={'state':state,'stream_id':stream_id,'checked_at':time.time()}
 
+    def set_stream_skipped(self, login, stream_id, skipped):
+        """Only change the displayed broadcast, never a pending VOD or a later stream."""
+        state='skipped_live' if skipped else 'live'
+        with self.store._connect() as db:
+            changed=db.execute("UPDATE observed_streams SET state=?,updated_at=? WHERE login=? AND stream_id=? AND offline_count=0 AND state IN ('live','skipped_live')",
+                               (state,time.time(),login,str(stream_id))).rowcount
+        return bool(changed)
+
     def stream_rows(self, cfg):
         """Saved watch list plus pending VODs; status is never inferred from history."""
         running=(cfg['monitor']['enabled'] and not self.stop_event.is_set() and
                  any(t.name=='twitch-monitor' and t.is_alive() for t in self._threads))
         with self._lock: snapshot={k:dict(v) for k,v in self._watch_state.items()}
         now=time.time(); max_age=max(180,3*cfg['monitor']['interval'])
+        with self.store._connect() as db:
+            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observed_streams'").fetchone()
+            skipped={r['stream_id'] for r in db.execute("SELECT stream_id FROM observed_streams WHERE state='skipped_live'")} if table else set()
+            pending=list(db.execute("SELECT login,stream_id,last_error FROM observed_streams WHERE state='waiting_vod' ORDER BY updated_at DESC")) if table else []
         rows=[]
         for name in cfg['streamers']:
             state=snapshot.get(name)
@@ -184,11 +196,8 @@ class Service:
             else:
                 label='В эфире' if state['state']=='live' else 'Не в эфире'
                 detail=''; stream_id=state['stream_id']
+                if state['state']=='live' and stream_id in skipped: label='Эфир пропускается'
             rows.append((name,stream_id,label,detail))
-        # Read waiting records even before an API client exists, e.g. after restart.
-        with self.store._connect() as db:
-            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observed_streams'").fetchone()
-            pending=list(db.execute("SELECT login,stream_id,last_error FROM observed_streams WHERE state='waiting_vod' ORDER BY updated_at DESC")) if table else []
         for row in pending:
             label='Ожидает запись' if running else 'Ожидает запись (остановлено)'
             rows.append((row['login'],row['stream_id'],label,row['last_error'] or ''))

@@ -23,7 +23,7 @@ def _cookie_domain(value):
     value = str(value or '').lstrip('.').lower()
     return any((value == d or value.endswith('.' + d) for d in ('chatgpt.com', 'openai.com')))
 
-from chatgpt_errors import ChatGPTWebError, ChatGPTSafetyError, ChatGPTLoginError, ChatGPTQuotaError, ChatGPTTechnicalError, ChatGPTUploadFailed
+from chatgpt_errors import ChatGPTWebError, ChatGPTSafetyError, ChatGPTLoginError, ChatGPTQuotaError, ChatGPTTechnicalError, ChatGPTUploadFailed, ChatGPTIncompleteAnswer
 
 JS_EXPIRED_RE = '/Срок действия вашего сеанса истек|сеанс истек|Session has expired|session has expired|Войдите снова|войдите снова|Log in again/i'
 
@@ -1044,6 +1044,7 @@ return {items};
                     else:
                         stable = 0
                         last_key = key
+                        idle_since = None
                     text, images = (cur_text, cur_imgs)
                     if stable >= (3 if cur_imgs else 2):
                         if until is None:
@@ -1061,10 +1062,11 @@ return {items};
                         if time.time() - idle_since > self.IDLE_GRACE_SECONDS:
                             self.last_answer = cur_text
                             self._answer_unreadable = True
-                            raise ChatGPTWebError('ChatGPT закончил ответ, но полного JSON с таймингами нет')
+                            raise ChatGPTIncompleteAnswer('ChatGPT закончил ответ, но полного JSON с таймингами нет')
                 else:
                     stable = 0
                     last_key = None
+                    idle_since = None
             time.sleep(2)
         if until is not None and (not complete):
             self.last_answer = text
@@ -1172,6 +1174,7 @@ return {items};
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
+                _OWN_CHROME_PIDS.discard(proc.pid)
                 deadline=time.monotonic()+5
                 while self._debug_port_busy() and time.monotonic()<deadline:
                     time.sleep(.1)

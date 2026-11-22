@@ -82,13 +82,25 @@ class Dashboard:
         self._streams_key=key;out=[]
         for row in rows:
             login,sid,state,details=(list(row)+['','','',''])[:4]
+            actions=[]
+            if sid and state in ('В эфире','Эфир пропускается'):
+                actions.append(ft.Checkbox(label='Пропустить этот эфир',value=state=='Эфир пропускается',
+                    on_change=lambda e,n=login,s=sid:self.app.spawn(self._set_skip,n,s,bool(e.control.value))))
             kind='error' if details and ('ошиб' in str(details).lower() or 'error' in str(details).lower()) else ('info' if 'эфир' in str(state).lower() or 'live' in str(state).lower() else 'muted')
             out.append(ft.Container(ft.Row([ft.Icon(ft.Icons.PERSON,size=18,color=MUTED),ft.Text(str(login),size=14,weight=ft.FontWeight.W_600,width=150),
                                             chip(str(state) or '—',kind),muted(str(sid or ''),size=12),
-                                            ft.Text(str(details or ''),size=12,color=MUTED,expand=True,max_lines=2,overflow=ft.TextOverflow.ELLIPSIS,selectable=True)],
+                                            ft.Text(str(details or ''),size=12,color=MUTED,expand=True,max_lines=2,overflow=ft.TextOverflow.ELLIPSIS,selectable=True),*actions],
                                            spacing=12,vertical_alignment=ft.CrossAxisAlignment.CENTER),
                                     padding=ft.Padding.symmetric(horizontal=12,vertical=8),bgcolor='#1d2026',border_radius=10))
         self.streams.controls=out or [empty('Стримеры не добавлены — укажите их в настройках.')]
+
+    async def _set_skip(self,login,sid,value):
+        try:
+            changed=await asyncio.to_thread(self.app.service.set_stream_skipped,login,sid,value)
+            if not changed:self.app.dialogs.toast('Эфир уже сменился или закончился. Ничего не изменено.','warn')
+        finally:
+            self._streams_key=None
+            self.app.refresh_soon()
 
     def _refresh_jobs(self,jobs):
         jobs=jobs[:80]
